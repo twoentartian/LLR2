@@ -1,0 +1,9 @@
+[submodule "py_src/third_party/compact_transformers"]
+	path = py_src/third_party/compact_transformers
+	url = https://github.com/SHI-Labs/Compact-Transformers.git
+[submodule "py_src/third_party/sam"]
+	path = py_src/third_party/sam
+	url = https://github.com/davda54/sam.git
+[submodule "py_src/third_party/ddpm"]
+	path = py_src/third_party/ddpm
+	url = https://github.com/abarankab/DDPM.git

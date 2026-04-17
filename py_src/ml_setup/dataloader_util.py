@@ -82,6 +82,7 @@ def build_dataloader(
         pin_memory=cfg.pin_memory,
         drop_last=cfg.drop_last,
         collate_fn=collate_fn,
+        prefetch_factor=4,
     )
     if cfg.sampler is not None:
         loader_kwargs["sampler"] = cfg.sampler

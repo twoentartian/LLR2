@@ -133,7 +133,7 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
         raise _nie(mt, dt)
 
     elif mt == ModelType.ddpm_cifar10:
-        from py_src.ml_setup.setup_ddpm import ddpm_cifar10
+        from py_src.ml_setup.ddpm import ddpm_cifar10
         if _default or dt == DatasetType.cifar10:
             return ddpm_cifar10()
         raise _nie(mt, dt)

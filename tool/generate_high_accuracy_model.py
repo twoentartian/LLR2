@@ -5,14 +5,12 @@ import json
 import logging
 import math
 import os
-import random
 import sys
 from datetime import datetime
 
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import DataLoader
 import lightning as L
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -24,6 +22,7 @@ from py_src.complete_ml_setup import FastTrainingSetup, TransferTrainingSetup
 from py_src.ml_setup_model import ModelType
 from py_src.ml_setup_dataset import DatasetType
 from py_src.engine import Device, train, val
+from py_src.ml_setup.dataloader_util import DataloaderConfig
 import py_src.adapters as _adapters
 
 logger = logging.getLogger("generate_high_accuracy_model")
@@ -99,7 +98,6 @@ def training_model(
     opposite_init_model_path,
     disable_reinit: bool,
     enable_validation: bool,
-    inverse_train_val: bool,
 ):
     thread_per_process = arg_total_cpu_count // arg_worker_count
     thread_per_process = min(thread_per_process, 8)
@@ -123,37 +121,14 @@ def training_model(
                              _adapters.LightningAdapter, _adapters.CustomStepAdapter)):
         adapter._model = model # type: ignore
 
-    training_data = arg_ml_setup.training_data
-    testing_data = arg_ml_setup.testing_data
-    if inverse_train_val:
-        training_data, testing_data = testing_data, training_data
-
-    batch_size = arg_ml_setup.default_batch_size
     num_workers = min(thread_per_process, 8)
 
-    if arg_ml_setup.override_train_loader is not None:
-        dataloader = arg_ml_setup.override_train_loader
-    else:
-        dataloader = DataLoader(
-            training_data, batch_size=batch_size, shuffle=True,
-            collate_fn=arg_ml_setup.default_collate_fn,
-            pin_memory=True, num_workers=num_workers,
-            persistent_workers=(num_workers > 0),
-            prefetch_factor=4 if num_workers > 0 else None,
-        )
+    dataloader = arg_ml_setup.train_dataloader(DataloaderConfig(num_workers=num_workers))
 
     is_diffusion = arg_ml_setup.model_type == ModelType.ddpm_cifar10
 
     if enable_validation and not is_diffusion:
-        if arg_ml_setup.override_test_loader is not None:
-            dataloader_test = arg_ml_setup.override_test_loader
-        else:
-            dataloader_test = DataLoader(
-                testing_data, batch_size=batch_size, shuffle=False,
-                pin_memory=True, num_workers=num_workers,
-                persistent_workers=(num_workers > 0),
-                prefetch_factor=4 if num_workers > 0 else None,
-            )
+        dataloader_test = arg_ml_setup.val_dataloader(DataloaderConfig(num_workers=num_workers))
     else:
         dataloader_test = None
 
@@ -325,7 +300,6 @@ if __name__ == "__main__":
                         help="checkpoint whose opposite direction is used after re-init")
     parser.add_argument("--disable_reinit", action="store_true", help="skip weight re-initialisation")
     parser.add_argument("--enable_eval", action="store_true", help="evaluate on validation set each epoch")
-    parser.add_argument("--inverse_train_val", action="store_true", help="swap train and validation sets")
 
     args = parser.parse_args()
 
@@ -375,7 +349,7 @@ if __name__ == "__main__":
          worker_count, total_cpu_cores,
          args.save_format, args.save_interval, args.amp, args.preset, args.epoch,
          args.transfer_learn, args.initial_model, args.opposite_init_model,
-         args.disable_reinit, args.enable_eval, args.inverse_train_val)
+         args.disable_reinit, args.enable_eval)
         for i in range(args.start_index, args.start_index + number_of_models)
     ]
 

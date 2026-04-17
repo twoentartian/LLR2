@@ -6,15 +6,19 @@ This wraps the existing GaussianDiffusion model with a
 
 from __future__ import annotations
 
+import os
 from typing import Literal
 
+from PIL import Image
+import numpy as np
+import torch
 import torch.nn.functional as F
 import torchvision
 
 from py_src.ml_setup_dataset import DatasetType, dataset_cifar10
 from py_src.ml_setup_model import ModelType
 from py_src.adapters import DiffusionAdapter
-from py_src.ml_setup.ml_setup import MLSetup
+from py_src.ml_setup import ApplicationType, MLSetup
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +102,15 @@ def _build_ddpm_model(
 # Public factory
 # ---------------------------------------------------------------------------
 
+def generate_sample(model: torch.nn.Module, output_folder:str, current_epoch:int) -> None:
+    model.eval()
+    samples = model.sample(10, device.device) # type: ignore
+    samples = ((samples + 1) / 2).clip(0, 1).permute(0, 2, 3, 1).cpu().numpy()
+    for i, sample in enumerate(samples):
+        Image.fromarray((sample * 255).astype(np.uint8)).save(
+            os.path.join(output_folder, f"epoch{current_epoch}_{i}.png")
+        )
+
 def ddpm_cifar10() -> MLSetup:
     transform = _ddpm_transform()
     dataset = dataset_cifar10(
@@ -106,7 +119,7 @@ def ddpm_cifar10() -> MLSetup:
     )
     model = _build_ddpm_model()
 
-    return MLSetup(
+    output_ml_setup = MLSetup(
         model=model,
         adapter=DiffusionAdapter(model),
         model_type=ModelType.ddpm_cifar10,
@@ -115,4 +128,8 @@ def ddpm_cifar10() -> MLSetup:
         dataset_type=DatasetType.cifar10,
         default_batch_size=128,
         has_normalization_layer=True,
+        application_type=ApplicationType.diffusion,
     )
+    output_ml_setup.difussion_generate_sample = generate_sample
+
+    return output_ml_setup

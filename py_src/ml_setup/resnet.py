@@ -4,7 +4,8 @@ from py_src.ml_setup.ml_setup import MLSetup
 from py_src.ml_setup_model import ModelType
 
 from py_src.ml_setup_dataset import dataset_cifar10, dataset_cifar100
-from .shared_setup_util import _make_setup
+from .shared_setup_util import make_setup
+from .imagenet_preset import preset_version, imagenet_criterion, imagenet_collate_fn, imagenet_sampler_fn
 
 # ---------------------------------------------------------------------------
 # ResNet-18
@@ -24,7 +25,7 @@ def _resnet18_cifar(num_classes, dataset_setup, model_type, use_gn=False) -> MLS
     model = models.resnet18(num_classes=num_classes, norm_layer=norm)
     model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
     model.maxpool = nn.Identity() # type: ignore
-    return _make_setup(model, model_type, dataset_setup, 256)
+    return make_setup(model, model_type, dataset_setup, 256)
 
 
 def resnet18_bn_cifar10() -> MLSetup:
@@ -42,4 +43,157 @@ def resnet18_bn_cifar100() -> MLSetup:
 def resnet18_gn_cifar100() -> MLSetup:
     return _resnet18_cifar(100, dataset_cifar100(), ModelType.resnet18_gn, True)
 
+
+# ---------------------------------------------------------------------------
+# ResNet ImageNet helpers
+# ---------------------------------------------------------------------------
+
+def _resnet18_imagenet(num_classes, dataset_setup, model_type, pyotrch_preset, use_gn=False) -> MLSetup:
+    from torchvision import models
+    norm = GroupNorm if use_gn else nn.BatchNorm2d
+    model = models.resnet18(num_classes=num_classes, norm_layer=norm)
+    criterion = imagenet_criterion(pyotrch_preset)
+    collate_fn = imagenet_collate_fn(pyotrch_preset)
+    sampler = imagenet_sampler_fn(pyotrch_preset)
+    return make_setup(model, model_type, dataset_setup, 256, criterion=criterion, 
+                      default_collate_fn=collate_fn, default_sampler_fn=sampler)
+
+
+# ---------------------------------------------------------------------------
+# ResNet-18 ImageNet-10
+# ---------------------------------------------------------------------------
+
+def resnet18_bn_imagenet10(preset: int = 0) -> MLSetup:
+    """ResNet-18 (BN) on ImageNet-10, batch=256."""
+    from py_src.ml_setup_dataset import dataset_imagenet10
+    pv = preset_version(preset)
+    return _resnet18_imagenet(10, dataset_imagenet10(pv), pv,
+                              ModelType.resnet18_bn, use_gn=False,)
+
+
+def resnet18_gn_imagenet10(preset: int = 0) -> MLSetup:
+    """ResNet-18 (GN) on ImageNet-10, batch=256."""
+    from py_src.ml_setup_dataset import dataset_imagenet10
+    pv = preset_version(preset)
+    return _resnet18_imagenet(10, dataset_imagenet10(pv), pv,
+                              ModelType.resnet18_gn, use_gn=True,)
+
+
+# ---------------------------------------------------------------------------
+# ResNet-18 ImageNet-100
+# ---------------------------------------------------------------------------
+
+def resnet18_bn_imagenet100(preset: int = 0) -> MLSetup:
+    """ResNet-18 (BN) on ImageNet-100, batch=256."""
+    from py_src.ml_setup_dataset import dataset_imagenet100
+    pv = preset_version(preset)
+    return _resnet18_imagenet(100, dataset_imagenet100(pv), pv,
+                              ModelType.resnet18_bn, use_gn=False)
+
+
+def resnet18_gn_imagenet100(preset: int = 0) -> MLSetup:
+    """ResNet-18 (GN) on ImageNet-100, batch=256."""
+    from py_src.ml_setup_dataset import dataset_imagenet100
+    pv = preset_version(preset)
+    return _resnet18_imagenet(100, dataset_imagenet100(pv), pv,
+                              ModelType.resnet18_gn, use_gn=True)
+
+
+# ---------------------------------------------------------------------------
+# ResNet-18 ImageNet-1k
+# ---------------------------------------------------------------------------
+
+def resnet18_bn_imagenet1k(preset: int = 0) -> MLSetup:
+    """ResNet-18 (BN) on ImageNet-1k, batch=256."""
+    from py_src.ml_setup_dataset import dataset_imagenet1k
+    pv = preset_version(preset)
+    return _resnet18_imagenet(1000, dataset_imagenet1k(pv), pv,
+                              ModelType.resnet18_bn, use_gn=False)
+
+
+def resnet18_gn_imagenet1k(preset: int = 0) -> MLSetup:
+    """ResNet-18 (GN) on ImageNet-1k, batch=256."""
+    from py_src.ml_setup_dataset import dataset_imagenet1k
+    pv = preset_version(preset)
+    return _resnet18_imagenet(1000, dataset_imagenet1k(pv), pv,
+                              ModelType.resnet18_gn, use_gn=True)
+
+
+# ---------------------------------------------------------------------------
+# ResNet-18 ImageNet-1k SAM-mask variants (fixed v1-style preprocessing)
+# ---------------------------------------------------------------------------
+
+def resnet18_bn_imagenet1k_sam_mask_random_noise() -> MLSetup:
+    """ResNet-18 (BN) on ImageNet-1k with SAM-mask regions filled with random noise, batch=256."""
+    from torchvision import models
+    from py_src.ml_setup_dataset import dataset_imagenet1k_sam_mask_random_noise
+    model = models.resnet18(num_classes=1000)
+    return make_setup(model, ModelType.resnet18_bn,
+                       dataset_imagenet1k_sam_mask_random_noise(), 256)
+
+
+def resnet18_bn_imagenet1k_sam_mask_black() -> MLSetup:
+    """ResNet-18 (BN) on ImageNet-1k with SAM-mask regions zeroed out, batch=256."""
+    from torchvision import models
+    from py_src.ml_setup_dataset import dataset_imagenet1k_sam_mask_black
+    model = models.resnet18(num_classes=1000)
+    return make_setup(model, ModelType.resnet18_bn,
+                       dataset_imagenet1k_sam_mask_black(), 256)
+
+
+# ---------------------------------------------------------------------------
+# ResNet-34 ImageNet-1k
+# ---------------------------------------------------------------------------
+
+def resnet34_imagenet1k(preset: int = 0) -> MLSetup:
+    """ResNet-34 on ImageNet-1k, batch=256."""
+    from torchvision import models
+    from py_src.ml_setup_dataset import dataset_imagenet1k
+    model = models.resnet34(num_classes=1000)
+    pv = preset_version(preset)
+    ds = dataset_imagenet1k(pv)
+    criterion = imagenet_criterion(pv)
+    collate_fn = imagenet_collate_fn(pv)
+    sampler = imagenet_sampler_fn(pv)
+    return make_setup(model, ModelType.resnet34, ds, 256,
+                       criterion=criterion, 
+                       default_collate_fn=collate_fn,
+                       default_sampler_fn=sampler)
+
+
+# ---------------------------------------------------------------------------
+# ResNet-50 ImageNet
+# ---------------------------------------------------------------------------
+
+def resnet50_imagenet1k(preset: int = 0) -> MLSetup:
+    """ResNet-50 on ImageNet-1k, batch=256."""
+    from torchvision import models
+    from py_src.ml_setup_dataset import dataset_imagenet1k
+    model = models.resnet50(num_classes=1000)
+    pv = preset_version(preset)
+    ds = dataset_imagenet1k(pv)
+    criterion = imagenet_criterion(pv)
+    collate_fn = imagenet_collate_fn(pv)
+    sampler = imagenet_sampler_fn(pv)
+    return make_setup(model, ModelType.resnet50, ds, 256,
+                       criterion=criterion, 
+                       default_collate_fn=collate_fn,
+                       default_sampler_fn=sampler)
+
+
+
+def resnet50_imagenet100(preset: int = 0) -> MLSetup:
+    """ResNet-50 on ImageNet-100, batch=256."""
+    from torchvision import models
+    from py_src.ml_setup_dataset import dataset_imagenet100
+    model = models.resnet50(num_classes=100)
+    pv = preset_version(preset)
+    ds = dataset_imagenet100(pv)
+    criterion = imagenet_criterion(pv)
+    collate_fn = imagenet_collate_fn(pv)
+    sampler = imagenet_sampler_fn(pv)
+    return make_setup(model, ModelType.resnet50, ds, 256,
+                       criterion=criterion, 
+                       default_collate_fn=collate_fn,
+                       default_sampler_fn=sampler)
 

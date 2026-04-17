@@ -79,6 +79,36 @@ class FastTrainingSetup:
                 optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
                 scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, lr, steps_per_epoch=steps_per_epoch, epochs=epochs)
                 return optimizer, scheduler, epochs
+            elif dt in (DatasetType.imagenet10, DatasetType.imagenet100, DatasetType.imagenet1k,
+                        DatasetType.imagenet1k_sam_mask_random_noise, DatasetType.imagenet1k_sam_mask_black):
+                epochs = 100
+                optimizer = torch.optim.SGD(model.parameters(), lr=1e-1, weight_decay=1e-4, momentum=0.9)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=epochs * steps_per_epoch, eta_min=1e-3,
+                )
+                return optimizer, scheduler, epochs
+            else:
+                raise err
+
+        elif mt == ModelType.resnet34:
+            if dt in (DatasetType.imagenet1k,):
+                epochs = 100
+                optimizer = torch.optim.SGD(model.parameters(), lr=1e-1, weight_decay=1e-4, momentum=0.9)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=epochs * steps_per_epoch, eta_min=1e-3,
+                )
+                return optimizer, scheduler, epochs
+            else:
+                raise err
+
+        elif mt == ModelType.resnet50:
+            if dt in (DatasetType.imagenet1k, DatasetType.imagenet100):
+                epochs = 100
+                optimizer = torch.optim.SGD(model.parameters(), lr=1e-1, weight_decay=1e-4, momentum=0.9)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=epochs * steps_per_epoch, eta_min=1e-3,
+                )
+                return optimizer, scheduler, epochs
             else:
                 raise err
 
@@ -180,6 +210,50 @@ class FastTrainingSetup:
                 epochs = 120
                 optimizer = torch.optim.SGD(model.parameters(), lr=1e-1, weight_decay=1e-4, momentum=0.9)
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs * steps_per_epoch)
+                return optimizer, scheduler, epochs
+            else:
+                raise err
+
+        elif mt == ModelType.dla_46_c:
+            if dt == DatasetType.imagenet10:
+                epochs = 120
+                optimizer = torch.optim.SGD(model.parameters(), lr=1e-1, weight_decay=1e-4, momentum=0.9)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=epochs * steps_per_epoch,
+                )
+                return optimizer, scheduler, epochs
+            else:
+                raise err
+
+        elif mt == ModelType.efficientnet_v2_s:
+            if dt == DatasetType.imagenet1k:
+                epochs = 100
+                optimizer = torch.optim.SGD(model.parameters(), lr=1e-1, weight_decay=1e-4, momentum=0.9)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=epochs * steps_per_epoch, eta_min=1e-3,
+                )
+                return optimizer, scheduler, epochs
+            else:
+                raise err
+
+        elif mt == ModelType.efficientnet_b1:
+            if dt == DatasetType.imagenet1k:
+                epochs = 100
+                optimizer = torch.optim.SGD(model.parameters(), lr=1e-1, weight_decay=1e-4, momentum=0.9)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=epochs * steps_per_epoch, eta_min=1e-3,
+                )
+                return optimizer, scheduler, epochs
+            else:
+                raise err
+
+        elif mt == ModelType.mobilenet_v3_large:
+            if dt == DatasetType.imagenet1k:
+                epochs = 100
+                optimizer = torch.optim.SGD(model.parameters(), lr=1e-1, weight_decay=1e-4, momentum=0.9)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=epochs * steps_per_epoch, eta_min=1e-3,
+                )
                 return optimizer, scheduler, epochs
             else:
                 raise err

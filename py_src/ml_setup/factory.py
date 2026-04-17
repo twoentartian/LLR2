@@ -52,12 +52,48 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
         raise _nie(mt, dt)
 
     elif mt in (ModelType.resnet18_bn, ModelType.resnet18_gn):
-        from .resnet import resnet18_gn_cifar10, resnet18_bn_cifar10, resnet18_gn_cifar100, resnet18_bn_cifar100
+        from .resnet import (
+            resnet18_gn_cifar10, resnet18_bn_cifar10,
+            resnet18_gn_cifar100, resnet18_bn_cifar100,
+            resnet18_bn_imagenet10, resnet18_gn_imagenet10,
+            resnet18_bn_imagenet100, resnet18_gn_imagenet100,
+            resnet18_bn_imagenet1k, resnet18_gn_imagenet1k,
+            resnet18_bn_imagenet1k_sam_mask_random_noise,
+            resnet18_bn_imagenet1k_sam_mask_black,
+        )
         use_gn = mt == ModelType.resnet18_gn
         if _default or dt == DatasetType.cifar10:
             return resnet18_gn_cifar10() if use_gn else resnet18_bn_cifar10()
         elif dt == DatasetType.cifar100:
             return resnet18_gn_cifar100() if use_gn else resnet18_bn_cifar100()
+        elif dt == DatasetType.imagenet10:
+            return resnet18_gn_imagenet10(preset) if use_gn else resnet18_bn_imagenet10(preset)
+        elif dt == DatasetType.imagenet100:
+            return resnet18_gn_imagenet100(preset) if use_gn else resnet18_bn_imagenet100(preset)
+        elif dt == DatasetType.imagenet1k:
+            return resnet18_gn_imagenet1k(preset) if use_gn else resnet18_bn_imagenet1k(preset)
+        elif dt == DatasetType.imagenet1k_sam_mask_random_noise:
+            if use_gn:
+                raise _nie(mt, dt)
+            return resnet18_bn_imagenet1k_sam_mask_random_noise()
+        elif dt == DatasetType.imagenet1k_sam_mask_black:
+            if use_gn:
+                raise _nie(mt, dt)
+            return resnet18_bn_imagenet1k_sam_mask_black()
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.resnet34:
+        from .resnet import resnet34_imagenet1k
+        if _default or dt == DatasetType.imagenet1k:
+            return resnet34_imagenet1k(preset)
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.resnet50:
+        from .resnet import resnet50_imagenet1k, resnet50_imagenet100
+        if _default or dt == DatasetType.imagenet1k:
+            return resnet50_imagenet1k(preset)
+        elif dt == DatasetType.imagenet100:
+            return resnet50_imagenet100(preset)
         raise _nie(mt, dt)
 
     elif mt == ModelType.mobilenet_v2:
@@ -66,6 +102,12 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
             return mobilenet_v2_cifar10()
         elif dt == DatasetType.cifar100:
             return mobilenet_v2_cifar100()
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.mobilenet_v3_large:
+        from .mobilenet import mobilenet_v3_large_imagenet1k
+        if _default or dt == DatasetType.imagenet1k:
+            return mobilenet_v3_large_imagenet1k(preset)
         raise _nie(mt, dt)
 
     elif mt == ModelType.vgg11_bn:
@@ -104,6 +146,18 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
             return efficientnet_b0_cifar100()
         raise _nie(mt, dt)
 
+    elif mt == ModelType.efficientnet_v2_s:
+        from .efficientnet import efficientnet_v2_s_imagenet1k
+        if _default or dt == DatasetType.imagenet1k:
+            return efficientnet_v2_s_imagenet1k(preset)
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.efficientnet_b1:
+        from .efficientnet import efficientnet_b1_imagenet1k
+        if _default or dt == DatasetType.imagenet1k:
+            return efficientnet_b1_imagenet1k(preset)
+        raise _nie(mt, dt)
+
     elif mt == ModelType.densenet121:
         from .densenet import densenet121_cifar10
         if _default or dt == DatasetType.cifar10:
@@ -130,6 +184,12 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
             return cct_7_3x1_cifar10()
         elif dt == DatasetType.cifar100:
             return cct_7_3x1_cifar100()
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.dla_46_c:
+        from .dla import dla46c_imagenet10
+        if _default or dt == DatasetType.imagenet10:
+            return dla46c_imagenet10(preset)
         raise _nie(mt, dt)
 
     elif mt == ModelType.ddpm_cifar10:

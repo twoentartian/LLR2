@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
+from enum import Enum, auto
 
 import torch.nn as nn
 
@@ -7,6 +8,13 @@ from py_src.adapters import ModelAdapter
 from py_src.ml_setup_dataset import DatasetType
 from py_src.ml_setup_model import ModelType
 from .dataloader_util import DataloaderConfig, build_dataloader
+
+
+class ApplicationType(Enum):
+    classifier = auto()
+    diffusion = auto()
+    clip = auto()
+    unknown = auto()
 
 @dataclass
 class MLSetup:
@@ -16,6 +24,7 @@ class MLSetup:
     model: nn.Module = None                    # type: ignore # the raw nn.Module
     adapter: ModelAdapter = None               # type: ignore # how the engine talks to this model
     model_type: ModelType = None               # type: ignore 
+    application_type: ApplicationType = ApplicationType.unknown
 
     # ---- dataset ----------------------------------------------------------
     training_data: Any = None                  # map-style Dataset, IterableDataset, or DataLoader
@@ -26,11 +35,15 @@ class MLSetup:
     default_batch_size: int = 0
     default_collate_fn: Optional[Callable] = None
     default_collate_fn_val: Optional[Callable] = None
+    default_sampler_fn: Optional[Callable] = None
     has_normalization_layer: bool = False
 
     # ---- dataloader overrides (pre-built loaders) -------------------------
     override_train_loader: Optional[Iterable] = None
     override_test_loader: Optional[Iterable] = None
+
+    # ---- special functions ------------------------------------------------
+    difussion_generate_sample: Optional[Callable] = None
 
     # ------------------------------------------------------------------
     # Public API: get dataloaders
@@ -50,6 +63,7 @@ class MLSetup:
             config=config,
             is_train=True,
             default_collate_fn=self.default_collate_fn,
+            default_sampler_fn=self.default_sampler_fn,
         )
 
     def val_dataloader(self, config: Optional[DataloaderConfig] = None) -> Iterable:

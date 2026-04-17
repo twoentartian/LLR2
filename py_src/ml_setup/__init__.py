@@ -1,5 +1,5 @@
 from .factory import get_ml_setup_from_config
-from .ml_setup import MLSetup
+from .ml_setup import MLSetup, ApplicationType
 
 from .densenet import densenet121_cifar10, densenet_cifar_cifar10
 from .efficientnet import efficientnet_b0_cifar10, efficientnet_b0_cifar100
@@ -15,7 +15,7 @@ from .cct import cct_7_3x1_cifar10, cct_7_3x1_cifar100
 from .ddpm import ddpm_cifar10
 
 __all__ = [
-    "get_ml_setup_from_config", "MLSetup",
+    "get_ml_setup_from_config", "MLSetup", "ApplicationType",
     "densenet121_cifar10", "densenet_cifar_cifar10",
     "efficientnet_b0_cifar10", "efficientnet_b0_cifar100",
     "lenet4_mnist", "lenet5_large_fc_mnist", "lenet5_mnist",

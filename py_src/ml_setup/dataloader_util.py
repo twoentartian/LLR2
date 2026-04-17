@@ -36,6 +36,7 @@ def build_dataloader(
     config: Optional[DataloaderConfig] = None,
     is_train: bool = True,
     default_collate_fn: Optional[Callable] = None,
+    default_sampler_fn: Optional[Callable] = None,
 ) -> Iterable:
     """Build a DataLoader (or return an IterableDataset directly).
 
@@ -83,8 +84,10 @@ def build_dataloader(
         collate_fn=collate_fn,
         prefetch_factor=4,
         persistent_workers=cfg.num_workers>1,
+        sampler=default_sampler_fn,
     )
     if cfg.sampler is not None:
+        assert default_sampler_fn is None, "default_sampler_fn and cfg.sampler conflict"
         loader_kwargs["sampler"] = cfg.sampler
 
     return DataLoader(**loader_kwargs)

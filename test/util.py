@@ -14,7 +14,7 @@ from py_src.engine import Device, TrainResult, ValResult, train, val
 from py_src.ml_setup.dataloader_util import DataloaderConfig
 
 # ---------------------------------------------------------------------------
-# Single-batch interface (for unit tests and smoke-checks)
+# Single-batch train and interface (for unit tests and smoke-checks)
 # ---------------------------------------------------------------------------
 
 def run_single_batch(

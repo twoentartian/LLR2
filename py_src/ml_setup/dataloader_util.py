@@ -24,7 +24,6 @@ class DataloaderConfig:
     drop_last: bool = False
     collate_fn: Optional[Callable] = None
     sampler: Optional[Any] = None
-    persistent_workers: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -83,10 +82,9 @@ def build_dataloader(
         drop_last=cfg.drop_last,
         collate_fn=collate_fn,
         prefetch_factor=4,
+        persistent_workers=cfg.num_workers>1,
     )
     if cfg.sampler is not None:
         loader_kwargs["sampler"] = cfg.sampler
-    if cfg.persistent_workers and cfg.num_workers > 0:
-        loader_kwargs["persistent_workers"] = True
 
     return DataLoader(**loader_kwargs)

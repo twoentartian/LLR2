@@ -1,4 +1,33 @@
 from pathlib import Path
+import logging
+import random
+from collections import deque
+
+import numpy as np
+import torch
+
+def re_initialize_model(model: torch.nn.Module):
+    for module in model.modules():
+        if hasattr(module, "reset_parameters"):
+            module.reset_parameters() # type: ignore
+
+def setup_logging(target_logger: logging.Logger, tag: str):
+    if not target_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            f"[%(asctime)s {tag}] %(levelname)s %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        target_logger.addHandler(handler)
+    target_logger.setLevel(logging.INFO)
+    target_logger.propagate = False
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 def expand_path(p):
     # convert to Path and expand ~, then resolve to absolute
@@ -49,3 +78,44 @@ def prompt_selection(options, prompt_message="Please make a selection:", allow_q
                 print(f"Please enter a number between 1 and {len(options)}")
         except ValueError:
             print("Please enter a valid number or 'q' to quit")
+
+class MovingAverage:
+    def __init__(self, window_size=10):
+        self.window_size = window_size
+        self.window = deque(maxlen=window_size)
+        self.sum = 0.0
+
+    def add(self, value):
+        if len(self.window) == self.window_size:
+            self.sum -= self.window[0]
+        self.window.append(value)
+        self.sum += value
+        return self.get_average()
+
+    def get_average(self):
+        if not self.window:
+            return 0
+        return self.sum / len(self.window)
+
+class MovingMax:
+    def __init__(self, window_size=10):
+        self.window_size = window_size
+        self.window = deque()
+        self.max_deque = deque()
+
+    def add(self, value):
+        self.window.append(value)
+        while self.max_deque and self.max_deque[-1] < value:
+            self.max_deque.pop()
+        self.max_deque.append(value)
+        if len(self.window) > self.window_size:
+            oldest = self.window.popleft()
+            if oldest == self.max_deque[0]:
+                self.max_deque.popleft()
+        return self.get_max()
+
+    def get_max(self):
+        if not self.max_deque:
+            return None
+        return self.max_deque[0]
+    

@@ -2,7 +2,7 @@ from typing import Optional
 from torchvision import transforms, datasets
 
 from .dataset_types import DatasetType
-from .dataset_env import default_path_mnist
+from .dataset_default import default_path_mnist
 from .dataset_types import DatasetSetup
 
 """ MNIST """

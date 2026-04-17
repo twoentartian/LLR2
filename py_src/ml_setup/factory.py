@@ -1,0 +1,146 @@
+"""Factory function to build an MLSetup from string-based config."""
+
+from __future__ import annotations
+
+import sys
+
+from py_src.ml_setup_model import ModelType
+from py_src.ml_setup_dataset import DatasetType
+from py_src.ml_setup.ml_setup import MLSetup
+
+
+def get_ml_setup_from_config(
+    model_type: str,
+    dataset_type: str = "default",
+    preset: int = 0,
+    device=None,
+) -> MLSetup:
+    try:
+        mt = ModelType[model_type]
+    except KeyError:
+        print(f"Unknown model type: {model_type!r}. Valid options: {[e.name for e in ModelType]}")
+        sys.exit(1)
+
+    try:
+        dt = DatasetType[dataset_type] if dataset_type != "default" else None
+    except KeyError:
+        print(f"Unknown dataset type: {dataset_type!r}. Valid options: {[e.name for e in DatasetType]}")
+        sys.exit(1)
+
+    return _build(mt, dt, preset, device)
+
+
+def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
+    _default = dt is None
+
+    if mt == ModelType.lenet5:
+        from .lenet import lenet5_mnist
+        if _default or dt == DatasetType.mnist:
+            return lenet5_mnist()
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.lenet4:
+        from .lenet import lenet4_mnist
+        if _default or dt == DatasetType.mnist:
+            return lenet4_mnist()
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.lenet5_large_fc:
+        from .lenet import lenet5_large_fc_mnist
+        if _default or dt == DatasetType.mnist:
+            return lenet5_large_fc_mnist()
+        raise _nie(mt, dt)
+
+    elif mt in (ModelType.resnet18_bn, ModelType.resnet18_gn):
+        from .resnet import resnet18_gn_cifar10, resnet18_bn_cifar10, resnet18_gn_cifar100, resnet18_bn_cifar100
+        use_gn = mt == ModelType.resnet18_gn
+        if _default or dt == DatasetType.cifar10:
+            return resnet18_gn_cifar10() if use_gn else resnet18_bn_cifar10()
+        elif dt == DatasetType.cifar100:
+            return resnet18_gn_cifar100() if use_gn else resnet18_bn_cifar100()
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.mobilenet_v2:
+        from .mobilenet import mobilenet_v2_cifar10, mobilenet_v2_cifar100
+        if _default or dt == DatasetType.cifar10:
+            return mobilenet_v2_cifar10()
+        elif dt == DatasetType.cifar100:
+            return mobilenet_v2_cifar100()
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.vgg11_bn:
+        from .vgg import vgg11_bn_cifar10
+        if _default or dt == DatasetType.cifar10:
+            return vgg11_bn_cifar10()
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.vgg11_no_bn:
+        from .vgg import vgg11_no_bn_cifar10
+        if _default or dt == DatasetType.cifar10:
+            return vgg11_no_bn_cifar10()
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.simplenet:
+        from .simplenet import simplenet_cifar10, simplenet_cifar100
+        if _default or dt == DatasetType.cifar10:
+            return simplenet_cifar10()
+        elif dt == DatasetType.cifar100:
+            return simplenet_cifar100()
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.shufflenet_v2:
+        from .shufflenet import shufflenet_v2_cifar10, shufflenet_v2_cifar100
+        if _default or dt == DatasetType.cifar10:
+            return shufflenet_v2_cifar10()
+        elif dt == DatasetType.cifar100:
+            return shufflenet_v2_cifar100()
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.efficientnet_b0:
+        from .efficientnet import efficientnet_b0_cifar10, efficientnet_b0_cifar100
+        if _default or dt == DatasetType.cifar10:
+            return efficientnet_b0_cifar10()
+        elif dt == DatasetType.cifar100:
+            return efficientnet_b0_cifar100()
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.densenet121:
+        from .densenet import densenet121_cifar10
+        if _default or dt == DatasetType.cifar10:
+            return densenet121_cifar10()
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.densenet_cifar:
+        from .densenet import densenet_cifar_cifar10
+        if _default or dt == DatasetType.cifar10:
+            return densenet_cifar_cifar10()
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.regnet_x_200mf:
+        from .regnet import regnet_x_200mf_cifar10, regnet_x_200mf_cifar100
+        if _default or dt == DatasetType.cifar10:
+            return regnet_x_200mf_cifar10()
+        elif dt == DatasetType.cifar100:
+            return regnet_x_200mf_cifar100()
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.cct_7_3x1_32:
+        from .cct import cct_7_3x1_cifar10, cct_7_3x1_cifar100
+        if _default or dt == DatasetType.cifar10:
+            return cct_7_3x1_cifar10()
+        elif dt == DatasetType.cifar100:
+            return cct_7_3x1_cifar100()
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.ddpm_cifar10:
+        from py_src.ml_setup.setup_ddpm import ddpm_cifar10
+        if _default or dt == DatasetType.cifar10:
+            return ddpm_cifar10()
+        raise _nie(mt, dt)
+
+    else:
+        raise NotImplementedError(f"No MLSetup defined for model_type={mt.name} in LLR2 yet.")
+
+
+def _nie(mt, dt):
+    return NotImplementedError(f"No MLSetup for model_type={mt.name}, dataset_type={dt}")

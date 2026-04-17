@@ -3,7 +3,7 @@ from typing import Optional, Any, List
 from torchvision import transforms, datasets
 
 from .dataset_types import DatasetType
-from .dataset_env import default_path_cifar10, default_path_cifar100
+from .dataset_default import default_path_cifar10, default_path_cifar100
 from .dataset_types import DatasetSetup
 
 _type_mean_std = Optional[tuple[tuple[float, float, float], tuple[float, float, float]]]

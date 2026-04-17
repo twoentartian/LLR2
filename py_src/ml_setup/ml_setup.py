@@ -4,10 +4,9 @@ from typing import Any, Callable, Iterable, Optional
 import torch.nn as nn
 
 from py_src.adapters import ModelAdapter
-
-from .dataloader_util import DataloaderConfig, build_dataloader
 from py_src.ml_setup_dataset import DatasetType
 from py_src.ml_setup_model import ModelType
+from .dataloader_util import DataloaderConfig, build_dataloader
 
 @dataclass
 class MLSetup:

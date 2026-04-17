@@ -1,4 +1,4 @@
-"""Training hyperparameter presets – optimizers, LR schedulers, and epoch counts.
+"""Training hyperparameter presets - optimizers, LR schedulers, and epoch counts.
 
 Ported from DFL_torch/py_src/complete_ml_setup.py and adapted for LLR2's MLSetup.
 """

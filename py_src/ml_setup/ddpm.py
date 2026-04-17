@@ -13,13 +13,6 @@ import torchvision
 
 from py_src.ml_setup_dataset import DatasetType, dataset_cifar10
 from py_src.ml_setup_model import ModelType
-from py_src.third_party.ddpm.ddpm.unet import UNet
-from py_src.third_party.ddpm.ddpm.diffusion import (
-    GaussianDiffusion,
-    generate_cosine_schedule,
-    generate_linear_schedule,
-)
-
 from py_src.adapters import DiffusionAdapter
 from py_src.ml_setup.ml_setup import MLSetup
 
@@ -57,7 +50,13 @@ def _build_ddpm_model(
     ema_decay: float = 0.9999,
     ema_update_rate: int = 1,
     loss_type: str = "l2",
-) -> GaussianDiffusion:
+):
+    from py_src.third_party.ddpm.ddpm.unet import UNet
+    from py_src.third_party.ddpm.ddpm.diffusion import (
+        GaussianDiffusion,
+        generate_cosine_schedule,
+        generate_linear_schedule,
+    )
     activations = {"relu": F.relu, "mish": F.mish, "silu": F.silu}
 
     unet = UNet(

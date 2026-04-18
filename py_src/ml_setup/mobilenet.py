@@ -1,11 +1,9 @@
-import torch.nn as nn
 from torch.utils.data.dataloader import default_collate
 
 from py_src.ml_setup.ml_setup import MLSetup
 from py_src.ml_setup_model import ModelType
 
 from py_src.ml_setup_dataset import dataset_cifar10, dataset_cifar100
-from py_src.third_party.sam import sam
 from .shared_setup_util import make_setup
 from .imagenet_preset import preset_version, imagenet_criterion, imagenet_collate_fn, imagenet_sampler_fn
 

@@ -290,7 +290,7 @@ if __name__ == "__main__":
     parser.add_argument("--amp", action="store_true", help="enable automatic mixed precision")
     parser.add_argument("-s", "--random_seed", type=int, default=None)
     parser.add_argument("-i", "--start_index", type=int, default=0)
-    parser.add_argument("-P", "--preset", type=int, default=0, help="training hyperparameter preset index")
+    parser.add_argument("-P", "--preset", type=int, default=1, help="training hyperparameter preset index")
     parser.add_argument("-e", "--epoch", type=int, default=None, help="override epoch count")
     parser.add_argument("-tl", "--transfer_learn", type=str, default=None,
                         help="checkpoint path for transfer learning")

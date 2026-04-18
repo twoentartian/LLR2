@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import Optional
+
 import torch.nn as nn
 from torch.utils.data.dataloader import default_collate
 
@@ -29,20 +33,17 @@ def _resnet18_cifar(num_classes, dataset_setup, model_type, use_gn=False) -> MLS
     return make_setup(model, model_type, dataset_setup, 256)
 
 
-def resnet18_bn_cifar10() -> MLSetup:
-    return _resnet18_cifar(10, dataset_cifar10(), ModelType.resnet18_bn, False)
+def resnet18_cifar10(override_dataset:Optional[DatasetSetup]=None, use_gn=False) -> MLSetup:
+    ds = dataset_cifar10() if override_dataset is None else override_dataset
+    mt = ModelType.resnet18_bn if use_gn is False else ModelType.resnet18_gn
+    return _resnet18_cifar(10, ds, mt, use_gn)
 
 
-def resnet18_gn_cifar10() -> MLSetup:
-    return _resnet18_cifar(10, dataset_cifar10(), ModelType.resnet18_gn, True)
+def resnet18_cifar100(override_dataset:Optional[DatasetSetup]=None, use_gn=False) -> MLSetup:
+    ds = dataset_cifar100() if override_dataset is None else override_dataset
+    mt = ModelType.resnet18_bn if use_gn is False else ModelType.resnet18_gn
+    return _resnet18_cifar(10, ds, mt, use_gn)
 
-
-def resnet18_bn_cifar100() -> MLSetup:
-    return _resnet18_cifar(100, dataset_cifar100(), ModelType.resnet18_bn, False)
-
-
-def resnet18_gn_cifar100() -> MLSetup:
-    return _resnet18_cifar(100, dataset_cifar100(), ModelType.resnet18_gn, True)
 
 
 # ---------------------------------------------------------------------------
@@ -65,60 +66,36 @@ def _resnet18_imagenet(num_classes:int, dataset_setup:DatasetSetup, pyotrch_pres
 # ResNet-18 ImageNet-10
 # ---------------------------------------------------------------------------
 
-def resnet18_bn_imagenet10(preset: int = 1) -> MLSetup:
+def resnet18_imagenet10(preset: int = 1, override_dataset:Optional[DatasetSetup]=None, use_gn=False) -> MLSetup:
     """ResNet-18 (BN) on ImageNet-10, batch=256."""
     from py_src.ml_setup_dataset import dataset_imagenet10
     pv = preset_version(preset)
-    return _resnet18_imagenet(10, dataset_imagenet10(pv), pv,
-                              ModelType.resnet18_bn, use_gn=False,)
-
-
-def resnet18_gn_imagenet10(preset: int = 1) -> MLSetup:
-    """ResNet-18 (GN) on ImageNet-10, batch=256."""
-    from py_src.ml_setup_dataset import dataset_imagenet10
-    pv = preset_version(preset)
-    return _resnet18_imagenet(10, dataset_imagenet10(pv), pv,
-                              ModelType.resnet18_gn, use_gn=True,)
+    ds = override_dataset if override_dataset is not None else dataset_imagenet10(pv)
+    return _resnet18_imagenet(10, ds, pv, ModelType.resnet18_bn, use_gn=use_gn,)
 
 
 # ---------------------------------------------------------------------------
 # ResNet-18 ImageNet-100
 # ---------------------------------------------------------------------------
 
-def resnet18_bn_imagenet100(preset: int = 1) -> MLSetup:
+def resnet18_imagenet100(preset: int = 1, override_dataset:Optional[DatasetSetup]=None, use_gn=False) -> MLSetup:
     """ResNet-18 (BN) on ImageNet-100, batch=256."""
     from py_src.ml_setup_dataset import dataset_imagenet100
     pv = preset_version(preset)
-    return _resnet18_imagenet(100, dataset_imagenet100(pv), pv,
-                              ModelType.resnet18_bn, use_gn=False)
-
-
-def resnet18_gn_imagenet100(preset: int = 1) -> MLSetup:
-    """ResNet-18 (GN) on ImageNet-100, batch=256."""
-    from py_src.ml_setup_dataset import dataset_imagenet100
-    pv = preset_version(preset)
-    return _resnet18_imagenet(100, dataset_imagenet100(pv), pv,
-                              ModelType.resnet18_gn, use_gn=True)
+    ds = override_dataset if override_dataset is not None else dataset_imagenet100(pv)
+    return _resnet18_imagenet(100, ds, pv, ModelType.resnet18_bn, use_gn=use_gn)
 
 
 # ---------------------------------------------------------------------------
 # ResNet-18 ImageNet-1k
 # ---------------------------------------------------------------------------
 
-def resnet18_bn_imagenet1k(preset: int = 1) -> MLSetup:
+def resnet18_imagenet1k(preset: int = 1, override_dataset:Optional[DatasetSetup]=None, use_gn=False) -> MLSetup:
     """ResNet-18 (BN) on ImageNet-1k, batch=256."""
     from py_src.ml_setup_dataset import dataset_imagenet1k
     pv = preset_version(preset)
-    return _resnet18_imagenet(1000, dataset_imagenet1k(pv), pv,
-                              ModelType.resnet18_bn, use_gn=False)
-
-
-def resnet18_gn_imagenet1k(preset: int = 1) -> MLSetup:
-    """ResNet-18 (GN) on ImageNet-1k, batch=256."""
-    from py_src.ml_setup_dataset import dataset_imagenet1k
-    pv = preset_version(preset)
-    return _resnet18_imagenet(1000, dataset_imagenet1k(pv), pv,
-                              ModelType.resnet18_gn, use_gn=True)
+    ds = override_dataset if override_dataset is not None else dataset_imagenet1k(pv)
+    return _resnet18_imagenet(1000, ds, pv, ModelType.resnet18_bn, use_gn=use_gn)
 
 
 # ---------------------------------------------------------------------------
@@ -147,13 +124,13 @@ def resnet18_bn_imagenet1k_sam_mask_black() -> MLSetup:
 # ResNet-34 ImageNet-1k
 # ---------------------------------------------------------------------------
 
-def resnet34_imagenet1k(preset: int = 1) -> MLSetup:
+def resnet34_imagenet1k(preset: int = 1, override_dataset:Optional[DatasetSetup]=None) -> MLSetup:
     """ResNet-34 on ImageNet-1k, batch=256."""
     from torchvision import models
     from py_src.ml_setup_dataset import dataset_imagenet1k
     model = models.resnet34(num_classes=1000)
     pv = preset_version(preset)
-    ds = dataset_imagenet1k(pv)
+    ds = override_dataset if override_dataset is not None else dataset_imagenet1k(pv)
     criterion = imagenet_criterion(pv)
     collate_fn = imagenet_collate_fn(pv)
     sampler = imagenet_sampler_fn(pv)
@@ -168,13 +145,13 @@ def resnet34_imagenet1k(preset: int = 1) -> MLSetup:
 # ResNet-50 ImageNet
 # ---------------------------------------------------------------------------
 
-def resnet50_imagenet1k(preset: int = 1) -> MLSetup:
+def resnet50_imagenet1k(preset: int = 1, override_dataset:Optional[DatasetSetup]=None) -> MLSetup:
     """ResNet-50 on ImageNet-1k, batch=256."""
     from torchvision import models
     from py_src.ml_setup_dataset import dataset_imagenet1k
     model = models.resnet50(num_classes=1000)
     pv = preset_version(preset)
-    ds = dataset_imagenet1k(pv)
+    ds = override_dataset if override_dataset is not None else dataset_imagenet1k(pv)
     criterion = imagenet_criterion(pv)
     collate_fn = imagenet_collate_fn(pv)
     sampler = imagenet_sampler_fn(pv)
@@ -186,13 +163,13 @@ def resnet50_imagenet1k(preset: int = 1) -> MLSetup:
 
 
 
-def resnet50_imagenet100(preset: int = 1) -> MLSetup:
+def resnet50_imagenet100(preset: int = 1, override_dataset:Optional[DatasetSetup]=None) -> MLSetup:
     """ResNet-50 on ImageNet-100, batch=256."""
     from torchvision import models
     from py_src.ml_setup_dataset import dataset_imagenet100
     model = models.resnet50(num_classes=100)
     pv = preset_version(preset)
-    ds = dataset_imagenet100(pv)
+    ds = override_dataset if override_dataset is not None else dataset_imagenet100(pv)
     criterion = imagenet_criterion(pv)
     collate_fn = imagenet_collate_fn(pv)
     sampler = imagenet_sampler_fn(pv)

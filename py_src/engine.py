@@ -180,8 +180,9 @@ def train(
     result = TrainResult()
     step_limit = max_steps if max_steps is not None else sys.maxsize
 
+    step_counter = 0
     for batch_idx, batch in enumerate(dataloader):
-        if batch_idx >= step_limit:
+        if step_counter >= step_limit:
             break
 
         out = adapter.train_step(
@@ -201,6 +202,7 @@ def train(
         result.iterations += 1
 
         adapter.post_train_step()
+        step_counter += 1
 
     return result
 

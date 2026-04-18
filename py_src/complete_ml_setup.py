@@ -128,6 +128,15 @@ class FastTrainingSetup:
             else:
                 raise err
 
+        elif mt == ModelType.vgg11_no_bn:
+            if dt == DatasetType.cifar10:
+                epochs = 120
+                optimizer = torch.optim.SGD(model.parameters(), lr=1e-1, weight_decay=1e-4, momentum=0.9)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs * steps_per_epoch)
+                return optimizer, scheduler, epochs
+            else:
+                raise err
+
         elif mt == ModelType.cct_7_3x1_32:
             if dt in (DatasetType.cifar10,):
                 if preset == 0:
@@ -236,6 +245,17 @@ class FastTrainingSetup:
 
         elif mt == ModelType.dla_46_c:
             if dt == DatasetType.imagenet10:
+                epochs = 120
+                optimizer = torch.optim.SGD(model.parameters(), lr=1e-1, weight_decay=1e-4, momentum=0.9)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=epochs * steps_per_epoch,
+                )
+                return optimizer, scheduler, epochs
+            else:
+                raise err
+
+        elif mt == ModelType.dla:
+            if dt in (DatasetType.cifar10, DatasetType.cifar100):
                 epochs = 120
                 optimizer = torch.optim.SGD(model.parameters(), lr=1e-1, weight_decay=1e-4, momentum=0.9)
                 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(

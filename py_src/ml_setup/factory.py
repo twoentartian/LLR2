@@ -57,7 +57,7 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
             resnet18_gn_cifar100, resnet18_bn_cifar100,
             resnet18_bn_imagenet10, resnet18_gn_imagenet10,
             resnet18_bn_imagenet100, resnet18_gn_imagenet100,
-            resnet18_bn_imagenet1k, resnet18_gn_imagenet1k,
+            resnet18_imagenet1k, resnet18_gn_imagenet1k,
             resnet18_bn_imagenet1k_sam_mask_random_noise,
             resnet18_bn_imagenet1k_sam_mask_black,
         )
@@ -71,7 +71,7 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
         elif dt == DatasetType.imagenet100:
             return resnet18_gn_imagenet100(preset) if use_gn else resnet18_bn_imagenet100(preset)
         elif dt == DatasetType.imagenet1k:
-            return resnet18_gn_imagenet1k(preset) if use_gn else resnet18_bn_imagenet1k(preset)
+            return resnet18_gn_imagenet1k(preset) if use_gn else resnet18_imagenet1k(preset)
         elif dt == DatasetType.imagenet1k_sam_mask_random_noise:
             if use_gn:
                 raise _nie(mt, dt)

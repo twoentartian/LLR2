@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from collections.abc import Callable
 from typing import Optional, Any, List
 from torchvision import transforms, datasets

@@ -141,9 +141,10 @@ class StandardAdapter(ModelAdapter):
         if backpropagation and lr_scheduler is not None:
             lr_scheduler.step()
 
-        # accuracy (classification)
+        # Accuracy is well-defined for standard classification logits even if
+        # the training loss is label-smoothed or soft-target based.
         correct = None
-        if isinstance(self._criterion, nn.CrossEntropyLoss):
+        if outputs.ndim >= 2:
             _, predicted = torch.max(outputs, 1)
             target_indices = _classification_target_indices(label, outputs.size(1))
             if target_indices is not None:
@@ -152,7 +153,7 @@ class StandardAdapter(ModelAdapter):
         return StepOutput(
             loss=loss.item(),
             sample_count=label.size(0),
-            correct_count=correct,
+            correct_count=correct, # type: ignore
         )
 
     # ---- validation ----
@@ -167,7 +168,7 @@ class StandardAdapter(ModelAdapter):
             loss = self._criterion(outputs, label)
 
         correct = None
-        if isinstance(self._criterion, nn.CrossEntropyLoss):
+        if outputs.ndim >= 2:
             _, predicted = torch.max(outputs, 1)
             target_indices = _classification_target_indices(label, outputs.size(1))
             if target_indices is not None:
@@ -178,7 +179,7 @@ class StandardAdapter(ModelAdapter):
         return StepOutput(
             loss=loss.item(),
             sample_count=label.size(0),
-            correct_count=correct,
+            correct_count=correct, # type: ignore
             extra={"variance": variance},
         )
 

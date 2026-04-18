@@ -7,7 +7,7 @@ This wraps the existing GaussianDiffusion model with a
 from __future__ import annotations
 
 import os
-from typing import Literal
+from typing import Literal, Optional
 
 from PIL import Image
 import numpy as np
@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 import torchvision
 
-from py_src.ml_setup_dataset import DatasetType, dataset_cifar10
+from py_src.ml_setup_dataset import DatasetSetup, DatasetType, dataset_cifar10
 from py_src.ml_setup_model import ModelType
 from py_src.adapters import DiffusionAdapter
 from py_src.ml_setup import ApplicationType, MLSetup
@@ -111,9 +111,9 @@ def generate_sample(model: torch.nn.Module, output_folder:str, current_epoch:int
             os.path.join(output_folder, f"epoch{current_epoch}_{i}.png")
         )
 
-def ddpm_cifar10() -> MLSetup:
+def ddpm_cifar10(override_dataset:Optional[DatasetSetup]=None) -> MLSetup:
     transform = _ddpm_transform()
-    dataset = dataset_cifar10(
+    dataset = override_dataset if override_dataset is not None else dataset_cifar10(
         transforms_training=transform,
         transforms_testing=transform,
     )

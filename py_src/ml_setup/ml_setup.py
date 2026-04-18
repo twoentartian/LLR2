@@ -50,13 +50,13 @@ class MLSetup:
     # Public API: get dataloaders
     # ------------------------------------------------------------------
 
-    def train_dataloader(self, config: Optional[DataloaderConfig] = None) -> Iterable:
+    def train_dataloader(self, config: Optional[DataloaderConfig] = None, ignore_override=False) -> Iterable:
         """Build (or return) a training dataloader.
 
         If ``override_train_loader`` is set, it is returned as-is
         (config is ignored in that case).
         """
-        if self.override_train_loader is not None:
+        if self.override_train_loader is not None and not ignore_override:
             return self.override_train_loader
         return build_dataloader(
             dataset=self.training_data,
@@ -67,9 +67,9 @@ class MLSetup:
             default_sampler_fn=self.default_sampler_fn,
         )
 
-    def val_dataloader(self, config: Optional[DataloaderConfig] = None) -> Iterable:
+    def val_dataloader(self, config: Optional[DataloaderConfig] = None, ignore_override=False) -> Iterable:
         """Build (or return) a validation / test dataloader."""
-        if self.override_test_loader is not None:
+        if self.override_test_loader is not None and not ignore_override:
             return self.override_test_loader
         collate = self.default_collate_fn_val or self.default_collate_fn
         return build_dataloader(

@@ -7,9 +7,8 @@ import lightning as L
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-from py_src.ml_setup import get_ml_setup_from_config, MLSetup
+from py_src.ml_setup import ApplicationType, MLSetup
 from py_src.complete_ml_setup import FastTrainingSetup
-from py_src.ml_setup_model import ModelType
 from py_src.engine import Device, TrainResult, ValResult, train, val
 from py_src.ml_setup.dataloader_util import DataloaderConfig
 
@@ -24,6 +23,7 @@ def run_single_batch(
     amp: bool = False,
     preset: int = 0,
     run_val: bool = True,
+    batch_size: int = 8,
 ) -> "tuple[TrainResult, ValResult | None]":
     """Train for one batch and (optionally) evaluate for one batch.
 
@@ -53,12 +53,9 @@ def run_single_batch(
     """
     device = Device.cpu() if use_cpu else Device.auto()
 
-    batch_size = ml_setup.default_batch_size
     one_batch_cfg = DataloaderConfig(num_samples=batch_size, num_workers=0, pin_memory=False)
 
     train_loader = ml_setup.train_dataloader(one_batch_cfg)
-
-    is_diffusion = ml_setup.model_type == ModelType.ddpm_cifar10
 
     model = ml_setup.model
     adapter = ml_setup.adapter
@@ -81,7 +78,7 @@ def run_single_batch(
     )
 
     val_result = None
-    if run_val and not is_diffusion:
+    if run_val and ml_setup.application_type == ApplicationType.classifier:
         val_loader = ml_setup.val_dataloader(one_batch_cfg)
         val_result = val(adapter, val_loader, device=device)
 

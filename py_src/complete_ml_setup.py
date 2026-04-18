@@ -145,7 +145,6 @@ class FastTrainingSetup:
             warmup_steps = warmup_epochs * steps_per_epoch
             cosine_steps = (epochs - warmup_epochs) * steps_per_epoch
             optimizer = torch.optim.AdamW(model.parameters(), lr=initial_lr, weight_decay=weight_decay)
-
             def lr_lambda(step):
                 if step < warmup_steps:
                     lr = warmup_lr + (initial_lr - warmup_lr) * (step / warmup_steps)
@@ -155,7 +154,28 @@ class FastTrainingSetup:
                 else:
                     lr = min_lr
                 return lr / initial_lr
-
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+            return optimizer, scheduler, epochs
+        
+        elif mt == ModelType.cct_14_7x2_224:
+            if dt in (DatasetType.imagenet1k,):
+                weight_decay, initial_lr = 5e-2, 5e-4
+            else:
+                raise err
+            warmup_lr, min_lr = 0.000001, 0.00001
+            warmup_epochs, epochs, cooldown_epochs = 25, 300, 10
+            warmup_steps = warmup_epochs * steps_per_epoch
+            cosine_steps = (epochs - warmup_epochs) * steps_per_epoch
+            optimizer = torch.optim.AdamW(model.parameters(), lr=initial_lr, weight_decay=weight_decay)
+            def lr_lambda(step):
+                if step < warmup_steps:
+                    lr = warmup_lr + (initial_lr - warmup_lr) * (step / warmup_steps)
+                elif step < warmup_steps + cosine_steps:
+                    t = step - warmup_steps
+                    lr = min_lr + 0.5 * (initial_lr - min_lr) * (1 + math.cos(math.pi * t / cosine_steps))
+                else:
+                    lr = min_lr
+                return lr / initial_lr
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
             return optimizer, scheduler, epochs
 

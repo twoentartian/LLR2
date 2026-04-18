@@ -192,6 +192,36 @@ def dataset_imagenet10(
     val_data = datasets.ImageFolder(os.path.join(imagenet10_path, "val"), transform=transforms_testing)
     return DatasetSetup(DatasetType.imagenet10, train_data, val_data)
 
+def dataset_imagenet1k_from_pytorch(train_crop_size=224, val_resize_size=256, val_crop_size=224,
+                              interpolation=transforms.InterpolationMode.BILINEAR, auto_augment_policy=None,
+                              random_erase_prob=0.0, ra_magnitude=9, augmix_severity=3,
+                              backend='pil', use_v2=False):
+    from .dataset_imagenet_raw_pytorch import ClassificationPresetTrain
+    dataset_type = DatasetType.imagenet1k
+    dataset_path = f'{imagenet1k_path}/train' if imagenet1k_path is None else f"{imagenet1k_path}/train"
+    dataset_train = datasets.ImageFolder(
+        dataset_path,
+        ClassificationPresetTrain(
+            crop_size=train_crop_size,
+            interpolation=interpolation,
+            auto_augment_policy=auto_augment_policy,
+            random_erase_prob=random_erase_prob,
+            ra_magnitude=ra_magnitude,
+            augmix_severity=augmix_severity,
+            backend=backend,
+            use_v2=use_v2,
+        ),
+    )
+    dataset_path = f'{imagenet1k_path}/val' if imagenet1k_path is None else f"{imagenet1k_path}/val"
+    transforms_test = transforms.Compose([
+        transforms.Resize(val_resize_size),
+        transforms.CenterCrop(val_crop_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    dataset_test = datasets.ImageFolder(dataset_path, transforms_test)
+    return DatasetSetup(dataset_type, dataset_train, dataset_test)
+
 
 def dataset_imagenet1k_sam_mask_random_noise(
     train_crop_size: int = 224,

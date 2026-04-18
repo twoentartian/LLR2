@@ -9,6 +9,7 @@ from .dataset_imagenet import (
     dataset_imagenet1k,
     dataset_imagenet100,
     dataset_imagenet10,
+    dataset_imagenet1k_from_pytorch,
     dataset_imagenet1k_sam_mask_random_noise,
     dataset_imagenet1k_sam_mask_black,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "dataset_imagenet1k",
     "dataset_imagenet100",
     "dataset_imagenet10",
+    "dataset_imagenet1k_from_pytorch",
     "dataset_imagenet1k_sam_mask_random_noise",
     "dataset_imagenet1k_sam_mask_black",
 ]

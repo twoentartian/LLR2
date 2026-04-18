@@ -23,7 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import lightning as L
 
-from py_src.ml_setup.resnet import resnet18_bn_imagenet1k, resnet50_imagenet1k
+from py_src.ml_setup import alexnet_imagenet1k, resnet18_bn_imagenet1k, resnet50_imagenet1k, cct14_7x2_imagenet1k
 
 # ---------------------------------------------------------------------------
 # Make sure the LLR2 project root is importable regardless of where the test
@@ -80,7 +80,6 @@ class TestRunSingleBatch(unittest.TestCase):
         if val_result is not None:
             print("val loss:{val_result.avg_loss:.4f}")
 
-
     def test_ddpm_train_no_val(self):
         """Diffusion models skip validation even when run_val=True."""
         setup = ddpm_cifar10()
@@ -111,6 +110,15 @@ class TestRunSingleBatch(unittest.TestCase):
         print(f"train loss:{train_result.avg_loss:.4f} train accuracy:{train_result.accuracy:.4f}")
         if val_result is not None:
             print("val loss:{val_result.avg_loss:.4f}")
+
+    def test_cct14_7x2_imagenet1k_train_and_val_timm(self):
+        setup = cct14_7x2_imagenet1k()
+        train_result, val_result = run_single_batch(setup, run_val=True, batch_size=1, use_cpu=False)
+        print(f"cct14_7x2_imagenet1k")
+        print(f"train loss:{train_result.avg_loss:.4f} train accuracy:{train_result.accuracy:.4f}")
+        if val_result is not None:
+            print("val loss:{val_result.avg_loss:.4f}")
+
 
     # def test_nanoclip_train_and_val(self):
     #     setup = ()

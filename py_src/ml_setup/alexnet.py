@@ -15,4 +15,4 @@ def alexnet_imagenet1k() -> MLSetup:
     pv: int = preset_version(1)
     ds = dataset_imagenet1k(preset_version=pv)
     model = models.alexnet(progress=False, weights=None, num_classes=1000)
-    return make_setup(model, ModelType.alexnet, dataset_imagenet1k(preset_version=1), 256)
+    return make_setup(model, ModelType.alexnet, ds, 256)

@@ -23,7 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import lightning as L
 
-from py_src.ml_setup.resnet import resnet18_bn_imagenet1k
+from py_src.ml_setup.resnet import resnet18_bn_imagenet1k, resnet50_imagenet1k
 
 # ---------------------------------------------------------------------------
 # Make sure the LLR2 project root is importable regardless of where the test
@@ -91,7 +91,7 @@ class TestRunSingleBatch(unittest.TestCase):
     def test_resnet18_imagenet1k_train_and_val_p1(self):
         setup = resnet18_bn_imagenet1k(1)
         train_result, val_result = run_single_batch(setup, run_val=True)
-        print(f"resnet18_bn_imagenet1k")
+        print(f"resnet18_bn_imagenet1k_p1")
         print(f"train loss:{train_result.avg_loss:.4f} train accuracy:{train_result.accuracy:.4f}")
         if val_result is not None:
             print("val loss:{val_result.avg_loss:.4f}")
@@ -99,7 +99,15 @@ class TestRunSingleBatch(unittest.TestCase):
     def test_resnet18_imagenet1k_train_and_val_p2(self):
         setup = resnet18_bn_imagenet1k(2)
         train_result, val_result = run_single_batch(setup, run_val=True)
-        print(f"resnet18_bn_imagenet1k")
+        print(f"resnet18_bn_imagenet1k_p2")
+        print(f"train loss:{train_result.avg_loss:.4f} train accuracy:{train_result.accuracy:.4f}")
+        if val_result is not None:
+            print("val loss:{val_result.avg_loss:.4f}")
+    
+    def test_resnet50_imagenet1k_train_and_val_p2(self):
+        setup = resnet50_imagenet1k(2)
+        train_result, val_result = run_single_batch(setup, run_val=True)
+        print(f"resnet50_bn_imagenet1k_p2")
         print(f"train loss:{train_result.avg_loss:.4f} train accuracy:{train_result.accuracy:.4f}")
         if val_result is not None:
             print("val loss:{val_result.avg_loss:.4f}")

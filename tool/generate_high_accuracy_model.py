@@ -17,7 +17,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from py_src.util import setup_logging, set_seed, re_initialize_model
 from py_src.model_opti_save_load import save_model_state, save_optimizer_state, load_model_state_file
-from py_src.ml_setup import get_ml_setup_from_config, MLSetup
+from py_src.ml_setup import ApplicationType, get_ml_setup_from_config, MLSetup
 from py_src.complete_ml_setup import FastTrainingSetup, TransferTrainingSetup
 from py_src.ml_setup_model import ModelType
 from py_src.ml_setup_dataset import DatasetType
@@ -125,9 +125,7 @@ def training_model(
 
     dataloader = arg_ml_setup.train_dataloader(DataloaderConfig(num_workers=num_workers))
 
-    is_diffusion = arg_ml_setup.model_type == ModelType.ddpm_cifar10
-
-    if enable_validation and not is_diffusion:
+    if enable_validation and arg_ml_setup.application_type==ApplicationType.classifier:
         dataloader_test = arg_ml_setup.val_dataloader(DataloaderConfig(num_workers=num_workers))
     else:
         dataloader_test = None
@@ -245,15 +243,10 @@ def training_model(
             )
 
         # DDPM: generate sample images after each epoch
-        if is_diffusion:
-            with torch.no_grad():
-                model.eval()
-                samples = model.sample(10, device.device) # type: ignore
-                samples = ((samples + 1) / 2).clip(0, 1).permute(0, 2, 3, 1).cpu().numpy()
-                for i, sample in enumerate(samples):
-                    Image.fromarray((sample * 255).astype(np.uint8)).save(
-                        os.path.join(output_folder, f"epoch{epoch}_{i}.png")
-                    )
+        if arg_ml_setup.application_type == ApplicationType.diffusion:
+            if arg_ml_setup.difussion_generate_sample is not None:
+                with torch.no_grad():
+                    arg_ml_setup.difussion_generate_sample(model, output_folder, epoch)
 
     child_logger.info("training complete")
     log_csv.flush()

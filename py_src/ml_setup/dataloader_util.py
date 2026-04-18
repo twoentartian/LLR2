@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Callable, Any, Iterable
 
 import torch
-from torch.utils.data import DataLoader, Dataset, IterableDataset, Subset
+from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler, Subset
 
 
 # ---------------------------------------------------------------------------
@@ -73,21 +73,23 @@ def build_dataloader(
     batch_size = cfg.batch_size or default_batch_size
     shuffle = cfg.shuffle if cfg.shuffle is not None else is_train
     collate_fn = cfg.collate_fn or default_collate_fn
+    assert default_sampler_fn is None or cfg.sampler is None, "default_sampler_fn and cfg.sampler cannot be set at the same time"
+    sampler = cfg.sampler if cfg.sampler is not None else default_sampler_fn
+    if sampler is not None and not isinstance(sampler, Sampler) and callable(sampler):
+        sampler = sampler(actual_dataset)
 
     loader_kwargs: dict = dict(
         dataset=actual_dataset,
         batch_size=batch_size,
-        shuffle=shuffle if cfg.sampler is None else False,
+        shuffle=shuffle if sampler is None else False,
         num_workers=cfg.num_workers,
         pin_memory=cfg.pin_memory,
         drop_last=cfg.drop_last,
         collate_fn=collate_fn,
-        prefetch_factor=4,
+        prefetch_factor=4 if cfg.num_workers>1 else None,
         persistent_workers=cfg.num_workers>1,
-        sampler=default_sampler_fn,
     )
-    if cfg.sampler is not None:
-        assert default_sampler_fn is None, "default_sampler_fn and cfg.sampler conflict"
-        loader_kwargs["sampler"] = cfg.sampler
+    if sampler is not None:
+        loader_kwargs["sampler"] = sampler
 
     return DataLoader(**loader_kwargs)

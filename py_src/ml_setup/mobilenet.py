@@ -1,4 +1,5 @@
 import torch.nn as nn
+from torch.utils.data.dataloader import default_collate
 
 from py_src.ml_setup.ml_setup import MLSetup
 from py_src.ml_setup_model import ModelType
@@ -44,5 +45,5 @@ def mobilenet_v3_large_imagenet1k(preset: int = 1) -> MLSetup:
     return make_setup(model, ModelType.mobilenet_v3_large, ds, 128,
                        criterion=imagenet_criterion(pv),
                        default_collate_fn=collate_fn,
+                       default_collate_fn_val=default_collate,
                        default_sampler_fn=sampler_fn)
-

@@ -23,6 +23,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import lightning as L
 
+from py_src.ml_setup.resnet import resnet18_bn_imagenet1k
+
 # ---------------------------------------------------------------------------
 # Make sure the LLR2 project root is importable regardless of where the test
 # runner is launched from.
@@ -70,10 +72,9 @@ class _TinyNanoCLIPDataset(torch.utils.data.Dataset):
 class TestRunSingleBatch(unittest.TestCase):
     """Smoke-tests: one train batch + one val batch (where applicable)."""
 
-    def test_resnet18_train_and_val(self):
+    def test_resnet18_cifar10_train_and_val(self):
         setup = resnet18_bn_cifar10()
         train_result, val_result = run_single_batch(setup, run_val=True)
-
         print(f"resnet18_bn_cifar10")
         print(f"train loss:{train_result.avg_loss:.4f} train accuracy:{train_result.accuracy:.4f}")
         if val_result is not None:
@@ -84,9 +85,24 @@ class TestRunSingleBatch(unittest.TestCase):
         """Diffusion models skip validation even when run_val=True."""
         setup = ddpm_cifar10()
         train_result, val_result = run_single_batch(setup, run_val=False)
-
         print(f"ddpm_cifar10")
         print(f"train loss:{train_result.avg_loss:.4f}")
+
+    def test_resnet18_imagenet1k_train_and_val_p1(self):
+        setup = resnet18_bn_imagenet1k(1)
+        train_result, val_result = run_single_batch(setup, run_val=True)
+        print(f"resnet18_bn_imagenet1k")
+        print(f"train loss:{train_result.avg_loss:.4f} train accuracy:{train_result.accuracy:.4f}")
+        if val_result is not None:
+            print("val loss:{val_result.avg_loss:.4f}")
+
+    def test_resnet18_imagenet1k_train_and_val_p2(self):
+        setup = resnet18_bn_imagenet1k(2)
+        train_result, val_result = run_single_batch(setup, run_val=True)
+        print(f"resnet18_bn_imagenet1k")
+        print(f"train loss:{train_result.avg_loss:.4f} train accuracy:{train_result.accuracy:.4f}")
+        if val_result is not None:
+            print("val loss:{val_result.avg_loss:.4f}")
 
     # def test_nanoclip_train_and_val(self):
     #     setup = ()

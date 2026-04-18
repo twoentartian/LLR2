@@ -32,6 +32,15 @@ def _to_device(x: Any, device: torch.device) -> Any:
     return x
 
 
+def _classification_target_indices(label: torch.Tensor, num_classes: int) -> Optional[torch.Tensor]:
+    """Return class indices for hard or soft classification targets."""
+    if label.ndim == 1:
+        return label
+    if label.ndim == 2 and label.size(1) == num_classes:
+        return label.argmax(dim=1)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Abstract base
 # ---------------------------------------------------------------------------
@@ -136,7 +145,9 @@ class StandardAdapter(ModelAdapter):
         correct = None
         if isinstance(self._criterion, nn.CrossEntropyLoss):
             _, predicted = torch.max(outputs, 1)
-            correct = (predicted == label).sum().item()
+            target_indices = _classification_target_indices(label, outputs.size(1))
+            if target_indices is not None:
+                correct = (predicted == target_indices).sum().item()
 
         return StepOutput(
             loss=loss.item(),
@@ -158,7 +169,9 @@ class StandardAdapter(ModelAdapter):
         correct = None
         if isinstance(self._criterion, nn.CrossEntropyLoss):
             _, predicted = torch.max(outputs, 1)
-            correct = (predicted == label).sum().item()
+            target_indices = _classification_target_indices(label, outputs.size(1))
+            if target_indices is not None:
+                correct = (predicted == target_indices).sum().item()
 
         variance = outputs.var(dim=0, unbiased=False).mean().item()
 

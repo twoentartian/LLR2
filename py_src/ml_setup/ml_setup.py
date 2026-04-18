@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 from enum import Enum, auto
 
+import torch
 import torch.nn as nn
 
 from py_src.adapters import ModelAdapter
@@ -43,7 +44,7 @@ class MLSetup:
     override_test_loader: Optional[Iterable] = None
 
     # ---- special functions ------------------------------------------------
-    difussion_generate_sample: Optional[Callable[[nn.Module, str, int], None]] = None
+    difussion_generate_sample: Optional[Callable[[nn.Module, str, int, torch.device], None]] = None
 
     # ------------------------------------------------------------------
     # Public API: get dataloaders

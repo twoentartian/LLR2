@@ -102,9 +102,9 @@ def _build_ddpm_model(
 # Public factory
 # ---------------------------------------------------------------------------
 
-def generate_sample(model: torch.nn.Module, output_folder:str, current_epoch:int) -> None:
+def generate_sample(model: torch.nn.Module, output_folder:str, current_epoch:int, device:torch.device) -> None:
     model.eval()
-    samples = model.sample(10, device.device) # type: ignore
+    samples = model.sample(10, device) # type: ignore
     samples = ((samples + 1) / 2).clip(0, 1).permute(0, 2, 3, 1).cpu().numpy()
     for i, sample in enumerate(samples):
         Image.fromarray((sample * 255).astype(np.uint8)).save(

@@ -110,8 +110,11 @@ def rebuild_norm_layer_function(
 # ---------------------------------------------------------------------------
 
 def _get_criterion(ml_setup) -> torch.nn.Module:
-    """Extract criterion from an MLSetup adapter (StandardAdapter)."""
+    """Extract criterion from an MLSetup."""
     from py_src.adapters import StandardAdapter
+    criterion = getattr(ml_setup, "criterion", None)
+    if criterion is not None:
+        return criterion
     if isinstance(ml_setup.adapter, StandardAdapter):
         return ml_setup.adapter._criterion
     raise AttributeError("Cannot extract criterion from adapter type: "

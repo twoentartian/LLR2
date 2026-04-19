@@ -34,11 +34,10 @@ def nanoclip_flickr30k_default(override_dataset: Optional[DatasetSetup] = None) 
         testing_data=dataset.valdation_data,
         dataset_type=dataset.dataset_type,
         default_batch_size=128,
+        criterion=criterion,
         default_collate_fn=CollateFlickr(tokenizer, max_length=80, captions_to_use="all"),
         default_collate_fn_val=CollateFlickr(tokenizer, max_length=80, captions_to_use="first"),
         has_normalization_layer=True,
         application_type=ApplicationType.clip,
     )
-    # Keep a DFL_torch-style attribute around for any callers that still look for it.
-    setattr(output_ml_setup, "criterion", criterion)
     return output_ml_setup

@@ -362,3 +362,34 @@ class CustomStepAdapter(ModelAdapter):
     def val_step(self, batch, batch_idx, device) -> StepOutput:
         batch = _to_device(batch, device)
         return self._val_step_fn(batch_idx, batch, self._model, self.extra_ctx)
+
+
+def clone_adapter_for_model(
+    adapter: ModelAdapter,
+    model: nn.Module,
+    *,
+    criterion: Optional[nn.Module] = None,
+) -> ModelAdapter:
+    """Create an adapter of the same family bound to *model*.
+
+    Services often reuse a shared model instance whose weights change over time.
+    They need an adapter that matches the original ML setup without forcing
+    every model family through ``StandardAdapter``.
+    """
+    if isinstance(adapter, StandardAdapter):
+        criterion_to_use = criterion if criterion is not None else adapter._criterion
+        return StandardAdapter(model, criterion_to_use, clip_grad_norm=adapter._clip_grad_norm)
+    if isinstance(adapter, LightningAdapter):
+        if not isinstance(model, L.LightningModule):
+            raise TypeError("LightningAdapter requires a LightningModule model")
+        return LightningAdapter(model)
+    if isinstance(adapter, DiffusionAdapter):
+        return DiffusionAdapter(model)
+    if isinstance(adapter, CustomStepAdapter):
+        return CustomStepAdapter(
+            model,
+            adapter._train_step_fn,
+            adapter._val_step_fn,
+            extra_ctx=adapter.extra_ctx,
+        )
+    raise TypeError(f"Unsupported adapter type: {type(adapter).__name__}")

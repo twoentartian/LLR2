@@ -21,7 +21,7 @@ from torch.utils.data import Subset
 
 from py_src.service_base import Service
 from py_src.simulation_runtime_parameters import RuntimeParameters, SimulationPhase
-from py_src.adapters import StandardAdapter
+from py_src.adapters import ModelAdapter, clone_adapter_for_model
 from py_src.engine import Device, val as engine_val
 from py_src.ml_setup.dataloader_util import DataloaderConfig
 from py_src.model_opti_save_load import save_model_state
@@ -93,7 +93,7 @@ class ServiceTestAccuracyLossRecorder(Service):
 
         self.node_order: Optional[List] = None
         self.test_model: Optional[nn.Module] = None
-        self._adapter: Optional[StandardAdapter] = None
+        self._adapter: Optional[ModelAdapter] = None
         self.criterion: Optional[nn.Module] = None
         self.collate_fn = None
         self.test_dataset = None
@@ -142,7 +142,7 @@ class ServiceTestAccuracyLossRecorder(Service):
         output_path: str,
         node_names: list,
         model: nn.Module,
-        criterion: nn.Module,
+        criterion: Optional[nn.Module],
         test_dataset,
         ml_setup,
         logger: Optional[logging.Logger] = None,
@@ -229,7 +229,7 @@ class ServiceTestAccuracyLossRecorder(Service):
         # Reuse the provided evaluation model directly.
         self.test_model = model
         self.test_model = self.test_model.to(self._device)
-        self._adapter = StandardAdapter(self.test_model, self.criterion)
+        self._adapter = clone_adapter_for_model(ml_setup.adapter, self.test_model, criterion=self.criterion)
 
         # Top-accuracy buffer
         self.store_top_accuracy_model_buffer = {}
@@ -257,7 +257,7 @@ class ServiceTestAccuracyLossRecorder(Service):
             batch_size=batch_size or self.test_batch_size,
             num_workers=num_workers or 0,
             num_samples=num_samples,
-            shuffle=True,
+            shuffle=False,
             pin_memory=True,
         )
         return loader_setup.val_dataloader(loader_config, ignore_override=False)
@@ -285,7 +285,6 @@ class ServiceTestAccuracyLossRecorder(Service):
         assert self._adapter is not None
         assert self.test_dataset is not None
         assert self.node_order is not None
-        assert self.criterion is not None
         assert self.accuracy_file is not None
         assert self.loss_file is not None
         assert self.output_var_file is not None
@@ -331,23 +330,10 @@ class ServiceTestAccuracyLossRecorder(Service):
                 else:
                     loss = 0.0; accuracy = 0.0
             else:
-                if self.use_fixed_testing_dataset:
-                    result = engine_val(self._adapter, self.test_dataset, device=self._device_obj)
-                    accuracy = result.accuracy or 0.0
-                    loss = result.avg_loss
-                    var = result.extra.get("variance", 0.0)
-                else:
-                    # Single batch evaluation
-                    data, labels = next(iter(self.test_dataset))
-                    data = data.to(self._device)
-                    labels = labels.to(self._device)
-                    self.test_model.eval()
-                    with torch.no_grad():
-                        outputs = self.test_model(data)
-                        loss = self.criterion(outputs, labels).item()
-                        _, predicted = torch.max(outputs, 1)
-                        accuracy = (predicted == labels).sum().item() / len(labels)
-                        var = outputs.var(dim=0, unbiased=False).mean().item()
+                result = engine_val(self._adapter, self.test_dataset, device=self._device_obj)
+                accuracy = result.accuracy or 0.0
+                loss = result.avg_loss
+                var = result.extra.get("variance", 0.0)
 
             row_acc.append('%.4E' % accuracy)
             row_loss.append('%.4E' % loss)

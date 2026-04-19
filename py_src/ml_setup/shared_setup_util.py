@@ -21,6 +21,7 @@ def make_setup(model, model_type, dataset_setup, batch_size, has_normalization=T
         testing_data=dataset_setup.valdation_data,
         dataset_type=dataset_setup.dataset_type,
         default_batch_size=batch_size,
+        criterion=criterion,
         has_normalization_layer=has_normalization,
         application_type=application_type,
         default_collate_fn=default_collate_fn,

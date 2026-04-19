@@ -34,6 +34,7 @@ class MLSetup:
 
     # ---- training defaults ------------------------------------------------
     default_batch_size: int = 0
+    criterion: Optional[nn.Module] = None
     default_collate_fn: Optional[Callable] = None
     default_collate_fn_val: Optional[Callable] = None
     default_sampler_fn: Optional[Callable] = None

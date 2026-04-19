@@ -23,7 +23,7 @@ from torch.utils.data import Subset
 
 from py_src.service_base import Service
 from py_src.simulation_runtime_parameters import RuntimeParameters, SimulationPhase
-from py_src.adapters import StandardAdapter
+from py_src.adapters import ModelAdapter, clone_adapter_for_model
 from py_src.engine import Device, train as engine_train
 from py_src.ml_setup.dataloader_util import DataloaderConfig
 
@@ -58,7 +58,7 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
         self.accuracy_file = None
         self.dataloader = None
         self.test_model: Optional[nn.Module] = None
-        self._adapter: Optional[StandardAdapter] = None
+        self._adapter: Optional[ModelAdapter] = None
         self.criterion: Optional[nn.Module] = None
         self._device_obj: Optional[Device] = None
         self._device: Optional[torch.device] = None
@@ -101,7 +101,7 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
         self,
         output_path: str,
         model: nn.Module,
-        criterion: nn.Module,
+        criterion: Optional[nn.Module],
         train_dataset,
         ml_setup,
         logger: Optional[logging.Logger] = None,
@@ -120,7 +120,7 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
 
         self.test_model = model
         self.test_model = self.test_model.to(self._device)
-        self._adapter = StandardAdapter(self.test_model, self.criterion)
+        self._adapter = clone_adapter_for_model(ml_setup.adapter, self.test_model, criterion=self.criterion)
         self._state_targets = self._get_state_targets(self.test_model)
         self._float_state_names = [
             name for name, tensor in self._state_targets.items() if tensor.dtype.is_floating_point

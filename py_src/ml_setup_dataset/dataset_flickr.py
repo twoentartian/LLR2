@@ -9,11 +9,16 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
+from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 
 import pathlib
 from collections import defaultdict
 from PIL import Image
 import random
+
+from .dataset_default import flickr30k_path
+from .dataset_types import DatasetSetup, DatasetType
 
 
 class Flickr30k(Dataset):
@@ -116,3 +121,35 @@ class CollateFlickr:
             masks = captions['attention_mask'].squeeze(0)
 
         return images, captions_ids, masks
+
+
+def dataset_flickr30k(transforms_training=None, transforms_testing=None, *args, **kwargs):
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+
+    train_transform = transforms.Compose([
+        transforms.RandomRotation(15),
+        transforms.RandomResizedCrop((224, 224), scale=(0.8, 1.0), interpolation=InterpolationMode.BILINEAR),
+        transforms.RandomHorizontalFlip(0.5),
+        transforms.RandomVerticalFlip(0.1),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.0),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+    valid_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+
+    dataset_train = Flickr30k(
+        flickr30k_path,
+        split="train",
+        img_transform=train_transform if transforms_training is None else transforms.Compose(transforms_training),
+    )
+    dataset_test = Flickr30k(
+        flickr30k_path,
+        split="val",
+        img_transform=valid_transform if transforms_testing is None else transforms.Compose(transforms_testing),
+    )
+    return DatasetSetup(DatasetType.flickr30k, dataset_train, dataset_test)

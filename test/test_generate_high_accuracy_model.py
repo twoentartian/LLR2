@@ -9,7 +9,13 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from typing import Any
+from unittest.mock import patch
 
+import lightning as L
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torchvision import transforms
 
 from py_src.ml_setup import (
@@ -31,6 +37,7 @@ from py_src.ml_setup import (
     mobilenet_v2_cifar10,
     mobilenet_v2_cifar100,
     mobilenet_v3_large_imagenet1k,
+    nanoclip_flickr30k_default,
     regnet_x_200mf_cifar10,
     regnet_x_200mf_cifar100,
     resnet18_cifar10,
@@ -54,7 +61,9 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from py_src.ml_setup.ml_setup import MLSetup
+from py_src.ml_setup_dataset import DatasetSetup, DatasetType
 from test.util import (
+    DummyDatasetNanoCLIP,
     make_dummy_cifar10,
     make_dummy_cifar100,
     make_dummy_imagenet10,
@@ -62,6 +71,58 @@ from test.util import (
     make_dummy_mnist,
     run_single_batch,
 )
+
+
+class _DummyNanoCLIPModel(L.LightningModule):
+    def __init__(self, embed_dim: int = 16, image_size: int = 8, vocab_size: int = 100):
+        super().__init__()
+        self.img_encoder = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(3 * image_size * image_size, embed_dim),
+        )
+        self.txt_encoder = nn.Embedding(vocab_size, embed_dim)
+        self.latest_loss = 0.0
+        self.latest_accuracy = 0.0
+
+    def configure_optimizers(self) -> Any:
+        return None, None
+
+    def forward(self, images: torch.Tensor, captions: torch.Tensor, masks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        image_embedding = F.normalize(self.img_encoder(images), p=2, dim=-1)
+        token_embeddings = self.txt_encoder(captions)
+        masked_embeddings = token_embeddings * masks.unsqueeze(-1)
+        text_embedding = masked_embeddings.sum(dim=1) / masks.sum(dim=1, keepdim=True).clamp_min(1)
+        text_embedding = F.normalize(text_embedding, p=2, dim=-1)
+        return image_embedding, text_embedding
+
+    def training_step(self, batch: Any, batch_idx: int) -> Any:
+        images, captions, masks = batch
+        image_embedding, text_embedding = self(images, captions, masks)
+        logits = image_embedding @ text_embedding.T
+        labels = torch.arange(logits.size(0), device=logits.device)
+        loss = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
+        accuracy = (logits.argmax(dim=1) == labels).float().mean()
+        return loss, accuracy
+
+    def on_validation_epoch_start(self):
+        self.latest_loss = 0.0
+        self.latest_accuracy = 0.0
+
+    def validation_step(self, batch: Any, batch_idx: int) -> Any:
+        images, captions, masks = batch
+        image_embedding, text_embedding = self(images, captions, masks)
+        logits = image_embedding @ text_embedding.T
+        labels = torch.arange(logits.size(0), device=logits.device)
+        loss = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) / 2
+        accuracy = (logits.argmax(dim=1) == labels).float().mean()
+        self.latest_loss = float(loss.item())
+        self.latest_accuracy = float(accuracy.item())
+
+    def on_validation_epoch_end(self):
+        return None
+
+    def get_validation_result(self):
+        return self.latest_loss, int(self.latest_accuracy)
 
 
 class TestRunSingleBatch(unittest.TestCase):
@@ -317,6 +378,26 @@ class TestRunSingleBatch(unittest.TestCase):
             ),
             batch_size=1,
         )
+
+    @patch("py_src.ml_setup.nanoclip.AutoTokenizer.from_pretrained", return_value=object())
+    @patch("py_src.ml_setup.nanoclip.NanoCLIP", side_effect=lambda *args, **kwargs: _DummyNanoCLIPModel())
+    def test_nanoclip_flickr30k_train_no_val(self, _mock_model_ctor, _mock_tokenizer):
+        dummy_dataset = DatasetSetup(
+            DatasetType.flickr30k,
+            DummyDatasetNanoCLIP(n=8, img_size=8, seq_len=8),
+            DummyDatasetNanoCLIP(n=8, img_size=8, seq_len=8),
+        )
+        setup = nanoclip_flickr30k_default(override_dataset=dummy_dataset)
+        setup.default_collate_fn = None
+        setup.default_collate_fn_val = None
+
+        train_result, val_result = run_single_batch(setup, run_val=True, batch_size=4)
+        self.assertGreater(train_result.iterations, 0)
+        self.assertGreater(train_result.total_count, 0)
+        self.assertIsNotNone(train_result.accuracy)
+        self.assertIsNone(val_result)
+        print("nanoclip_flickr30k_default")
+        print(f"train loss:{train_result.avg_loss:.4f} train accuracy:{train_result.accuracy:.4f}")
 
 
 if __name__ == "__main__":

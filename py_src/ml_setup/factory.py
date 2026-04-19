@@ -195,6 +195,12 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
             return ddpm_cifar10()
         raise _nie(mt, dt)
 
+    elif mt == ModelType.nanoclip_default:
+        from .nanoclip import nanoclip_flickr30k_default
+        if _default or dt == DatasetType.flickr30k:
+            return nanoclip_flickr30k_default()
+        raise _nie(mt, dt)
+
     else:
         raise NotImplementedError(f"No MLSetup defined for model_type={mt.name} in LLR2 yet.")
 

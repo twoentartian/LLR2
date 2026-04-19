@@ -17,6 +17,7 @@ from .vgg import vgg11_bn_cifar10, vgg11_no_bn_cifar10
 from .cct import cct_7_3x1_cifar10, cct_7_3x1_cifar100, cct14_7x2_imagenet1k
 
 from .ddpm import ddpm_cifar10
+from .nanoclip import nanoclip_flickr30k_default
 
 __all__ = [
     "get_ml_setup_from_config", "MLSetup", "ApplicationType",
@@ -34,4 +35,5 @@ __all__ = [
     "vgg11_bn_cifar10", "vgg11_no_bn_cifar10",
     "cct_7_3x1_cifar10", "cct_7_3x1_cifar100", "cct14_7x2_imagenet1k",
     "ddpm_cifar10",
+    "nanoclip_flickr30k_default",
     ]

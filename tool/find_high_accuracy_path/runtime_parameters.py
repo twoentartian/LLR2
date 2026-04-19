@@ -6,6 +6,8 @@ from typing import Iterable, Optional, Set
 from py_src.ml_setup_dataset import DatasetType
 from py_src.ml_setup_model import ModelType
 
+from .find_parameters import ParameterGeneral, ParameterMove, ParameterRebuildNorm, ParameterTrain
+
 class WorkMode(Enum):
     unknown = auto()
     to_origin = auto()
@@ -99,14 +101,14 @@ class RuntimeParameters:
 
 
 class Checkpoint:
-    current_model_stat = None
-    current_optimizer_stat = None
-    start_model_stat = None
-    end_model_stat = None
-    init_model_stat = None
+    current_model_stat: Optional[dict] = None
+    current_optimizer_stat: Optional[dict] = None
+    start_model_stat: Optional[dict] = None
+    end_model_stat: Optional[dict] = None
+    init_model_stat: Optional[dict] = None
 
     current_runtime_parameter: Optional[RuntimeParameters] = None
-    current_general_parameter = None
-    current_move_parameter = None
-    current_train_parameter = None
-    current_rebuild_norm_parameter = None
+    current_general_parameter: Optional[ParameterGeneral] = None
+    current_move_parameter: Optional[ParameterMove] = None
+    current_train_parameter: Optional[ParameterTrain] = None
+    current_rebuild_norm_parameter: Optional[ParameterRebuildNorm] = None

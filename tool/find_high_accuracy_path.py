@@ -347,9 +347,9 @@ def _apply_attention_policy(
     old_attention_state: Dict[str, Any],
     target_state: Dict[str, Any],
     attention_layers: list[str],
-    policy: str,
+    policy: Optional[str],
 ) -> None:
-    if not attention_layers or policy == "none":
+    if not attention_layers or policy == None:
         return
     if policy != "ignore_kv":
         raise NotImplementedError(f"Attention policy {policy!r} is not implemented")
@@ -598,6 +598,7 @@ class FindHighAccuracyPathRunner:
             raise RuntimeError("get_parameter_general(...) must return a ParameterGeneral instance")
         general_parameter = self.general_parameter
 
+        assert general_parameter.max_tick is not None, f"max_tick is not set"
         runtime_parameter.max_tick = general_parameter.max_tick
         runtime_parameter.current_tick = 0
         runtime_parameter.test_dataset_use_whole = (
@@ -626,7 +627,8 @@ class FindHighAccuracyPathRunner:
 
         if checkpoint_file_path is not None:
             assert self.checkpoint_content is not None
-            checkpoint_content = self.checkpoint_content
+            checkpoint_content: Checkpoint = self.checkpoint_content
+            assert checkpoint_content.current_optimizer_stat is not None
             optimizer.load_state_dict(checkpoint_content.current_optimizer_stat)
             _optimizer_to(optimizer, device)
 
@@ -704,6 +706,7 @@ class FindHighAccuracyPathRunner:
             start_point = self.start_point
             start_model_state, start_model_name, dataset_name_in_file = load_model_state_file(start_point)
             start_model_type = RuntimeParameters.coerce_model_type(start_model_name)
+            assert(start_model_type is not None)
             dataset_type_in_file = RuntimeParameters.coerce_dataset_type(dataset_name_in_file)
             if dataset_type_in_file is None:
                 dataset_type_in_file = runtime_parameter.dataset_type
@@ -756,7 +759,7 @@ class FindHighAccuracyPathRunner:
                 child_logger.info("Work mode: to_inf")
             elif runtime_parameter.work_mode == WorkMode.to_mean:
                 self.end_model_stat_dict = {
-                    key: torch.full_like(value, value.float().mean()) if torch.is_tensor(value) else copy.deepcopy(value)
+                    key: torch.full_like(value, value.float().mean().item()) if torch.is_tensor(value) else copy.deepcopy(value)
                     for key, value in start_model_state.items()
                 }
                 child_logger.info("Work mode: to_mean")
@@ -765,6 +768,7 @@ class FindHighAccuracyPathRunner:
                 end_point = self.end_point
                 self.end_model_stat_dict, end_model_name, _ = load_model_state_file(end_point)
                 end_model_type = RuntimeParameters.coerce_model_type(end_model_name)
+                assert end_model_type is not None
                 assert end_model_type == start_model_type, f"start({start_model_type.name}) != end({end_model_type.name})"
                 child_logger.info("Work mode: to_certain_model at %s", end_point)
             elif runtime_parameter.work_mode == WorkMode.to_vs:
@@ -773,6 +777,7 @@ class FindHighAccuracyPathRunner:
                     runtime_parameter.variance_sphere_file_path
                 )
                 variance_sphere_type = RuntimeParameters.coerce_model_type(variance_sphere_name)
+                assert variance_sphere_type is not None
                 assert variance_sphere_type == start_model_type
                 self.variance_sphere_model = variance_sphere_model
                 self.end_model_stat_dict = calculate_layer_wise_projection_to_variance_sphere(
@@ -793,7 +798,7 @@ class FindHighAccuracyPathRunner:
 
         else:
             assert self.checkpoint_content is not None
-            checkpoint_content = self.checkpoint_content
+            checkpoint_content: Checkpoint = self.checkpoint_content
             checkpoint_runtime = checkpoint_content.current_runtime_parameter
             assert checkpoint_runtime is not None
             runtime_parameter.work_mode = checkpoint_runtime.work_mode
@@ -820,6 +825,7 @@ class FindHighAccuracyPathRunner:
             self.model = current_ml_setup.model
             assert self.model is not None
             model = self.model
+            assert checkpoint_content.current_model_stat is not None
             model.load_state_dict(checkpoint_content.current_model_stat)
             self.adapter = current_ml_setup.adapter
 
@@ -1277,6 +1283,9 @@ class FindHighAccuracyPathRunner:
             raise RuntimeError("Cannot enable both pretrain_optimizer and load_existing_optimizer")
 
         if parameter_train.pretrain_optimizer or parameter_train.pretrain_model_weights:
+            assert parameter_train.pretrain_iterations is not None
+            pretrain_optimizer = parameter_train.pretrain_optimizer == True
+            pretrain_model_weights = parameter_train.pretrain_model_weights == True
             pre_train(
                 self.adapter,
                 optimizer,
@@ -1284,8 +1293,8 @@ class FindHighAccuracyPathRunner:
                 device_obj,
                 self.scaler,
                 train_iteration=parameter_train.pretrain_iterations,
-                train_optimizer=parameter_train.pretrain_optimizer,
-                train_model_weights=parameter_train.pretrain_model_weights,
+                train_optimizer=pretrain_optimizer,
+                train_model_weights=pretrain_model_weights,
                 log=child_logger,
             )
 
@@ -1340,12 +1349,15 @@ class FindHighAccuracyPathRunner:
         current_state = model.state_dict()
         old_attention_state = _capture_attention_state(current_state, self.attention_layer)
 
+        step_size = 0.0 if parameter_move.step_size is None else parameter_move.step_size
+        adoptive_step_size = 0.0 if parameter_move.adoptive_step_size is None else parameter_move.adoptive_step_size
+        merge_bias_with_weights = parameter_move.merge_bias_with_weights == True
         target_state = move_model_state_toward(
             current_state,
             end_model_stat_dict,
-            parameter_move.step_size,
-            parameter_move.adoptive_step_size,
-            enable_merge_bias_with_weight=parameter_move.merge_bias_with_weights,
+            step_size,
+            adoptive_step_size,
+            enable_merge_bias_with_weight=merge_bias_with_weights,
             ignore_layers=self.ignore_move_layers,
             ratio_step_per_layer=self.ratio_step_size,
         )
@@ -1360,9 +1372,9 @@ class FindHighAccuracyPathRunner:
             target_state = move_model_state_toward(
                 target_state,
                 compensate_destination,
-                parameter_move.step_size,
-                parameter_move.adoptive_step_size,
-                enable_merge_bias_with_weight=parameter_move.merge_bias_with_weights,
+                step_size,
+                adoptive_step_size,
+                enable_merge_bias_with_weight=merge_bias_with_weights,
                 move_layer=self.compensate_move_layer,
                 ratio_step_per_layer=self.ratio_step_size,
             )
@@ -1370,9 +1382,9 @@ class FindHighAccuracyPathRunner:
             target_state = move_model_state_toward(
                 target_state,
                 compensate_destination,
-                parameter_move.step_size,
-                parameter_move.adoptive_step_size,
-                enable_merge_bias_with_weight=parameter_move.merge_bias_with_weights,
+                step_size,
+                adoptive_step_size,
+                enable_merge_bias_with_weight=merge_bias_with_weights,
                 move_layer=self.compensate_movex2_layer,
                 ratio_step_per_layer=self.ratio_step_size,
             )
@@ -1664,7 +1676,7 @@ class FindHighAccuracyPathRunner:
             self.finalize()
             return False
 
-        child_logger.info("tick: %s", runtime_parameter.current_tick)
+        child_logger.info("tick %s", runtime_parameter.current_tick)
 
         self._maybe_save_checkpoint()
         self._update_dynamic_end_model()

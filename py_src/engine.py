@@ -19,6 +19,7 @@ Usage::
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import sys
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
@@ -30,6 +31,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from py_src.adapters import ModelAdapter
+from py_src.util import MovingAverage
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +111,8 @@ class TrainResult:
     total_count: int = 0
     total_correct: Optional[int] = None
     iterations: int = 0
+    moving_average_loss: Optional[float] = None
+    stop_reason: Optional[str] = None
 
     @property
     def avg_loss(self) -> float:
@@ -152,9 +156,12 @@ def train(
     device: Device,
     scaler: Optional[torch.amp.GradScaler] = None, # type: ignore
     backpropagation: bool = True,
-    max_steps: Optional[int] = None,
+    training_mode: bool = True,
+    min_rounds: Optional[int] = None,
+    max_rounds: Optional[int] = None,
+    loss_threshold: Optional[float] = None,
 ) -> TrainResult:
-    """Run one epoch of training (or up to *max_steps* batches).
+    """Run training for one epoch or for an adaptive number of batches.
 
     Parameters
     ----------
@@ -170,39 +177,79 @@ def train(
         An AMP ``GradScaler`` (pass ``None`` to disable mixed precision).
     backpropagation:
         Set to ``False`` to only compute the forward pass (no weight updates).
-    max_steps:
-        Stop after this many batches (``None`` = full epoch).
+    training_mode:
+        When ``True`` the model is put into ``train()`` mode before the loop.
+        When ``False`` it is put into ``eval()`` mode while still using the
+        adapter's ``train_step`` interface.
+    min_rounds / max_rounds / loss_threshold:
+        When ``max_rounds`` is provided, training can span multiple passes over
+        *dataloader*. The loop stops when the moving average of the last
+        ``min_rounds`` losses drops below ``loss_threshold`` (after at least
+        ``min_rounds`` batches) or when ``max_rounds`` batches have been run.
     """
     model = adapter.get_model()
-    model.train()
+    model.train(training_mode)
     model.to(device.device)
 
     result = TrainResult()
-    step_limit = max_steps if max_steps is not None else sys.maxsize
+    adaptive_mode = any(value is not None for value in (min_rounds, max_rounds, loss_threshold))
+    if adaptive_mode and max_rounds is None:
+        raise ValueError("Adaptive training requires max_rounds to avoid infinite loops")
 
-    step_counter = 0
-    for batch_idx, batch in enumerate(dataloader):
-        if step_counter >= step_limit:
+    step_limit = max_rounds if max_rounds is not None else sys.maxsize
+
+    min_rounds_value = max(0, min_rounds or 0)
+    moving_average = MovingAverage(max(1, min_rounds_value)) if adaptive_mode else None
+    stop_after_single_epoch = not adaptive_mode
+    step_context = nullcontext if backpropagation else torch.no_grad
+
+    should_stop = False
+    while result.iterations < step_limit and not should_stop:
+        epoch_had_batches = False
+        for batch_idx, batch in enumerate(dataloader):
+            if result.iterations >= step_limit:
+                break
+            epoch_had_batches = True
+
+            with step_context():
+                out = adapter.train_step(
+                    batch=batch,
+                    batch_idx=batch_idx,
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler,
+                    device=device.device,
+                    scaler=scaler,
+                    backpropagation=backpropagation,
+                )
+
+            result.total_loss += out.loss * out.sample_count
+            result.total_count += out.sample_count
+            if out.correct_count is not None:
+                result.total_correct = (result.total_correct or 0) + out.correct_count
+            result.iterations += 1
+
+            if backpropagation:
+                adapter.post_train_step()
+
+            if moving_average is not None:
+                result.moving_average_loss = moving_average.add(out.loss)
+                if (
+                    loss_threshold is not None
+                    and result.iterations >= min_rounds_value
+                    and result.moving_average_loss <= loss_threshold
+                ):
+                    result.stop_reason = "loss_threshold"
+                    should_stop = True
+                    break
+
+        if not epoch_had_batches:
+            break
+        if stop_after_single_epoch:
             break
 
-        out = adapter.train_step(
-            batch=batch,
-            batch_idx=batch_idx,
-            optimizer=optimizer,
-            lr_scheduler=lr_scheduler,
-            device=device.device,
-            scaler=scaler,
-            backpropagation=backpropagation,
-        )
-
-        result.total_loss += out.loss * out.sample_count
-        result.total_count += out.sample_count
-        if out.correct_count is not None:
-            result.total_correct = (result.total_correct or 0) + out.correct_count
-        result.iterations += 1
-
-        adapter.post_train_step()
-        step_counter += 1
+    if result.stop_reason is None and result.iterations >= step_limit:
+        if max_rounds is not None and result.iterations >= max_rounds:
+            result.stop_reason = "max_rounds"
 
     return result
 

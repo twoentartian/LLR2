@@ -53,25 +53,22 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
 
     elif mt in (ModelType.resnet18_bn, ModelType.resnet18_gn):
         from .resnet import (
-            resnet18_gn_cifar10, resnet18_bn_cifar10,
-            resnet18_gn_cifar100, resnet18_bn_cifar100,
-            resnet18_bn_imagenet10, resnet18_gn_imagenet10,
-            resnet18_bn_imagenet100, resnet18_gn_imagenet100,
-            resnet18_imagenet1k, resnet18_gn_imagenet1k,
+            resnet18_cifar10, resnet18_cifar100, resnet18_imagenet10,
+            resnet18_imagenet100, resnet18_imagenet1k,
             resnet18_bn_imagenet1k_sam_mask_random_noise,
             resnet18_bn_imagenet1k_sam_mask_black,
         )
         use_gn = mt == ModelType.resnet18_gn
         if _default or dt == DatasetType.cifar10:
-            return resnet18_gn_cifar10() if use_gn else resnet18_bn_cifar10()
+            return resnet18_cifar10(use_gn=use_gn)
         elif dt == DatasetType.cifar100:
-            return resnet18_gn_cifar100() if use_gn else resnet18_bn_cifar100()
+            return resnet18_cifar100(use_gn=use_gn)
         elif dt == DatasetType.imagenet10:
-            return resnet18_gn_imagenet10(preset) if use_gn else resnet18_bn_imagenet10(preset)
+            return resnet18_imagenet10(preset=preset, use_gn=use_gn)
         elif dt == DatasetType.imagenet100:
-            return resnet18_gn_imagenet100(preset) if use_gn else resnet18_bn_imagenet100(preset)
+            return resnet18_imagenet100(preset=preset, use_gn=use_gn)
         elif dt == DatasetType.imagenet1k:
-            return resnet18_gn_imagenet1k(preset) if use_gn else resnet18_imagenet1k(preset)
+            return resnet18_imagenet1k(preset=preset, use_gn=use_gn)
         elif dt == DatasetType.imagenet1k_sam_mask_random_noise:
             if use_gn:
                 raise _nie(mt, dt)

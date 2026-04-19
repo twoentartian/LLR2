@@ -2,9 +2,13 @@ from pathlib import Path
 import logging
 import random
 from collections import deque
+from typing import Optional
 
 import numpy as np
 import torch
+
+def basename_without_extension(name: str) -> str:
+    return Path(name).stem
 
 def re_initialize_model(model: torch.nn.Module):
     for module in model.modules():
@@ -21,6 +25,20 @@ def setup_logging(target_logger: logging.Logger, tag: str):
         target_logger.addHandler(handler)
     target_logger.setLevel(logging.INFO)
     target_logger.propagate = False
+
+def setup_logging_exit_on_critical(target_logger: logging.Logger) -> None:
+    """Make ``target_logger.critical(...)`` terminate the current process."""
+    if getattr(target_logger, "_critical_exits_process", False):
+        return
+
+    original_critical = target_logger.critical
+
+    def critical_and_exit(msg, *args, **kwargs):
+        original_critical(msg, *args, **kwargs)
+        raise SystemExit(1)
+
+    target_logger.critical = critical_and_exit  # type: ignore[method-assign]
+    target_logger._critical_exits_process = True  # type: ignore[attr-defined]
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -78,6 +96,19 @@ def prompt_selection(options, prompt_message="Please make a selection:", allow_q
                 print(f"Please enter a number between 1 and {len(options)}")
         except ValueError:
             print("Please enter a valid number or 'q' to quit")
+
+def geodesic_distance(a: torch.Tensor, b: torch.Tensor) -> Optional[torch.Tensor]:
+    if not a.dtype.is_floating_point or not b.dtype.is_floating_point:
+        return None
+    a_flat = a.flatten()
+    b_flat = b.flatten()
+    na = torch.norm(a_flat)
+    nb = torch.norm(b_flat)
+    if na == 0 or nb == 0:
+        return torch.tensor(0.0, dtype=torch.float32, device=a.device)
+    radius = (na + nb) / 2
+    cos_theta = torch.clamp(torch.dot(a_flat, b_flat) / (na * nb), -1.0, 1.0)
+    return radius * torch.acos(cos_theta)
 
 class MovingAverage:
     def __init__(self, window_size=10):

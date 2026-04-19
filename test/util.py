@@ -81,7 +81,7 @@ def run_single_batch(
 
     train_result = train(
         adapter, train_loader, optimizer, lr_scheduler, # type: ignore
-        device=device, scaler=scaler, max_steps=1,
+        device=device, scaler=scaler, max_rounds=1,
     )
 
     val_result = None

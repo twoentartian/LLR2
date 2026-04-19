@@ -2,3 +2,10 @@ __pycache__
 *.log.csv
 info.json
 *.png
+*.csv
+*.log
+*.optimizer.pt
+*.model.pt
+*.checkpoint.pt
+arguments.txt
+*????-??-??_??-??-??*/

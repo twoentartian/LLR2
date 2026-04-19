@@ -14,15 +14,6 @@
             "args": "-dexp \"2*x+y_mod_97\" --modulus 97"
         },
         {
-            "name": "find_high_accuracy_path_v2",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/tool/find_high_accuracy_path_v2.py",
-            "cwd": "${workspaceFolder}/tool/",
-            "console": "integratedTerminal",
-            "args": "./addition_97_begin_1 ./addition_97_end_1 -S --disable_service_test --disable_service_cosine_similarity"
-        },
-        {
             "name": "generate_resnet18",
             "type": "debugpy",
             "request": "launch",
@@ -30,6 +21,24 @@
             "cwd": "${workspaceFolder}/tool/",
             "console": "integratedTerminal",
             "args": "-m resnet18_bn -d cifar10"
+        },
+        {
+            "name": "find_high_accuracy_path (addition_97)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/tool/find_high_accuracy_path.py",
+            "cwd": "${workspaceFolder}/tool/",
+            "console": "integratedTerminal",
+            "args": "./addition_97_begin_1 ./addition_97_end_1 -S --disable_service_test --disable_service_cosine_similarity"
+        },
+                {
+            "name": "find_high_accuracy_path (resnet18_cifar10)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/tool/find_high_accuracy_path.py",
+            "cwd": "${workspaceFolder}/tool/",
+            "console": "integratedTerminal",
+            "args": "./resnet18_begin_1 ./resnet18_end_1 --config ./configs/resnet18_cifar10_low_loss.py -S"
         },
     ]
 }

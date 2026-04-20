@@ -6,7 +6,6 @@
 # Licensed under the MIT License. See LICENSE file in the project root.
 # ----------------------------------------------------------------------------
 
-import math
 import torch
 import torch.nn.functional as F
 import faiss
@@ -47,6 +46,7 @@ class NanoCLIP(L.LightningModule):
 
         self.num_training_batches_per_epoch = None
         self.latest_loss = None
+        self.latest_correct_count = None
 
     def set_batches_per_epoch(self, count):
         self.num_training_batches_per_epoch = count
@@ -124,6 +124,8 @@ class NanoCLIP(L.LightningModule):
 
     def on_validation_epoch_start(self):
         self.validation_descriptors = {"img": [], "txt": [], "nb_captions": []}
+        self.latest_loss = None
+        self.latest_correct_count = None
 
     def validation_step(self, batch, batch_idx):
         """
@@ -166,13 +168,13 @@ class NanoCLIP(L.LightningModule):
         ])
 
         # use faiss to calculate recall, images are gallery and texts are queries
-        recall_1 = self._calculate_recall(img_descriptors, txt_descriptors, labels, k_values=[1])
+        recall_1 = float(self._calculate_recall(img_descriptors, txt_descriptors, labels, k_values=[1])[0])
         self.latest_loss = recall_1
+        self.latest_correct_count = int(round(recall_1 * len(labels)))
         self.validation_descriptors.clear()
 
     def get_validation_result(self):
-        correct_count = math.nan
-        return self.latest_loss, correct_count
+        return self.latest_loss, self.latest_correct_count
 
     @staticmethod
     def _calculate_recall(img_descriptors, txt_descriptors, labels, k_values=[1, 5, 10]):
@@ -190,7 +192,7 @@ class NanoCLIP(L.LightningModule):
         for q_idx, pred in enumerate(predictions):
             for i, n in enumerate(k_values):
                 # if in top N then also in top NN, where NN > N
-                if np.any(np.in1d(pred[:n], labels[q_idx])):
+                if np.any(np.isin(pred[:n], labels[q_idx])):
                     correct_at_k[i:] += 1
                     break
 

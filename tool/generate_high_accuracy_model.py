@@ -7,6 +7,7 @@ import math
 import os
 import sys
 from datetime import datetime
+from typing import Optional
 
 import numpy as np
 import torch
@@ -35,7 +36,7 @@ def initialize_model_to_opposite_direction(
     model: torch.nn.Module,
     reference_state: dict,
     reference_model_type: str,
-    reference_dataset_type: str,
+    reference_dataset_type: Optional[str],
     arg_ml_setup: MLSetup,
     child_logger: logging.Logger,
 ):
@@ -157,6 +158,7 @@ def training_model(
                 if opposite_init_model_path is not None:
                     ref_state, ref_model_type, ref_dataset_type = load_model_state_file(opposite_init_model_path)
                     child_logger.info("rotating init toward opposite direction of %s", opposite_init_model_path)
+                    assert ref_model_type is not None, f"ref_model_type is {ref_model_type}"
                     initialize_model_to_opposite_direction(
                         model, ref_state, ref_model_type, ref_dataset_type, arg_ml_setup, child_logger
                     )

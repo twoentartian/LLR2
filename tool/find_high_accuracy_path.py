@@ -514,6 +514,25 @@ class FindHighAccuracyPathRunner:
         self.finalized = False
         self.finished = False
 
+    def _synchronize_for_timing(self) -> None:
+        if self.device is None:
+            return
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+
+    def _time_call(self, func, *args, **kwargs):
+        self._synchronize_for_timing()
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        self._synchronize_for_timing()
+        return result, time.perf_counter() - start_time
+
+    @staticmethod
+    def _format_timing_entries(entries: list[tuple[str, float]]) -> str:
+        if not entries:
+            return "no timed steps"
+        return ", ".join(f"{name}={elapsed:.3f}s" for name, elapsed in entries)
+
     def setup(
         self,
         index: int,
@@ -1559,8 +1578,10 @@ class FindHighAccuracyPathRunner:
         run_service = self._should_run_services()
         assert self.model is not None
         assert self.runtime_parameter is not None
+        assert self.child_logger is not None
         model = self.model
         runtime_parameter = self.runtime_parameter
+        child_logger = self.child_logger
         current_state = model.state_dict()
 
         if not run_service:
@@ -1574,25 +1595,39 @@ class FindHighAccuracyPathRunner:
         assert self.model_state_of_last_tick is not None
         assert self.end_model_stat_dict is not None
 
-        self.weight_diff_service.trigger_without_runtime_parameters(
+        service_timings: list[tuple[str, float]] = []
+
+        _, elapsed = self._time_call(
+            self.weight_diff_service.trigger_without_runtime_parameters,
             runtime_parameter.current_tick,
             [current_state, self.end_model_stat_dict],
         )
-        self.weight_change_service.trigger_without_runtime_parameters(
+        service_timings.append(("weight_diff", elapsed))
+
+        _, elapsed = self._time_call(
+            self.weight_change_service.trigger_without_runtime_parameters,
             runtime_parameter.current_tick,
             [self.model_state_of_last_tick, current_state],
         )
-        self.model_state_of_last_tick = _clone_state_dict(current_state)
+        service_timings.append(("weight_change", elapsed))
 
-        self.distance_to_origin_service.trigger_without_runtime_parameters(
+        self.model_state_of_last_tick, elapsed = self._time_call(_clone_state_dict, current_state)
+        service_timings.append(("clone_last_tick_state", elapsed))
+
+        _, elapsed = self._time_call(
+            self.distance_to_origin_service.trigger_without_runtime_parameters,
             runtime_parameter.current_tick,
             {0: current_state},
         )
-        self.record_variance_service.trigger_without_runtime_parameters(
+        service_timings.append(("distance_to_origin", elapsed))
+
+        _, elapsed = self._time_call(
+            self.record_variance_service.trigger_without_runtime_parameters,
             runtime_parameter.current_tick,
             [0],
             [current_state],
         )
+        service_timings.append(("record_variance", elapsed))
 
         if self.record_model_service is not None:
             should_save = False
@@ -1601,36 +1636,52 @@ class FindHighAccuracyPathRunner:
             else:
                 should_save = runtime_parameter.current_tick in runtime_parameter.save_ticks
             if should_save:
-                self.record_model_service.trigger_without_runtime_parameters(
+                _, elapsed = self._time_call(
+                    self.record_model_service.trigger_without_runtime_parameters,
                     runtime_parameter.current_tick,
                     [0],
                     [current_state],
                 )
+                service_timings.append(("record_model", elapsed))
 
         if self.record_test_accuracy_loss_service is not None:
-            self.record_test_accuracy_loss_service.trigger_without_runtime_parameters(
+            _, elapsed = self._time_call(
+                self.record_test_accuracy_loss_service.trigger_without_runtime_parameters,
                 runtime_parameter.current_tick,
                 {0: current_state},
             )
+            service_timings.append(("record_test_accuracy_loss", elapsed))
 
-        self.record_training_loss_service.trigger_without_runtime_parameters(
+        _, elapsed = self._time_call(
+            self.record_training_loss_service.trigger_without_runtime_parameters,
             runtime_parameter.current_tick,
             {0: training_loss},
             {0: training_accuracy},
         )
+        service_timings.append(("record_training_loss", elapsed))
 
         if self.record_consecutive_points_service is not None:
-            self.record_consecutive_points_service.trigger_without_runtime_parameters(
+            _, elapsed = self._time_call(
+                self.record_consecutive_points_service.trigger_without_runtime_parameters,
                 runtime_parameter.current_tick,
                 SimulationPhase.END_OF_TICK,
                 current_state,
             )
+            service_timings.append(("record_consecutive_points", elapsed))
 
         if self.record_cosine_similarity_service is not None:
-            self.record_cosine_similarity_service.trigger_without_runtime_parameters(
+            _, elapsed = self._time_call(
+                self.record_cosine_similarity_service.trigger_without_runtime_parameters,
                 runtime_parameter.current_tick,
                 {0: current_state},
             )
+            service_timings.append(("record_cosine_similarity", elapsed))
+
+        child_logger.info(
+            "tick %s service profile: %s",
+            runtime_parameter.current_tick,
+            self._format_timing_entries(service_timings),
+        )
 
     def finalize(self) -> None:
         if self.finalized:
@@ -1670,38 +1721,58 @@ class FindHighAccuracyPathRunner:
         runtime_parameter = self.runtime_parameter
         child_logger = self.child_logger
         model = self.model
+        tick_index = runtime_parameter.current_tick
 
-        if runtime_parameter.current_tick >= runtime_parameter.max_tick:
+        if tick_index >= runtime_parameter.max_tick:
             self.finished = True
             self.finalize()
             return False
 
-        child_logger.info("tick %s", runtime_parameter.current_tick)
+        child_logger.info("tick %s", tick_index)
+        tick_timings: list[tuple[str, float]] = []
+        self._synchronize_for_timing()
+        tick_start_time = time.perf_counter()
 
-        self._maybe_save_checkpoint()
-        self._update_dynamic_end_model()
-        self._maybe_log_eta()
+        _, elapsed = self._time_call(self._maybe_save_checkpoint)
+        tick_timings.append(("save_checkpoint", elapsed))
+        _, elapsed = self._time_call(self._update_dynamic_end_model)
+        tick_timings.append(("update_dynamic_end_model", elapsed))
+        _, elapsed = self._time_call(self._maybe_log_eta)
+        tick_timings.append(("log_eta", elapsed))
 
-        parameter_updated = self._update_parameters_for_current_tick()
-        self._maybe_first_tick_setup()
+        parameter_updated, elapsed = self._time_call(self._update_parameters_for_current_tick)
+        tick_timings.append(("update_parameters", elapsed))
+        _, elapsed = self._time_call(self._maybe_first_tick_setup)
+        tick_timings.append(("first_tick_setup", elapsed))
 
         if parameter_updated:
-            self._save_on_parameter_update()
+            _, elapsed = self._time_call(self._save_on_parameter_update)
+            tick_timings.append(("save_on_parameter_update", elapsed))
 
         if self._should_run_services() and self.record_consecutive_points_service is not None:
-            self.record_consecutive_points_service.trigger_without_runtime_parameters(
+            _, elapsed = self._time_call(
+                self.record_consecutive_points_service.trigger_without_runtime_parameters,
                 runtime_parameter.current_tick,
                 SimulationPhase.START_OF_TICK,
                 model.state_dict(),
             )
+            tick_timings.append(("record_consecutive_points_start", elapsed))
 
-        self._move_model()
-        self._apply_variance_correction(phase="pre-train")
-        self._adjust_learning_rates()
-        training_loss, training_accuracy = self._train_current_tick()
-        self._rebuild_norm_layers()
-        self._apply_variance_correction(phase="post-train")
-        self._run_services(training_loss, training_accuracy)
+        _, elapsed = self._time_call(self._move_model)
+        tick_timings.append(("move_model", elapsed))
+        _, elapsed = self._time_call(self._apply_variance_correction, phase="pre-train")
+        tick_timings.append(("variance_correction_pre_train", elapsed))
+        _, elapsed = self._time_call(self._adjust_learning_rates)
+        tick_timings.append(("adjust_learning_rates", elapsed))
+        training_output, elapsed = self._time_call(self._train_current_tick)
+        training_loss, training_accuracy = training_output
+        tick_timings.append(("train_current_tick", elapsed))
+        _, elapsed = self._time_call(self._rebuild_norm_layers)
+        tick_timings.append(("rebuild_norm_layers", elapsed))
+        _, elapsed = self._time_call(self._apply_variance_correction, phase="post-train")
+        tick_timings.append(("variance_correction_post_train", elapsed))
+        _, elapsed = self._time_call(self._run_services, training_loss, training_accuracy)
+        tick_timings.append(("run_services", elapsed))
 
         runtime_parameter.current_tick += 1
 
@@ -1720,7 +1791,17 @@ class FindHighAccuracyPathRunner:
             self.finished = True
 
         if self.finished:
-            self.finalize()
+            _, elapsed = self._time_call(self.finalize)
+            tick_timings.append(("finalize", elapsed))
+
+        self._synchronize_for_timing()
+        tick_total_time = time.perf_counter() - tick_start_time
+        child_logger.info(
+            "tick %s profile: total=%.3fs, %s",
+            tick_index,
+            tick_total_time,
+            self._format_timing_entries(tick_timings),
+        )
 
         return not self.finished
 

@@ -86,8 +86,12 @@ class ServiceTrainingLossAccuracyRecorder(Service):
         assert self.accuracy_file is not None
         for fname, fobj in [(self.loss_file_name, self.loss_file),
                              (self.accuracy_file_name, self.accuracy_file)]:
-            with open(os.path.join(checkpoint_folder_path, fname), 'r', newline='') as infile:
-                next(infile)
+            src_path = os.path.join(checkpoint_folder_path, fname)
+            if not os.path.exists(src_path):
+                continue
+            with open(src_path, 'r', newline='') as infile:
+                if next(infile, None) is None:
+                    continue
                 for line in infile:
                     if int(line.split(",", 1)[0]) < restore_until_tick:
                         fobj.write(line)

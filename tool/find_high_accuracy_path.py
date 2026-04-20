@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import copy
+import hashlib
 import importlib.util
 import logging
 import math
@@ -61,7 +62,12 @@ from py_src.service import (
 )
 from py_src.simulation_runtime_parameters import SimulationPhase
 from py_src.special_torch_layers import find_layers_according_to_name_and_keyword, find_normalization_layers
-from py_src.util import setup_logging, setup_logging_exit_on_critical, geodesic_distance
+from py_src.util import (
+    setup_logging,
+    setup_logging_exit_on_critical,
+    geodesic_distance,
+    prompt_selection,
+)
 
 logger = logging.getLogger("find_high_accuracy_path")
 
@@ -220,6 +226,20 @@ def _state_dicts_equal(state_a: Dict[str, Any], state_b: Dict[str, Any]) -> bool
         elif value_a != value_b:
             return False
     return True
+
+
+def _compute_file_sha256(path: Optional[str]) -> Optional[str]:
+    if path is None or not os.path.exists(path):
+        return None
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as file_handle:
+        while True:
+            chunk = file_handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _apply_ml_setup_compatibility(ml_setup) -> None:
@@ -478,6 +498,7 @@ class FindHighAccuracyPathRunner:
         self.initial_model_stat: Optional[Dict[str, Any]] = None
         self.starting_point_stat: Optional[Dict[str, Any]] = None
         self.end_model_stat_dict: Optional[Dict[str, Any]] = None
+        self.current_phase_start_model_stat: Optional[Dict[str, Any]] = None
         self.initial_optimizer_state_dict: Optional[dict[str, Any]] = None
         self.base_optimizer_group_lrs: list[float] = []
         self.param_name_by_id: dict[int, str] = {}
@@ -597,6 +618,95 @@ class FindHighAccuracyPathRunner:
             performance_logger.addHandler(file_handler)
         self.performance_logger = performance_logger
 
+    def _warn_about_resume_config_mismatch(self, _checkpoint_runtime_parameter: RuntimeParameters) -> None:
+        assert self.runtime_parameter is not None
+        assert self.child_logger is not None
+        assert self.checkpoint_content is not None
+        checkpoint_content = self.checkpoint_content
+
+        current_config_path = os.path.abspath(self.runtime_parameter.config_file_path)
+        checkpoint_config_path = checkpoint_content.checkpoint_config_path
+        checkpoint_config_hash = checkpoint_content.checkpoint_config_sha256
+        assert checkpoint_config_path is not None
+        assert checkpoint_config_hash is not None
+        checkpoint_config_path = os.path.abspath(checkpoint_config_path)
+
+        current_config_hash = _compute_file_sha256(self.runtime_parameter.config_file_path)
+        assert current_config_hash is not None
+
+        path_mismatch = checkpoint_config_path != current_config_path
+        hash_mismatch = checkpoint_config_hash != current_config_hash
+        if not path_mismatch and not hash_mismatch:
+            return
+
+        details: list[str] = []
+        if path_mismatch:
+            details.append(f"checkpoint config path: {checkpoint_config_path}")
+            details.append(f"current config path: {current_config_path}")
+        if hash_mismatch:
+            details.append("config file contents differ from the checkpoint snapshot")
+
+        warning_message = "Checkpoint was created with a different config.\n" + "\n".join(details)
+        if self.runtime_parameter.silence_mode:
+            self.child_logger.warning(warning_message)
+            return
+
+        selection = prompt_selection(
+            ["Continue with current config", "Quit"],
+            prompt_message=warning_message,
+            allow_quit=True,
+        )
+        if selection != "Continue with current config":
+            self.child_logger.critical("Aborted because checkpoint config does not match the current config")
+
+    def _resolve_resume_parameter(
+        self,
+        parameter_name: str,
+        config_parameter: Any,
+        checkpoint_parameter: Any,
+    ) -> Any:
+        if config_parameter is not None:
+            return config_parameter
+        if checkpoint_parameter is None:
+            raise RuntimeError(
+                f"Config did not provide {parameter_name} at resume tick and checkpoint does not contain one"
+            )
+        assert self.child_logger is not None
+        assert self.runtime_parameter is not None
+        self.child_logger.info(
+            "Using checkpointed %s at tick %s because the current config did not provide one",
+            parameter_name,
+            self.runtime_parameter.current_tick,
+        )
+        return copy.deepcopy(checkpoint_parameter)
+
+    def _build_train_optimizer(self, runtime_parameter: RuntimeParameters, current_ml_setup: MLSetup) -> Optional[torch.optim.Optimizer]:
+        assert self.config_file is not None
+        assert self.model is not None
+        optimizer = self.config_file.get_optimizer_train(
+            runtime_parameter,
+            current_ml_setup,
+            self.model.parameters(),
+        )
+        if optimizer is not None or self.checkpoint_content is None:
+            return optimizer
+
+        bootstrap_runtime_parameter = copy.deepcopy(runtime_parameter)
+        bootstrap_runtime_parameter.current_tick = 0
+        optimizer = self.config_file.get_optimizer_train(
+            bootstrap_runtime_parameter,
+            current_ml_setup,
+            self.model.parameters(),
+        )
+        if optimizer is not None:
+            assert self.child_logger is not None
+            self.child_logger.info(
+                "get_optimizer_train(...) returned None at resume tick %s; "
+                "falling back to tick 0 construction before loading checkpoint state",
+                runtime_parameter.current_tick,
+            )
+        return optimizer
+
     def _resolve_dataloader_worker_count(self, explicit_workers: Optional[int]) -> int:
         if explicit_workers is not None:
             return explicit_workers
@@ -615,6 +725,11 @@ class FindHighAccuracyPathRunner:
         checkpoint_file_path: Optional[str] = None,
     ) -> None:
         self.runtime_parameter = runtime_parameter
+        checkpoint_runtime_parameter: Optional[RuntimeParameters] = None
+        checkpoint_general_parameter = None
+        checkpoint_move_parameter = None
+        checkpoint_train_parameter = None
+        checkpoint_rebuild_norm_parameter = None
         runtime_parameter.save_ticks = (
             _parse_save_ticks(runtime_parameter.save_ticks)
             if isinstance(runtime_parameter.save_ticks, str)
@@ -650,6 +765,10 @@ class FindHighAccuracyPathRunner:
             assert checkpoint_runtime_parameter is not None
             assert checkpoint_runtime_parameter.task_name is not None
             runtime_parameter.task_name = checkpoint_runtime_parameter.task_name
+            checkpoint_general_parameter = self.checkpoint_content.current_general_parameter
+            checkpoint_move_parameter = self.checkpoint_content.current_move_parameter
+            checkpoint_train_parameter = self.checkpoint_content.current_train_parameter
+            checkpoint_rebuild_norm_parameter = self.checkpoint_content.current_rebuild_norm_parameter
 
         self.child_logger = logging.getLogger(f"find_high_accuracy_path.{runtime_parameter.task_name}")
         assert self.child_logger is not None
@@ -663,6 +782,8 @@ class FindHighAccuracyPathRunner:
             child_logger.addHandler(file_handler)
         child_logger.info("Logging setup complete")
         self._setup_performance_logger()
+        if checkpoint_runtime_parameter is not None:
+            self._warn_about_resume_config_mismatch(checkpoint_runtime_parameter)
 
         self.device_obj = Device.cpu() if runtime_parameter.use_cpu else Device.auto()
         assert self.device_obj is not None
@@ -687,16 +808,22 @@ class FindHighAccuracyPathRunner:
         assert self.model is not None
         model = self.model
         assert self.config_file is not None
+        if checkpoint_runtime_parameter is not None:
+            runtime_parameter.current_tick = checkpoint_runtime_parameter.current_tick
+        else:
+            runtime_parameter.current_tick = 0
 
-        self.general_parameter = self.config_file.get_parameter_general(runtime_parameter, current_ml_setup)
-        if self.general_parameter is None:
-            raise RuntimeError("get_parameter_general(...) must return a ParameterGeneral instance")
+        self.general_parameter = self._resolve_resume_parameter(
+            "general parameters",
+            self.config_file.get_parameter_general(runtime_parameter, current_ml_setup),
+            checkpoint_general_parameter,
+        )
         general_parameter = self.general_parameter
+        assert general_parameter is not None
         general_parameter.fill_default()
 
         assert general_parameter.max_tick is not None, f"max_tick is not set"
         runtime_parameter.max_tick = general_parameter.max_tick
-        runtime_parameter.current_tick = 0
         runtime_parameter.test_dataset_use_whole = (
             general_parameter.test_dataset_use_whole
             if general_parameter.test_dataset_use_whole is not None
@@ -717,11 +844,7 @@ class FindHighAccuracyPathRunner:
         assert self.criterion is not None
 
         model.to(device)
-        self.optimizer = self.config_file.get_optimizer_train(
-            runtime_parameter,
-            current_ml_setup,
-            model.parameters(),
-        )
+        self.optimizer = self._build_train_optimizer(runtime_parameter, current_ml_setup)
         if self.optimizer is None:
             raise RuntimeError("get_optimizer_train(...) returned None during initialization")
         optimizer = self.optimizer
@@ -737,28 +860,42 @@ class FindHighAccuracyPathRunner:
         self.base_optimizer_group_lrs = [group["lr"] for group in optimizer.param_groups]
         self.param_name_by_id = {id(param): name for name, param in model.named_parameters()}
 
-        self.parameter_train = self.config_file.get_parameter_train(runtime_parameter, current_ml_setup)
-        if self.parameter_train is None:
-            raise RuntimeError("get_parameter_train(...) must return an initial ParameterTrain")
+        self.parameter_train = self._resolve_resume_parameter(
+            "train parameters",
+            self.config_file.get_parameter_train(runtime_parameter, current_ml_setup),
+            checkpoint_train_parameter,
+        )
         parameter_train = self.parameter_train
+        assert parameter_train is not None
         parameter_train.fill_default()
 
-        self.parameter_move = self.config_file.get_parameter_move(runtime_parameter, current_ml_setup)
-        if self.parameter_move is None:
-            raise RuntimeError("get_parameter_move(...) must return an initial ParameterMove")
+        self.parameter_move = self._resolve_resume_parameter(
+            "move parameters",
+            self.config_file.get_parameter_move(runtime_parameter, current_ml_setup),
+            checkpoint_move_parameter,
+        )
         parameter_move = self.parameter_move
+        assert parameter_move is not None
         parameter_move.fill_default()
 
-        self.parameter_rebuild_norm = self.config_file.get_parameter_rebuild_norm(runtime_parameter, current_ml_setup)
-        if self.parameter_rebuild_norm is None:
-            raise RuntimeError("get_parameter_rebuild_norm(...) must return an initial ParameterRebuildNorm")
+        self.parameter_rebuild_norm = self._resolve_resume_parameter(
+            "rebuild-norm parameters",
+            self.config_file.get_parameter_rebuild_norm(runtime_parameter, current_ml_setup),
+            checkpoint_rebuild_norm_parameter,
+        )
         assert self.parameter_rebuild_norm is not None
 
         self.scaler = device_obj.make_scaler() if runtime_parameter.use_amp else None
         assert self.end_model_stat_dict is not None
         self.end_model_stat_dict = _ensure_state_dict_device(self.end_model_stat_dict, device)
+        if self.current_phase_start_model_stat is not None:
+            self.current_phase_start_model_stat = _ensure_state_dict_device(
+                self.current_phase_start_model_stat,
+                device,
+            )
         if self.variance_sphere_model is not None:
             self.variance_sphere_model = _ensure_state_dict_device(self.variance_sphere_model, device)
+        self._update_ratio_step_size()
 
         self._initialize_services()
 
@@ -771,10 +908,6 @@ class FindHighAccuracyPathRunner:
         if checkpoint_file_path is not None:
             checkpoint_folder_path = os.path.dirname(checkpoint_file_path)
             assert self.checkpoint_content is not None
-            checkpoint_content = self.checkpoint_content
-            checkpoint_runtime_parameter = checkpoint_content.current_runtime_parameter
-            assert checkpoint_runtime_parameter is not None
-            runtime_parameter.current_tick = checkpoint_runtime_parameter.current_tick
 
             for service_instance in (
                 self.weight_diff_service,
@@ -839,6 +972,7 @@ class FindHighAccuracyPathRunner:
 
             self.initial_model_stat = _clone_state_dict(current_ml_setup.model.state_dict())
             self.starting_point_stat = _clone_state_dict(start_model_state)
+            self.current_phase_start_model_stat = _clone_state_dict(start_model_state)
 
             self.model = current_ml_setup.model
             assert self.model is not None
@@ -923,11 +1057,13 @@ class FindHighAccuracyPathRunner:
             self.initial_model_stat = checkpoint_content.init_model_stat
             self.starting_point_stat = checkpoint_content.start_model_stat
             self.end_model_stat_dict = checkpoint_content.end_model_stat
+            self.current_phase_start_model_stat = checkpoint_content.current_phase_start_model_stat
             self.model = current_ml_setup.model
             assert self.model is not None
             model = self.model
             assert checkpoint_content.current_model_stat is not None
             model.load_state_dict(checkpoint_content.current_model_stat)
+            assert self.current_phase_start_model_stat is not None
             self.adapter = current_ml_setup.adapter
 
             if runtime_parameter.work_mode == WorkMode.to_vs:
@@ -1194,19 +1330,18 @@ class FindHighAccuracyPathRunner:
 
     def _update_ratio_step_size(self) -> None:
         assert self.parameter_move is not None
-        assert self.model is not None
         assert self.end_model_stat_dict is not None
+        assert self.current_phase_start_model_stat is not None
         parameter_move = self.parameter_move
-        model = self.model
         end_model_stat_dict = self.end_model_stat_dict
+        current_phase_start_model_stat = self.current_phase_start_model_stat
 
         if parameter_move.ratio_step_size is None:
             self.ratio_step_size = None
             return
 
-        current_state = model.state_dict()
         ratio_step_size: dict[str, float] = {}
-        for layer_name, current_weights in current_state.items():
+        for layer_name, current_weights in current_phase_start_model_stat.items():
             if layer_name not in end_model_stat_dict:
                 continue
             distance = geodesic_distance(current_weights, end_model_stat_dict[layer_name])
@@ -1234,6 +1369,7 @@ class FindHighAccuracyPathRunner:
         assert self.parameter_rebuild_norm is not None
         assert self.starting_point_stat is not None
         assert self.end_model_stat_dict is not None
+        assert self.current_phase_start_model_stat is not None
         assert self.initial_model_stat is not None
         output_folder_path = self.arg_output_folder_path
         model = self.model
@@ -1245,6 +1381,7 @@ class FindHighAccuracyPathRunner:
         parameter_rebuild_norm = self.parameter_rebuild_norm
         starting_point_stat = self.starting_point_stat
         end_model_stat_dict = self.end_model_stat_dict
+        current_phase_start_model_stat = self.current_phase_start_model_stat
         initial_model_stat = self.initial_model_stat
 
         checkpoint_path = os.path.join(
@@ -1263,7 +1400,10 @@ class FindHighAccuracyPathRunner:
         checkpoint.current_rebuild_norm_parameter = copy.deepcopy(parameter_rebuild_norm)
         checkpoint.start_model_stat = _state_dict_to_cpu(starting_point_stat)
         checkpoint.end_model_stat = _state_dict_to_cpu(end_model_stat_dict)
+        checkpoint.current_phase_start_model_stat = _state_dict_to_cpu(current_phase_start_model_stat)
         checkpoint.init_model_stat = _state_dict_to_cpu(initial_model_stat)
+        checkpoint.checkpoint_config_path = os.path.abspath(runtime_parameter.config_file_path)
+        checkpoint.checkpoint_config_sha256 = _compute_file_sha256(runtime_parameter.config_file_path)
 
         child_logger.info("Saving checkpoint to %s", checkpoint_path)
         atomic_torch_save(checkpoint, checkpoint_path)
@@ -1328,9 +1468,11 @@ class FindHighAccuracyPathRunner:
         assert self.current_ml_setup is not None
         assert self.child_logger is not None
         assert self.config_file is not None
+        assert self.model is not None
         runtime_parameter = self.runtime_parameter
         current_ml_setup = self.current_ml_setup
         child_logger = self.child_logger
+        model = self.model
         parameter_updated = False
 
         new_parameter_train = self.config_file.get_parameter_train(runtime_parameter, current_ml_setup)
@@ -1345,6 +1487,7 @@ class FindHighAccuracyPathRunner:
             parameter_updated = True
             new_parameter_move.fill_default()
             self.parameter_move = new_parameter_move
+            self.current_phase_start_model_stat = _clone_state_dict(model.state_dict())
             self.re_init_norm_layer_list = True
             self._update_ratio_step_size()
 

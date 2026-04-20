@@ -106,8 +106,12 @@ class ServiceWeightsDifferenceRecorder(Service):
         assert self.l2_save_file is not None
         for fname, fobj in [(self.l1_save_file_name, self.l1_save_file),
                              (self.l2_save_file_name, self.l2_save_file)]:
-            with open(os.path.join(checkpoint_folder_path, fname), 'r', newline='') as infile:
-                next(infile)  # skip header
+            src_path = os.path.join(checkpoint_folder_path, fname)
+            if not os.path.exists(src_path):
+                continue
+            with open(src_path, 'r', newline='') as infile:
+                if next(infile, None) is None:
+                    continue
                 for line in infile:
                     if int(line.split(",", 1)[0]) < restore_until_tick:
                         fobj.write(line)
@@ -216,7 +220,8 @@ class ServiceDistanceToOriginRecorder(Service):
                 if node_name not in files_dict:
                     continue
                 with open(path, 'r', newline='') as infile:
-                    next(infile)
+                    if next(infile, None) is None:
+                        continue
                     for line in infile:
                         if int(line.split(",", 1)[0]) < restore_until_tick:
                             files_dict[node_name].write(line)

@@ -107,6 +107,9 @@ class Checkpoint:
     start_model_stat: Optional[dict] = None
     end_model_stat: Optional[dict] = None
     init_model_stat: Optional[dict] = None
+    current_phase_start_model_stat: Optional[dict] = None
+    checkpoint_config_path: Optional[str] = None
+    checkpoint_config_sha256: Optional[str] = None
 
     current_runtime_parameter: Optional[RuntimeParameters] = None
     current_general_parameter: Optional[ParameterGeneral] = None

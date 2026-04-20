@@ -96,9 +96,12 @@ class ServiceVarianceRecorder(Service):
     def continue_from_checkpoint(self, checkpoint_folder_path: str, restore_until_tick: int, *args, **kwargs):
         for name in self.known_nodes_to_record:
             src = os.path.join(checkpoint_folder_path, "variance", f"{name}.csv")
+            if not os.path.exists(src):
+                continue
             f = self.save_files[name]
             with open(src, 'r', newline='') as infile:
-                next(infile)
+                if next(infile, None) is None:
+                    continue
                 for line in infile:
                     if int(line.split(",", 1)[0]) < restore_until_tick:
                         f.write(line)

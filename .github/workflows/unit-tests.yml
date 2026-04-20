@@ -42,4 +42,4 @@ jobs:
 
       - name: Run unit tests
         run: |
-          python -m unittest test.test_engine test.test_generate_high_accuracy_model -v
+          python -m unittest test.test_engine test.test_generate_high_accuracy_model test.test_find_high_accuracy_path_resume -v

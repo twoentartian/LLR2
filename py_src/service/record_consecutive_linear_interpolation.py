@@ -68,6 +68,7 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
         self._float_state_names: list[str] = []
         self._other_state_names: list[str] = []
         self.logger: Optional[logging.Logger] = None
+        self.performance_logger: Optional[logging.Logger] = None
         self.enable_profiler = False
         self._cached_probe_batches = None
 
@@ -91,6 +92,39 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
         if not entries:
             return "no timings"
         return ", ".join(f"{name}={elapsed:.3f}s" for name, elapsed in entries)
+
+    @staticmethod
+    def _format_performance_row(
+        tick: int,
+        category: str,
+        entries: list[tuple[str, float]],
+        *,
+        total: Optional[float] = None,
+    ) -> str:
+        parts = [f"tick={tick}", category]
+        if total is not None:
+            parts.append(f"total={total:.3f}s")
+        for name, elapsed in entries:
+            if name == "total":
+                continue
+            parts.append(f"{name}={elapsed:.3f}s")
+        return " | ".join(parts)
+
+    def _emit_profile_row(
+        self,
+        tick: int,
+        category: str,
+        entries: list[tuple[str, float]],
+        *,
+        total: Optional[float] = None,
+    ) -> None:
+        if not self.enable_profiler:
+            return
+        message = self._format_performance_row(tick, category, entries, total=total)
+        if self.logger is not None:
+            self.logger.info(message)
+        if self.performance_logger is not None:
+            self.performance_logger.info(message)
 
     def _move_batch_to_device(self, batch: Any) -> Any:
         if torch.is_tensor(batch):
@@ -243,11 +277,12 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
             self.cache_state_model_stat = {k: v.detach().clone() for k, v in model_state.items()}
             if self.enable_profiler:
                 self._synchronize_for_timing()
-            if self.enable_profiler and logger is not None:
-                logger.info(
-                    "tick %s consecutive_points start internals: cache_start_state=%.3fs",
+            if self.enable_profiler:
+                self._emit_profile_row(
                     tick,
-                    time.perf_counter() - start_time,
+                    "service(consecutive_points:start)",
+                    [("cache_start_state", time.perf_counter() - start_time)],
+                    total=time.perf_counter() - start_time,
                 )
 
         elif phase == SimulationPhase.END_OF_TICK:
@@ -327,12 +362,11 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
             if self.enable_profiler:
                 timing_entries.append(("write_csv", time.perf_counter() - write_start))
                 self._synchronize_for_timing()
-                timing_entries.append(("total", time.perf_counter() - service_start))
-            if self.enable_profiler and logger is not None:
-                logger.info(
-                    "tick %s consecutive_points end internals: %s",
+                self._emit_profile_row(
                     tick,
-                    self._format_timing_entries(timing_entries),
+                    "service(consecutive_points:end)",
+                    timing_entries,
+                    total=time.perf_counter() - service_start,
                 )
 
     def _build_probe_dataloader(

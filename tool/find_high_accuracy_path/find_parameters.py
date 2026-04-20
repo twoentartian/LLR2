@@ -12,8 +12,13 @@ class ParameterGeneral(Parameter):
     max_tick: Optional[int] = None
     dataloader_worker: Optional[int] = None
     dataloader_prefetch_factor: Optional[int] = None
+    test_dataset_interval: Optional[int] = None
     test_dataset_use_whole: Optional[bool] = None   # False by default
     split_test_val: Optional[float] = None
+
+    def fill_default(self):
+        if self.test_dataset_interval is None:
+            self.test_dataset_interval = 10
 
 
 class ParameterMove(Parameter):

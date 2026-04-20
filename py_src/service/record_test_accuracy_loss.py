@@ -104,6 +104,7 @@ class ServiceTestAccuracyLossRecorder(Service):
         self.store_top_accuracy_model_path: Optional[str] = None
         self.store_top_accuracy_model_buffer: Optional[Dict] = None
         self.logger: Optional[logging.Logger] = None
+        self.performance_logger: Optional[logging.Logger] = None
         self.test_idx = None
         self.val_idx = None
         self.enable_profiler = False
@@ -130,6 +131,39 @@ class ServiceTestAccuracyLossRecorder(Service):
         if not entries:
             return "no timings"
         return ", ".join(f"{name}={elapsed:.3f}s" for name, elapsed in entries)
+
+    @staticmethod
+    def _format_performance_row(
+        tick: int,
+        category: str,
+        entries: list[tuple[str, float]],
+        *,
+        total: Optional[float] = None,
+    ) -> str:
+        parts = [f"tick={tick}", category]
+        if total is not None:
+            parts.append(f"total={total:.3f}s")
+        for name, elapsed in entries:
+            if name == "total":
+                continue
+            parts.append(f"{name}={elapsed:.3f}s")
+        return " | ".join(parts)
+
+    def _emit_profile_row(
+        self,
+        tick: int,
+        category: str,
+        entries: list[tuple[str, float]],
+        *,
+        total: Optional[float] = None,
+    ) -> None:
+        if not self.enable_profiler:
+            return
+        message = self._format_performance_row(tick, category, entries, total=total)
+        if self.logger is not None:
+            self.logger.info(message)
+        if self.performance_logger is not None:
+            self.performance_logger.info(message)
 
     def _move_batch_to_device(self, batch: Any) -> Any:
         if torch.is_tensor(batch):
@@ -372,7 +406,7 @@ class ServiceTestAccuracyLossRecorder(Service):
         row_test_acc, row_test_loss, row_val_acc, row_val_loss = [], [], [], []
         final_accuracy: Dict = {}
         final_model: Dict = {}
-        node_summaries: list[str] = []
+        node_component_timings: list[tuple[str, float]] = []
         service_timings: list[tuple[str, float]] = []
 
         service_start = 0.0
@@ -443,7 +477,10 @@ class ServiceTestAccuracyLossRecorder(Service):
                 row_val_loss.append('%.4E' % loss_val)
             final_accuracy[node_name] = accuracy
             final_model[node_name] = model_stat
-            node_summaries.append(f"node {node_name} ({self._format_timing_entries(node_timings)})")
+            node_component_timings.extend(
+                (f"node{node_name}.{component_name}", component_elapsed)
+                for component_name, component_elapsed in node_timings
+            )
 
         prefix = [str(tick), str(phase_str)]
         write_start = time.perf_counter() if self.enable_profiler else 0.0
@@ -466,13 +503,11 @@ class ServiceTestAccuracyLossRecorder(Service):
         if self.enable_profiler:
             service_timings.append(("store_top_accuracy", elapsed))
             self._synchronize_for_timing()
-            service_timings.append(("total", time.perf_counter() - service_start))
-        if self.enable_profiler and logger is not None:
-            logger.info(
-                "tick %s test_accuracy_loss internals: %s; %s",
+            self._emit_profile_row(
                 tick,
-                self._format_timing_entries(service_timings),
-                "; ".join(node_summaries),
+                "service(test_accuracy_loss)",
+                node_component_timings + service_timings,
+                total=time.perf_counter() - service_start,
             )
 
     def continue_from_checkpoint(self, checkpoint_folder_path: str, restore_until_tick: int, *args, **kwargs):

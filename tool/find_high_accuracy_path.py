@@ -463,6 +463,7 @@ class FindHighAccuracyPathRunner:
         self.arg_output_folder_path: Optional[str] = None
 
         self.child_logger: Optional[logging.Logger] = None
+        self.performance_logger: Optional[logging.Logger] = None
         self.device_obj: Optional[Device] = None
         self.device: Optional[torch.device] = None
         self.scaler = None
@@ -537,6 +538,65 @@ class FindHighAccuracyPathRunner:
             return "no timed steps"
         return ", ".join(f"{name}={elapsed:.3f}s" for name, elapsed in entries)
 
+    @staticmethod
+    def _format_performance_row(
+        tick: int,
+        category: str,
+        entries: list[tuple[str, float]],
+        *,
+        total: Optional[float] = None,
+    ) -> str:
+        parts = [f"tick={tick}", category]
+        if total is not None:
+            parts.append(f"total={total:.3f}s")
+        for name, elapsed in entries:
+            if name == "total":
+                continue
+            parts.append(f"{name}={elapsed:.3f}s")
+        return " | ".join(parts)
+
+    def _emit_performance_row(
+        self,
+        tick: int,
+        category: str,
+        entries: list[tuple[str, float]],
+        *,
+        total: Optional[float] = None,
+    ) -> None:
+        if self.runtime_parameter is None or not self.runtime_parameter.enable_profiler:
+            return
+        message = self._format_performance_row(tick, category, entries, total=total)
+        if self.child_logger is not None:
+            self.child_logger.info(message)
+        if self.performance_logger is not None:
+            self.performance_logger.info(message)
+
+    def _setup_performance_logger(self) -> None:
+        assert self.runtime_parameter is not None
+        assert self.child_logger is not None
+        if not self.runtime_parameter.enable_profiler:
+            self.performance_logger = None
+            return
+
+        os.makedirs(self.runtime_parameter.output_folder_path, exist_ok=True)
+        performance_logger = logging.getLogger(f"{self.child_logger.name}.performance")
+        performance_logger.setLevel(logging.INFO)
+        performance_logger.propagate = False
+        performance_log_file = os.path.abspath(
+            os.path.join(self.runtime_parameter.output_folder_path, "performance.log")
+        )
+        if not any(
+            isinstance(handler, logging.FileHandler)
+            and os.path.abspath(handler.baseFilename) == performance_log_file
+            for handler in performance_logger.handlers
+        ):
+            file_handler = logging.FileHandler(performance_log_file)
+            file_handler.setFormatter(
+                logging.Formatter("[%(asctime)s %(name)s] %(levelname)s: %(message)s")
+            )
+            performance_logger.addHandler(file_handler)
+        self.performance_logger = performance_logger
+
     def _resolve_dataloader_worker_count(self, explicit_workers: Optional[int]) -> int:
         if explicit_workers is not None:
             return explicit_workers
@@ -602,6 +662,7 @@ class FindHighAccuracyPathRunner:
             file_handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
             child_logger.addHandler(file_handler)
         child_logger.info("Logging setup complete")
+        self._setup_performance_logger()
 
         self.device_obj = Device.cpu() if runtime_parameter.use_cpu else Device.auto()
         assert self.device_obj is not None
@@ -631,6 +692,7 @@ class FindHighAccuracyPathRunner:
         if self.general_parameter is None:
             raise RuntimeError("get_parameter_general(...) must return a ParameterGeneral instance")
         general_parameter = self.general_parameter
+        general_parameter.fill_default()
 
         assert general_parameter.max_tick is not None, f"max_tick is not set"
         runtime_parameter.max_tick = general_parameter.max_tick
@@ -897,6 +959,7 @@ class FindHighAccuracyPathRunner:
         device_obj = self.device_obj
         starting_point_stat = self.starting_point_stat
         end_model_stat_dict = self.end_model_stat_dict
+        num_workers = self._resolve_dataloader_worker_count(general_parameter.dataloader_worker)
 
         child_logger.info("Initializing services")
         current_state = model.state_dict()
@@ -974,8 +1037,9 @@ class FindHighAccuracyPathRunner:
             child_logger.info("record_model_service is disabled")
 
         if not runtime_parameter.service_test_accuracy_loss_disable:
+            test_dataset_interval = max(1, general_parameter.test_dataset_interval or 10)
             self.record_test_accuracy_loss_service = record_test_accuracy_loss.ServiceTestAccuracyLossRecorder(
-                interval=runtime_parameter.service_test_accuracy_loss_interval,
+                interval=test_dataset_interval,
                 test_batch_size=runtime_parameter.service_test_accuracy_loss_batch_size,
                 model_name=_require_model_type_name(runtime_parameter.model_type),
                 dataset_name=_require_dataset_type_name(runtime_parameter.dataset_type),
@@ -984,7 +1048,9 @@ class FindHighAccuracyPathRunner:
                 test_whole_dataset=runtime_parameter.test_dataset_use_whole,
                 test_val_split=general_parameter.split_test_val,
             )
+            child_logger.info("record_test_accuracy_loss_service interval = %s tick(s)", test_dataset_interval)
             self.record_test_accuracy_loss_service.enable_profiler = runtime_parameter.enable_profiler
+            self.record_test_accuracy_loss_service.performance_logger = self.performance_logger
             self.record_test_accuracy_loss_service.initialize_without_runtime_parameters(
                 output_path=output_path,
                 node_names=[0],
@@ -994,7 +1060,7 @@ class FindHighAccuracyPathRunner:
                 ml_setup=current_ml_setup,
                 logger=child_logger,
                 device=device_obj,
-                num_workers=general_parameter.dataloader_worker,
+                num_workers=num_workers,
                 prefetch_factor=general_parameter.dataloader_prefetch_factor,
             )
 
@@ -1016,6 +1082,7 @@ class FindHighAccuracyPathRunner:
                 )
             )
             self.record_consecutive_points_service.enable_profiler = runtime_parameter.enable_profiler
+            self.record_consecutive_points_service.performance_logger = self.performance_logger
             self.record_consecutive_points_service.initialize_without_runtime_parameters(
                 output_path=output_path,
                 model=model,
@@ -1024,7 +1091,7 @@ class FindHighAccuracyPathRunner:
                 ml_setup=current_ml_setup,
                 logger=child_logger,
                 device=device_obj,
-                num_workers=general_parameter.dataloader_worker,
+                num_workers=num_workers,
                 prefetch_factor=general_parameter.dataloader_prefetch_factor,
             )
 
@@ -1620,6 +1687,10 @@ class FindHighAccuracyPathRunner:
         assert self.end_model_stat_dict is not None
 
         service_timings: list[tuple[str, float]] = []
+        services_start_time = 0.0
+        if runtime_parameter.enable_profiler:
+            self._synchronize_for_timing()
+            services_start_time = time.perf_counter()
 
         _, elapsed = self._time_call(
             self.weight_diff_service.trigger_without_runtime_parameters,
@@ -1702,10 +1773,12 @@ class FindHighAccuracyPathRunner:
             service_timings.append(("record_cosine_similarity", elapsed))
 
         if runtime_parameter.enable_profiler:
-            child_logger.info(
-                "tick %s service profile: %s",
+            self._synchronize_for_timing()
+            self._emit_performance_row(
                 runtime_parameter.current_tick,
-                self._format_timing_entries(service_timings),
+                "services(all)",
+                service_timings,
+                total=time.perf_counter() - services_start_time,
             )
 
     def finalize(self) -> None:
@@ -1823,12 +1896,11 @@ class FindHighAccuracyPathRunner:
 
         if runtime_parameter.enable_profiler:
             self._synchronize_for_timing()
-            tick_total_time = time.perf_counter() - tick_start_time
-            child_logger.info(
-                "tick %s profile: total=%.3fs, %s",
+            self._emit_performance_row(
                 tick_index,
-                tick_total_time,
-                self._format_timing_entries(tick_timings),
+                "profile(total)",
+                tick_timings,
+                total=time.perf_counter() - tick_start_time,
             )
 
         return not self.finished

@@ -537,6 +537,17 @@ class FindHighAccuracyPathRunner:
             return "no timed steps"
         return ", ".join(f"{name}={elapsed:.3f}s" for name, elapsed in entries)
 
+    def _resolve_dataloader_worker_count(self, explicit_workers: Optional[int]) -> int:
+        if explicit_workers is not None:
+            return explicit_workers
+        assert self.runtime_parameter is not None
+        total_cpu_count = self.runtime_parameter.total_cpu_count or os.cpu_count() or 1
+        process_worker_count = max(1, self.runtime_parameter.worker_count or 1)
+        cpu_budget_per_process = max(1, total_cpu_count // process_worker_count)
+        # Conservative default: enough workers to overlap host preprocessing
+        # and H2D copies, but capped to avoid oversubscribing many path workers.
+        return min(8, max(1, cpu_budget_per_process // 8))
+
     def setup(
         self,
         index: int,
@@ -632,8 +643,13 @@ class FindHighAccuracyPathRunner:
 
         child_logger.info("test_dataset_use_whole = %s", runtime_parameter.test_dataset_use_whole)
 
-        num_workers = general_parameter.dataloader_worker or 0
-        self.dataloader = current_ml_setup.train_dataloader(DataloaderConfig(num_workers=num_workers))
+        num_workers = self._resolve_dataloader_worker_count(general_parameter.dataloader_worker)
+        self.dataloader = current_ml_setup.train_dataloader(
+            DataloaderConfig(
+                num_workers=num_workers,
+                prefetch_factor=general_parameter.dataloader_prefetch_factor,
+            )
+        )
         self.criterion = _get_criterion(current_ml_setup)
         assert self.dataloader is not None
         assert self.criterion is not None
@@ -979,6 +995,7 @@ class FindHighAccuracyPathRunner:
                 logger=child_logger,
                 device=device_obj,
                 num_workers=general_parameter.dataloader_worker,
+                prefetch_factor=general_parameter.dataloader_prefetch_factor,
             )
 
         self.record_training_loss_service = record_training_loss_accuracy.ServiceTrainingLossAccuracyRecorder(1)
@@ -1008,6 +1025,7 @@ class FindHighAccuracyPathRunner:
                 logger=child_logger,
                 device=device_obj,
                 num_workers=general_parameter.dataloader_worker,
+                prefetch_factor=general_parameter.dataloader_prefetch_factor,
             )
 
     def _refresh_layer_lists(self) -> None:

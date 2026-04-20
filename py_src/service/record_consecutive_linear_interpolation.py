@@ -16,7 +16,7 @@ import copy
 import logging
 import os
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -69,6 +69,7 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
         self._other_state_names: list[str] = []
         self.logger: Optional[logging.Logger] = None
         self.enable_profiler = False
+        self._cached_probe_batches = None
 
     def _synchronize_for_timing(self) -> None:
         if not self.enable_profiler:
@@ -90,6 +91,44 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
         if not entries:
             return "no timings"
         return ", ".join(f"{name}={elapsed:.3f}s" for name, elapsed in entries)
+
+    def _move_batch_to_device(self, batch: Any) -> Any:
+        if torch.is_tensor(batch):
+            return batch.to(self._device, non_blocking=True)
+        if isinstance(batch, dict):
+            return {key: self._move_batch_to_device(value) for key, value in batch.items()}
+        if isinstance(batch, tuple):
+            return tuple(self._move_batch_to_device(value) for value in batch)
+        if isinstance(batch, list):
+            return [self._move_batch_to_device(value) for value in batch]
+        return batch
+
+    def _cache_probe_max_samples(self) -> int:
+        return max(self.batch_size * 16, 512)
+
+    def _maybe_cache_probe_batches(self) -> None:
+        if self._cached_probe_batches is not None:
+            return
+        if self.dataloader is None or self._device is None or self._device.type != "cuda":
+            return
+        try:
+            total_samples = len(self.dataloader.dataset)  # type: ignore[attr-defined]
+        except Exception:
+            return
+        if total_samples > self._cache_probe_max_samples():
+            return
+
+        cached_batches = []
+        for batch in self.dataloader:
+            cached_batches.append(self._move_batch_to_device(batch))
+        self._cached_probe_batches = cached_batches
+        self.dataloader = cached_batches
+        if self.enable_profiler and self.logger is not None:
+            self.logger.info(
+                "Cached consecutive-points probe set on GPU (%s samples, %s batches)",
+                total_samples,
+                len(cached_batches),
+            )
 
     @staticmethod
     def get_service_name() -> str:
@@ -130,6 +169,7 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
         logger: Optional[logging.Logger] = None,
         device: Optional[Device] = None,
         num_workers: Optional[int] = None,
+        prefetch_factor: Optional[int] = None,
     ):
         self.logger = logger
         self.criterion = criterion
@@ -167,8 +207,10 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
         self.dataloader = self._build_probe_dataloader(
             ml_setup,
             num_workers=num_workers,
+            prefetch_factor=prefetch_factor,
             dataset_override=subset_override,
         )
+        self._maybe_cache_probe_batches()
 
         # CSV files
         self.accuracy_file = open(os.path.join(output_path, self.accuracy_file_name), "w+")
@@ -298,6 +340,7 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
         ml_setup,
         *,
         num_workers: Optional[int] = None,
+        prefetch_factor: Optional[int] = None,
         dataset_override=None,
     ):
         loader_setup = copy.copy(ml_setup)
@@ -309,6 +352,7 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
             num_workers=num_workers or 0,
             shuffle=False,
             pin_memory=True,
+            prefetch_factor=prefetch_factor,
         )
         return loader_setup.val_dataloader(loader_config, ignore_override=False)
 

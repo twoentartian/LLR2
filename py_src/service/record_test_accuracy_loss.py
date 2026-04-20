@@ -13,7 +13,7 @@ import logging
 import os
 import time
 from collections import OrderedDict
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -107,6 +107,8 @@ class ServiceTestAccuracyLossRecorder(Service):
         self.test_idx = None
         self.val_idx = None
         self.enable_profiler = False
+        self._cached_test_batches = None
+        self._cached_val_batches = None
 
     def _synchronize_for_timing(self) -> None:
         if not self.enable_profiler:
@@ -128,6 +130,46 @@ class ServiceTestAccuracyLossRecorder(Service):
         if not entries:
             return "no timings"
         return ", ".join(f"{name}={elapsed:.3f}s" for name, elapsed in entries)
+
+    def _move_batch_to_device(self, batch: Any) -> Any:
+        if torch.is_tensor(batch):
+            return batch.to(self._device, non_blocking=True)
+        if isinstance(batch, dict):
+            return {key: self._move_batch_to_device(value) for key, value in batch.items()}
+        if isinstance(batch, tuple):
+            return tuple(self._move_batch_to_device(value) for value in batch)
+        if isinstance(batch, list):
+            return [self._move_batch_to_device(value) for value in batch]
+        return batch
+
+    def _cache_eval_max_samples(self) -> int:
+        return max(self.test_batch_size * 16, 512)
+
+    def _maybe_cache_eval_batches(self, dataloader, cache_attr_name: str):
+        cached_batches = getattr(self, cache_attr_name)
+        if cached_batches is not None:
+            return cached_batches
+        if dataloader is None or self._device is None or self._device.type != "cuda":
+            return dataloader
+        try:
+            total_samples = len(dataloader.dataset)  # type: ignore[attr-defined]
+        except Exception:
+            return dataloader
+        if total_samples > self._cache_eval_max_samples():
+            return dataloader
+
+        cached_batches = []
+        for batch in dataloader:
+            cached_batches.append(self._move_batch_to_device(batch))
+        setattr(self, cache_attr_name, cached_batches)
+        if self.enable_profiler and self.logger is not None:
+            self.logger.info(
+                "Cached %s eval batches on GPU (%s samples, %s batches)",
+                cache_attr_name.replace("_cached_", "").replace("_", " "),
+                total_samples,
+                len(cached_batches),
+            )
+        return cached_batches
 
     @staticmethod
     def get_service_name() -> str:
@@ -171,6 +213,7 @@ class ServiceTestAccuracyLossRecorder(Service):
         logger: Optional[logging.Logger] = None,
         device: Optional[Device] = None,
         num_workers: Optional[int] = None,
+        prefetch_factor: Optional[int] = None,
     ):
         self.logger = logger
         self.node_order = node_names
@@ -209,19 +252,25 @@ class ServiceTestAccuracyLossRecorder(Service):
                 self.test_dataset = self._build_val_dataloader(
                     ml_setup,
                     num_workers=num_workers,
+                    prefetch_factor=prefetch_factor,
                     dataset_override=Subset(base_test_dataset, self.test_idx), # type: ignore[arg-type]
                 )
+                self.test_dataset = self._maybe_cache_eval_batches(self.test_dataset, "_cached_test_batches")
                 self.val_dataset = self._build_val_dataloader(
                     ml_setup,
                     num_workers=num_workers,
+                    prefetch_factor=prefetch_factor,
                     dataset_override=Subset(base_test_dataset, self.val_idx), # type: ignore[arg-type]
                 )
+                self.val_dataset = self._maybe_cache_eval_batches(self.val_dataset, "_cached_val_batches")
             else:
                 self.test_dataset = self._build_val_dataloader(
                     ml_setup,
                     num_workers=num_workers,
+                    prefetch_factor=prefetch_factor,
                     dataset_override=base_test_dataset,
                 )
+                self.test_dataset = self._maybe_cache_eval_batches(self.test_dataset, "_cached_test_batches")
         else:
             if self.use_fixed_testing_dataset:
                 labels = np.array([base_test_dataset[i][1] for i in range(len(base_test_dataset))]) # type: ignore[index,arg-type]
@@ -238,16 +287,20 @@ class ServiceTestAccuracyLossRecorder(Service):
                     ml_setup,
                     batch_size=min(100, self.test_batch_size),
                     num_workers=num_workers,
+                    prefetch_factor=prefetch_factor,
                     dataset_override=Subset(base_test_dataset, balanced_idx), # type: ignore[arg-type]
                 )
+                self.test_dataset = self._maybe_cache_eval_batches(self.test_dataset, "_cached_test_batches")
             else:
                 self.test_dataset = self._build_val_dataloader(
                     ml_setup,
                     batch_size=self.test_batch_size,
                     num_workers=num_workers,
+                    prefetch_factor=prefetch_factor,
                     num_samples=self.test_batch_size,
                     dataset_override=base_test_dataset,
                 )
+                self.test_dataset = self._maybe_cache_eval_batches(self.test_dataset, "_cached_test_batches")
 
         # Reuse the provided evaluation model directly.
         self.test_model = model
@@ -268,6 +321,7 @@ class ServiceTestAccuracyLossRecorder(Service):
         *,
         batch_size: Optional[int] = None,
         num_workers: Optional[int] = None,
+        prefetch_factor: Optional[int] = None,
         num_samples: Optional[int] = None,
         dataset_override=None,
     ):
@@ -282,6 +336,7 @@ class ServiceTestAccuracyLossRecorder(Service):
             num_samples=num_samples,
             shuffle=False,
             pin_memory=True,
+            prefetch_factor=prefetch_factor,
         )
         return loader_setup.val_dataloader(loader_config, ignore_override=False)
 

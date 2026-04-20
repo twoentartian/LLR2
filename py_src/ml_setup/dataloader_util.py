@@ -24,6 +24,8 @@ class DataloaderConfig:
     drop_last: bool = False
     collate_fn: Optional[Callable] = None
     sampler: Optional[Any] = None
+    prefetch_factor: Optional[int] = None
+    persistent_workers: Optional[bool] = None
 
 
 # ---------------------------------------------------------------------------
@@ -86,9 +88,16 @@ def build_dataloader(
         pin_memory=cfg.pin_memory,
         drop_last=cfg.drop_last,
         collate_fn=collate_fn,
-        prefetch_factor=4 if cfg.num_workers>1 else None,
-        persistent_workers=cfg.num_workers>1,
     )
+    if cfg.num_workers > 0:
+        prefetch_factor = cfg.prefetch_factor if cfg.prefetch_factor is not None else 4
+        persistent_workers = (
+            cfg.persistent_workers
+            if cfg.persistent_workers is not None
+            else True
+        )
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+        loader_kwargs["persistent_workers"] = persistent_workers
     if sampler is not None:
         loader_kwargs["sampler"] = sampler
 

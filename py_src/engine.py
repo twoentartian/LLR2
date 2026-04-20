@@ -201,7 +201,7 @@ def train(
     min_rounds_value = max(0, min_rounds or 0)
     moving_average = MovingAverage(max(1, min_rounds_value)) if adaptive_mode else None
     stop_after_single_epoch = not adaptive_mode
-    step_context = nullcontext if backpropagation else torch.no_grad
+    step_context = nullcontext if backpropagation else torch.inference_mode
 
     should_stop = False
     while result.iterations < step_limit and not should_stop:
@@ -283,7 +283,7 @@ def val(
 
     result = ValResult()
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch_idx, batch in enumerate(dataloader):
             out = adapter.val_step(batch, batch_idx, device.device)
             result.total_loss += out.loss * out.sample_count

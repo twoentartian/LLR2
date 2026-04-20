@@ -106,12 +106,17 @@ class ServiceTestAccuracyLossRecorder(Service):
         self.logger: Optional[logging.Logger] = None
         self.test_idx = None
         self.val_idx = None
+        self.enable_profiler = False
 
     def _synchronize_for_timing(self) -> None:
+        if not self.enable_profiler:
+            return
         if self._device is not None and self._device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.synchronize(self._device)
 
     def _time_call(self, func, *args, **kwargs):
+        if not self.enable_profiler:
+            return func(*args, **kwargs), 0.0
         self._synchronize_for_timing()
         start_time = time.perf_counter()
         result = func(*args, **kwargs)
@@ -315,8 +320,10 @@ class ServiceTestAccuracyLossRecorder(Service):
         node_summaries: list[str] = []
         service_timings: list[tuple[str, float]] = []
 
-        self._synchronize_for_timing()
-        service_start = time.perf_counter()
+        service_start = 0.0
+        if self.enable_profiler:
+            self._synchronize_for_timing()
+            service_start = time.perf_counter()
 
         for node_name in self.node_order:
             model_stat = node_names_and_model_stats[node_name]
@@ -384,7 +391,7 @@ class ServiceTestAccuracyLossRecorder(Service):
             node_summaries.append(f"node {node_name} ({self._format_timing_entries(node_timings)})")
 
         prefix = [str(tick), str(phase_str)]
-        write_start = time.perf_counter()
+        write_start = time.perf_counter() if self.enable_profiler else 0.0
         self.accuracy_file.write(",".join(prefix + row_acc) + "\n"); self.accuracy_file.flush()
         self.loss_file.write(",".join(prefix + row_loss) + "\n"); self.loss_file.flush()
         self.output_var_file.write(",".join(prefix + row_var) + "\n"); self.output_var_file.flush()
@@ -397,13 +404,15 @@ class ServiceTestAccuracyLossRecorder(Service):
             self.test_loss_file.write(",".join(prefix + row_test_loss) + "\n"); self.test_loss_file.flush()
             self.val_accuracy_file.write(",".join(prefix + row_val_acc) + "\n"); self.val_accuracy_file.flush()
             self.val_loss_file.write(",".join(prefix + row_val_loss) + "\n"); self.val_loss_file.flush()
-        service_timings.append(("write_csv", time.perf_counter() - write_start))
+        if self.enable_profiler:
+            service_timings.append(("write_csv", time.perf_counter() - write_start))
 
         _, elapsed = self._time_call(self._check_store_top_accuracy_model, final_accuracy, final_model, tick)
-        service_timings.append(("store_top_accuracy", elapsed))
-        self._synchronize_for_timing()
-        service_timings.append(("total", time.perf_counter() - service_start))
-        if logger is not None:
+        if self.enable_profiler:
+            service_timings.append(("store_top_accuracy", elapsed))
+            self._synchronize_for_timing()
+            service_timings.append(("total", time.perf_counter() - service_start))
+        if self.enable_profiler and logger is not None:
             logger.info(
                 "tick %s test_accuracy_loss internals: %s; %s",
                 tick,

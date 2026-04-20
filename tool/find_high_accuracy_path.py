@@ -515,12 +515,16 @@ class FindHighAccuracyPathRunner:
         self.finished = False
 
     def _synchronize_for_timing(self) -> None:
+        if self.runtime_parameter is None or not self.runtime_parameter.enable_profiler:
+            return
         if self.device is None:
             return
         if self.device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.synchronize(self.device)
 
     def _time_call(self, func, *args, **kwargs):
+        if self.runtime_parameter is None or not self.runtime_parameter.enable_profiler:
+            return func(*args, **kwargs), 0.0
         self._synchronize_for_timing()
         start_time = time.perf_counter()
         result = func(*args, **kwargs)
@@ -964,6 +968,7 @@ class FindHighAccuracyPathRunner:
                 test_whole_dataset=runtime_parameter.test_dataset_use_whole,
                 test_val_split=general_parameter.split_test_val,
             )
+            self.record_test_accuracy_loss_service.enable_profiler = runtime_parameter.enable_profiler
             self.record_test_accuracy_loss_service.initialize_without_runtime_parameters(
                 output_path=output_path,
                 node_names=[0],
@@ -993,6 +998,7 @@ class FindHighAccuracyPathRunner:
                     recorded_node_name=0,
                 )
             )
+            self.record_consecutive_points_service.enable_profiler = runtime_parameter.enable_profiler
             self.record_consecutive_points_service.initialize_without_runtime_parameters(
                 output_path=output_path,
                 model=model,
@@ -1677,11 +1683,12 @@ class FindHighAccuracyPathRunner:
             )
             service_timings.append(("record_cosine_similarity", elapsed))
 
-        child_logger.info(
-            "tick %s service profile: %s",
-            runtime_parameter.current_tick,
-            self._format_timing_entries(service_timings),
-        )
+        if runtime_parameter.enable_profiler:
+            child_logger.info(
+                "tick %s service profile: %s",
+                runtime_parameter.current_tick,
+                self._format_timing_entries(service_timings),
+            )
 
     def finalize(self) -> None:
         if self.finalized:
@@ -1730,8 +1737,10 @@ class FindHighAccuracyPathRunner:
 
         child_logger.info("tick %s", tick_index)
         tick_timings: list[tuple[str, float]] = []
-        self._synchronize_for_timing()
-        tick_start_time = time.perf_counter()
+        tick_start_time = 0.0
+        if runtime_parameter.enable_profiler:
+            self._synchronize_for_timing()
+            tick_start_time = time.perf_counter()
 
         _, elapsed = self._time_call(self._maybe_save_checkpoint)
         tick_timings.append(("save_checkpoint", elapsed))
@@ -1794,14 +1803,15 @@ class FindHighAccuracyPathRunner:
             _, elapsed = self._time_call(self.finalize)
             tick_timings.append(("finalize", elapsed))
 
-        self._synchronize_for_timing()
-        tick_total_time = time.perf_counter() - tick_start_time
-        child_logger.info(
-            "tick %s profile: total=%.3fs, %s",
-            tick_index,
-            tick_total_time,
-            self._format_timing_entries(tick_timings),
-        )
+        if runtime_parameter.enable_profiler:
+            self._synchronize_for_timing()
+            tick_total_time = time.perf_counter() - tick_start_time
+            child_logger.info(
+                "tick %s profile: total=%.3fs, %s",
+                tick_index,
+                tick_total_time,
+                self._format_timing_entries(tick_timings),
+            )
 
         return not self.finished
 
@@ -1847,6 +1857,7 @@ def _build_runtime_parameters_from_args(args) -> RuntimeParameters:
     runtime_parameter.service_cosine_similarity_disable = args.disable_service_cosine_similarity
     runtime_parameter.total_cpu_count = args.core
     runtime_parameter.worker_count = args.worker
+    runtime_parameter.enable_profiler = args.profiler
     return runtime_parameter
 
 
@@ -1953,6 +1964,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--linear_interpolation_dataset_size", type=int, default=1000)
     parser.add_argument("--disable_service_test", action="store_true")
     parser.add_argument("--disable_service_cosine_similarity", action="store_true")
+    parser.add_argument("--profiler", action=argparse.BooleanOptionalAction, default=False, help="Enable per-tick and per-service timing logs")
 
     args = parser.parse_args(argv)
 

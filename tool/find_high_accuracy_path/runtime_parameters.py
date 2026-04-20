@@ -61,6 +61,7 @@ class RuntimeParameters:
     service_test_accuracy_loss_batch_size: int = None # type: ignore
     service_cosine_similarity_disable: bool = None # type: ignore
     service_cosine_similarity_ref_model: str = None # type: ignore
+    enable_profiler: bool = False
 
     @staticmethod
     def coerce_model_type(value: Optional[ModelType | str]) -> Optional[ModelType]:

@@ -68,12 +68,17 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
         self._float_state_names: list[str] = []
         self._other_state_names: list[str] = []
         self.logger: Optional[logging.Logger] = None
+        self.enable_profiler = False
 
     def _synchronize_for_timing(self) -> None:
+        if not self.enable_profiler:
+            return
         if self._device is not None and self._device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.synchronize(self._device)
 
     def _time_call(self, func, *args, **kwargs):
+        if not self.enable_profiler:
+            return func(*args, **kwargs), 0.0
         self._synchronize_for_timing()
         start_time = time.perf_counter()
         result = func(*args, **kwargs)
@@ -189,11 +194,14 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
         if phase == SimulationPhase.START_OF_TICK:
             assert self.cache_state_model_stat is None
             # Cache on same device as model — avoids CPU round-trip
-            self._synchronize_for_timing()
-            start_time = time.perf_counter()
+            start_time = 0.0
+            if self.enable_profiler:
+                self._synchronize_for_timing()
+                start_time = time.perf_counter()
             self.cache_state_model_stat = {k: v.detach().clone() for k, v in model_state.items()}
-            self._synchronize_for_timing()
-            if logger is not None:
+            if self.enable_profiler:
+                self._synchronize_for_timing()
+            if self.enable_profiler and logger is not None:
                 logger.info(
                     "tick %s consecutive_points start internals: cache_start_state=%.3fs",
                     tick,
@@ -202,23 +210,29 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
 
         elif phase == SimulationPhase.END_OF_TICK:
             assert self.cache_state_model_stat is not None
-            self._synchronize_for_timing()
-            service_start = time.perf_counter()
+            service_start = 0.0
+            if self.enable_profiler:
+                self._synchronize_for_timing()
+                service_start = time.perf_counter()
             timing_entries: list[tuple[str, float]] = []
             start_stat = self.cache_state_model_stat
-            self._synchronize_for_timing()
-            start_time = time.perf_counter()
+            start_time = 0.0
+            if self.enable_profiler:
+                self._synchronize_for_timing()
+                start_time = time.perf_counter()
             end_stat = {k: v.detach().clone() for k, v in model_state.items()}
-            self._synchronize_for_timing()
-            timing_entries.append(("clone_end_state", time.perf_counter() - start_time))
-            self._synchronize_for_timing()
-            start_time = time.perf_counter()
+            if self.enable_profiler:
+                self._synchronize_for_timing()
+                timing_entries.append(("clone_end_state", time.perf_counter() - start_time))
+                self._synchronize_for_timing()
+                start_time = time.perf_counter()
             delta_stat = {
                 name: end_stat[name] - start_stat[name]
                 for name in self._float_state_names
             }
-            self._synchronize_for_timing()
-            timing_entries.append(("build_delta", time.perf_counter() - start_time))
+            if self.enable_profiler:
+                self._synchronize_for_timing()
+                timing_entries.append(("build_delta", time.perf_counter() - start_time))
 
             loss_results, acc_results = [], []
             original_training_mode = self.test_model.training
@@ -228,8 +242,10 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
             try:
                 for i in range(1, self.points_size):
                     alpha = i / self.points_size
-                    self._synchronize_for_timing()
-                    point_start = time.perf_counter()
+                    point_start = 0.0
+                    if self.enable_profiler:
+                        self._synchronize_for_timing()
+                        point_start = time.perf_counter()
                     _, elapsed = self._time_call(self._load_interpolated_state, start_stat, end_stat, delta_stat, alpha)
                     interpolation_load_total += elapsed
                     result, elapsed = self._time_call(
@@ -242,31 +258,35 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
                         training_mode=self.training_mode,
                     )
                     probe_eval_total += elapsed
-                    self._synchronize_for_timing()
-                    point_total_times.append(time.perf_counter() - point_start)
+                    if self.enable_profiler:
+                        self._synchronize_for_timing()
+                        point_total_times.append(time.perf_counter() - point_start)
                     loss_results.append('%.4E' % result.avg_loss)
                     acc_results.append('%.4E' % (result.accuracy or 0.0))
             finally:
                 # Service probes must not leave the model in a modified state.
                 _, elapsed = self._time_call(self._restore_state, end_stat)
-                timing_entries.append(("restore_end_state", elapsed))
+                if self.enable_profiler:
+                    timing_entries.append(("restore_end_state", elapsed))
                 self.test_model.train(original_training_mode)
                 self.cache_state_model_stat = None
 
-            timing_entries.append(("interpolate_state_total", interpolation_load_total))
-            timing_entries.append(("probe_eval_total", probe_eval_total))
-            if point_total_times:
+            if self.enable_profiler:
+                timing_entries.append(("interpolate_state_total", interpolation_load_total))
+                timing_entries.append(("probe_eval_total", probe_eval_total))
+            if self.enable_profiler and point_total_times:
                 timing_entries.append(("point_avg", sum(point_total_times) / len(point_total_times)))
                 timing_entries.append(("point_max", max(point_total_times)))
 
             prefix = [str(tick), str(phase.name)]
-            write_start = time.perf_counter()
+            write_start = time.perf_counter() if self.enable_profiler else 0.0
             self.accuracy_file.write(",".join(prefix + acc_results) + "\n"); self.accuracy_file.flush()
             self.loss_file.write(",".join(prefix + loss_results) + "\n"); self.loss_file.flush()
-            timing_entries.append(("write_csv", time.perf_counter() - write_start))
-            self._synchronize_for_timing()
-            timing_entries.append(("total", time.perf_counter() - service_start))
-            if logger is not None:
+            if self.enable_profiler:
+                timing_entries.append(("write_csv", time.perf_counter() - write_start))
+                self._synchronize_for_timing()
+                timing_entries.append(("total", time.perf_counter() - service_start))
+            if self.enable_profiler and logger is not None:
                 logger.info(
                     "tick %s consecutive_points end internals: %s",
                     tick,

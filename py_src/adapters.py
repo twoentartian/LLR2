@@ -357,7 +357,16 @@ class CustomStepAdapter(ModelAdapter):
         backpropagation=True,
     ) -> StepOutput:
         batch = _to_device(batch, device)
-        return self._train_step_fn(batch_idx, batch, self._model, optimizer, lr_scheduler, self.extra_ctx)
+        effective_optimizer = optimizer if backpropagation else None
+        effective_lr_scheduler = lr_scheduler if backpropagation else None
+        return self._train_step_fn(
+            batch_idx,
+            batch,
+            self._model,
+            effective_optimizer,
+            effective_lr_scheduler,
+            self.extra_ctx,
+        )
 
     def val_step(self, batch, batch_idx, device) -> StepOutput:
         batch = _to_device(batch, device)

@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torchvision import transforms
 
 from py_src.ml_setup import (
+    arithmetic_addition_grokking,
     cct14_7x2_imagenet1k,
     cct_7_3x1_cifar10,
     ddpm_cifar10,
@@ -159,6 +160,13 @@ class TestRunSingleBatch(unittest.TestCase):
         self.assertIsNone(val_result)
         print("ddpm_cifar10")
         print(f"train loss:{train_result.avg_loss:.4f}")
+
+    def test_arithmetic_addition_grokking_train_and_val(self):
+        self._assert_classifier_single_batch(
+            "arithmetic_addition_grokking",
+            arithmetic_addition_grokking(train_percentage=50, modulus=13),
+            batch_size=8,
+        )
 
     def test_resnet18_cifar10_train_and_val(self):
         self._assert_classifier_single_batch(

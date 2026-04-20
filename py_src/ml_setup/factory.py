@@ -201,6 +201,23 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
             return nanoclip_flickr30k_default()
         raise _nie(mt, dt)
 
+    elif mt == ModelType.transformer_for_grokking:
+        from .grokking import (
+            arithmetic_addition_grokking,
+            arithmetic_cubepoly_grokking,
+            arithmetic_cube2_grokking,
+            arithmetic_unknown_exp_grokking,
+        )
+        if _default or dt == DatasetType.arithmetic_addition:
+            return arithmetic_addition_grokking()
+        elif dt == DatasetType.arithmetic_cubepoly:
+            return arithmetic_cubepoly_grokking()
+        elif dt == DatasetType.arithmetic_cube2:
+            return arithmetic_cube2_grokking()
+        elif dt == DatasetType.arithmetic_exp_unknown:
+            return arithmetic_unknown_exp_grokking()
+        raise _nie(mt, dt)
+
     else:
         raise NotImplementedError(f"No MLSetup defined for model_type={mt.name} in LLR2 yet.")
 

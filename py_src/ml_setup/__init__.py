@@ -17,6 +17,12 @@ from .vgg import vgg11_bn_cifar10, vgg11_no_bn_cifar10
 from .cct import cct_7_3x1_cifar10, cct_7_3x1_cifar100, cct14_7x2_imagenet1k
 
 from .ddpm import ddpm_cifar10
+from .grokking import (
+    arithmetic_addition_grokking,
+    arithmetic_cubepoly_grokking,
+    arithmetic_cube2_grokking,
+    arithmetic_unknown_exp_grokking,
+)
 from .nanoclip import nanoclip_flickr30k_default
 
 __all__ = [
@@ -35,5 +41,9 @@ __all__ = [
     "vgg11_bn_cifar10", "vgg11_no_bn_cifar10",
     "cct_7_3x1_cifar10", "cct_7_3x1_cifar100", "cct14_7x2_imagenet1k",
     "ddpm_cifar10",
+    "arithmetic_addition_grokking",
+    "arithmetic_cubepoly_grokking",
+    "arithmetic_cube2_grokking",
+    "arithmetic_unknown_exp_grokking",
     "nanoclip_flickr30k_default",
     ]

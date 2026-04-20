@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import time
 from typing import Optional
 
 import torch
@@ -67,6 +68,23 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
         self._float_state_names: list[str] = []
         self._other_state_names: list[str] = []
         self.logger: Optional[logging.Logger] = None
+
+    def _synchronize_for_timing(self) -> None:
+        if self._device is not None and self._device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(self._device)
+
+    def _time_call(self, func, *args, **kwargs):
+        self._synchronize_for_timing()
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        self._synchronize_for_timing()
+        return result, time.perf_counter() - start_time
+
+    @staticmethod
+    def _format_timing_entries(entries: list[tuple[str, float]]) -> str:
+        if not entries:
+            return "no timings"
+        return ", ".join(f"{name}={elapsed:.3f}s" for name, elapsed in entries)
 
     @staticmethod
     def get_service_name() -> str:
@@ -166,28 +184,56 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
         assert self._state_targets is not None
         if self.accuracy_file is None or self.loss_file is None:
             return
+        logger = self.logger
 
         if phase == SimulationPhase.START_OF_TICK:
             assert self.cache_state_model_stat is None
             # Cache on same device as model — avoids CPU round-trip
+            self._synchronize_for_timing()
+            start_time = time.perf_counter()
             self.cache_state_model_stat = {k: v.detach().clone() for k, v in model_state.items()}
+            self._synchronize_for_timing()
+            if logger is not None:
+                logger.info(
+                    "tick %s consecutive_points start internals: cache_start_state=%.3fs",
+                    tick,
+                    time.perf_counter() - start_time,
+                )
 
         elif phase == SimulationPhase.END_OF_TICK:
             assert self.cache_state_model_stat is not None
+            self._synchronize_for_timing()
+            service_start = time.perf_counter()
+            timing_entries: list[tuple[str, float]] = []
             start_stat = self.cache_state_model_stat
+            self._synchronize_for_timing()
+            start_time = time.perf_counter()
             end_stat = {k: v.detach().clone() for k, v in model_state.items()}
+            self._synchronize_for_timing()
+            timing_entries.append(("clone_end_state", time.perf_counter() - start_time))
+            self._synchronize_for_timing()
+            start_time = time.perf_counter()
             delta_stat = {
                 name: end_stat[name] - start_stat[name]
                 for name in self._float_state_names
             }
+            self._synchronize_for_timing()
+            timing_entries.append(("build_delta", time.perf_counter() - start_time))
 
             loss_results, acc_results = [], []
             original_training_mode = self.test_model.training
+            interpolation_load_total = 0.0
+            probe_eval_total = 0.0
+            point_total_times: list[float] = []
             try:
                 for i in range(1, self.points_size):
                     alpha = i / self.points_size
-                    self._load_interpolated_state(start_stat, end_stat, delta_stat, alpha)
-                    result = engine_train(
+                    self._synchronize_for_timing()
+                    point_start = time.perf_counter()
+                    _, elapsed = self._time_call(self._load_interpolated_state, start_stat, end_stat, delta_stat, alpha)
+                    interpolation_load_total += elapsed
+                    result, elapsed = self._time_call(
+                        engine_train,
                         self._adapter, self.dataloader,
                         optimizer=None, lr_scheduler=None,
                         device=self._device_obj,
@@ -195,17 +241,37 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
                         backpropagation=False,
                         training_mode=self.training_mode,
                     )
+                    probe_eval_total += elapsed
+                    self._synchronize_for_timing()
+                    point_total_times.append(time.perf_counter() - point_start)
                     loss_results.append('%.4E' % result.avg_loss)
                     acc_results.append('%.4E' % (result.accuracy or 0.0))
             finally:
                 # Service probes must not leave the model in a modified state.
-                self._restore_state(end_stat)
+                _, elapsed = self._time_call(self._restore_state, end_stat)
+                timing_entries.append(("restore_end_state", elapsed))
                 self.test_model.train(original_training_mode)
                 self.cache_state_model_stat = None
 
+            timing_entries.append(("interpolate_state_total", interpolation_load_total))
+            timing_entries.append(("probe_eval_total", probe_eval_total))
+            if point_total_times:
+                timing_entries.append(("point_avg", sum(point_total_times) / len(point_total_times)))
+                timing_entries.append(("point_max", max(point_total_times)))
+
             prefix = [str(tick), str(phase.name)]
+            write_start = time.perf_counter()
             self.accuracy_file.write(",".join(prefix + acc_results) + "\n"); self.accuracy_file.flush()
             self.loss_file.write(",".join(prefix + loss_results) + "\n"); self.loss_file.flush()
+            timing_entries.append(("write_csv", time.perf_counter() - write_start))
+            self._synchronize_for_timing()
+            timing_entries.append(("total", time.perf_counter() - service_start))
+            if logger is not None:
+                logger.info(
+                    "tick %s consecutive_points end internals: %s",
+                    tick,
+                    self._format_timing_entries(timing_entries),
+                )
 
     def _build_probe_dataloader(
         self,

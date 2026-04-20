@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import time
 from collections import OrderedDict
 from typing import Dict, List, Optional
 
@@ -105,6 +106,23 @@ class ServiceTestAccuracyLossRecorder(Service):
         self.logger: Optional[logging.Logger] = None
         self.test_idx = None
         self.val_idx = None
+
+    def _synchronize_for_timing(self) -> None:
+        if self._device is not None and self._device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(self._device)
+
+    def _time_call(self, func, *args, **kwargs):
+        self._synchronize_for_timing()
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        self._synchronize_for_timing()
+        return result, time.perf_counter() - start_time
+
+    @staticmethod
+    def _format_timing_entries(entries: list[tuple[str, float]]) -> str:
+        if not entries:
+            return "no timings"
+        return ", ".join(f"{name}={elapsed:.3f}s" for name, elapsed in entries)
 
     @staticmethod
     def get_service_name() -> str:
@@ -288,23 +306,35 @@ class ServiceTestAccuracyLossRecorder(Service):
         assert self.accuracy_file is not None
         assert self.loss_file is not None
         assert self.output_var_file is not None
+        logger = self.logger
 
         row_acc, row_loss, row_var = [], [], []
         row_test_acc, row_test_loss, row_val_acc, row_val_loss = [], [], [], []
         final_accuracy: Dict = {}
         final_model: Dict = {}
+        node_summaries: list[str] = []
+        service_timings: list[tuple[str, float]] = []
+
+        self._synchronize_for_timing()
+        service_start = time.perf_counter()
 
         for node_name in self.node_order:
             model_stat = node_names_and_model_stats[node_name]
             # Load state dict — tensors stay on device
-            self.test_model.load_state_dict(model_stat)
-            self.test_model.to(self._device)
+            node_timings: list[tuple[str, float]] = []
+            _, elapsed = self._time_call(self.test_model.load_state_dict, model_stat)
+            node_timings.append(("load_state_dict", elapsed))
+            _, elapsed = self._time_call(self.test_model.to, self._device)
+            node_timings.append(("model_to_device", elapsed))
 
             loss_test = acc_test = loss_val = acc_val = var = 0.0
 
             if self.test_whole_dataset:
                 assert self.test_dataset is not None
-                result = engine_val(self._adapter, self.test_dataset, device=self._device_obj)
+                result, elapsed = self._time_call(
+                    engine_val, self._adapter, self.test_dataset, device=self._device_obj
+                )
+                node_timings.append(("test_eval", elapsed))
                 acc_test = result.accuracy or 0.0
                 loss_test = result.avg_loss
                 var = result.extra.get("variance", 0.0)
@@ -312,7 +342,10 @@ class ServiceTestAccuracyLossRecorder(Service):
 
                 if self.test_val_split is not None:
                     assert self.val_dataset is not None
-                    result_val = engine_val(self._adapter, self.val_dataset, device=self._device_obj) # type: ignore
+                    result_val, elapsed = self._time_call(
+                        engine_val, self._adapter, self.val_dataset, device=self._device_obj
+                    ) # type: ignore
+                    node_timings.append(("val_eval", elapsed))
                     acc_val = result_val.accuracy or 0.0
                     loss_val = result_val.avg_loss
 
@@ -330,7 +363,10 @@ class ServiceTestAccuracyLossRecorder(Service):
                 else:
                     loss = 0.0; accuracy = 0.0
             else:
-                result = engine_val(self._adapter, self.test_dataset, device=self._device_obj)
+                result, elapsed = self._time_call(
+                    engine_val, self._adapter, self.test_dataset, device=self._device_obj
+                )
+                node_timings.append(("test_eval", elapsed))
                 accuracy = result.accuracy or 0.0
                 loss = result.avg_loss
                 var = result.extra.get("variance", 0.0)
@@ -345,8 +381,10 @@ class ServiceTestAccuracyLossRecorder(Service):
                 row_val_loss.append('%.4E' % loss_val)
             final_accuracy[node_name] = accuracy
             final_model[node_name] = model_stat
+            node_summaries.append(f"node {node_name} ({self._format_timing_entries(node_timings)})")
 
         prefix = [str(tick), str(phase_str)]
+        write_start = time.perf_counter()
         self.accuracy_file.write(",".join(prefix + row_acc) + "\n"); self.accuracy_file.flush()
         self.loss_file.write(",".join(prefix + row_loss) + "\n"); self.loss_file.flush()
         self.output_var_file.write(",".join(prefix + row_var) + "\n"); self.output_var_file.flush()
@@ -359,8 +397,19 @@ class ServiceTestAccuracyLossRecorder(Service):
             self.test_loss_file.write(",".join(prefix + row_test_loss) + "\n"); self.test_loss_file.flush()
             self.val_accuracy_file.write(",".join(prefix + row_val_acc) + "\n"); self.val_accuracy_file.flush()
             self.val_loss_file.write(",".join(prefix + row_val_loss) + "\n"); self.val_loss_file.flush()
+        service_timings.append(("write_csv", time.perf_counter() - write_start))
 
-        self._check_store_top_accuracy_model(final_accuracy, final_model, tick)
+        _, elapsed = self._time_call(self._check_store_top_accuracy_model, final_accuracy, final_model, tick)
+        service_timings.append(("store_top_accuracy", elapsed))
+        self._synchronize_for_timing()
+        service_timings.append(("total", time.perf_counter() - service_start))
+        if logger is not None:
+            logger.info(
+                "tick %s test_accuracy_loss internals: %s; %s",
+                tick,
+                self._format_timing_entries(service_timings),
+                "; ".join(node_summaries),
+            )
 
     def continue_from_checkpoint(self, checkpoint_folder_path: str, restore_until_tick: int, *args, **kwargs):
         files = [

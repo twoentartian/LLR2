@@ -28,6 +28,24 @@ class DataloaderConfig:
     persistent_workers: Optional[bool] = None
 
 
+def move_batch_to_device(batch: Any, device: torch.device) -> Any:
+    """Recursively move tensors in a batch structure to ``device``."""
+    if torch.is_tensor(batch):
+        return batch.to(device, non_blocking=True)
+    if isinstance(batch, dict):
+        return {key: move_batch_to_device(value, device) for key, value in batch.items()}
+    if isinstance(batch, tuple):
+        return tuple(move_batch_to_device(value, device) for value in batch)
+    if isinstance(batch, list):
+        return [move_batch_to_device(value, device) for value in batch]
+    return batch
+
+
+def cache_dataloader_on_device(dataloader: Iterable, device: torch.device) -> list[Any]:
+    """Materialize all batches from ``dataloader`` onto ``device`` once."""
+    return [move_batch_to_device(batch, device) for batch in dataloader]
+
+
 # ---------------------------------------------------------------------------
 # Helper: build a DataLoader from a dataset + config
 # ---------------------------------------------------------------------------

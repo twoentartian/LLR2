@@ -24,7 +24,7 @@ from py_src.service_base import Service
 from py_src.simulation_runtime_parameters import RuntimeParameters, SimulationPhase
 from py_src.adapters import ModelAdapter, clone_adapter_for_model
 from py_src.engine import Device, val as engine_val
-from py_src.ml_setup.dataloader_util import DataloaderConfig
+from py_src.ml_setup.dataloader_util import DataloaderConfig, cache_dataloader_on_device
 from py_src.model_opti_save_load import save_model_state
 
 
@@ -165,17 +165,6 @@ class ServiceTestAccuracyLossRecorder(Service):
         if self.performance_logger is not None:
             self.performance_logger.info(message)
 
-    def _move_batch_to_device(self, batch: Any) -> Any:
-        if torch.is_tensor(batch):
-            return batch.to(self._device, non_blocking=True)
-        if isinstance(batch, dict):
-            return {key: self._move_batch_to_device(value) for key, value in batch.items()}
-        if isinstance(batch, tuple):
-            return tuple(self._move_batch_to_device(value) for value in batch)
-        if isinstance(batch, list):
-            return [self._move_batch_to_device(value) for value in batch]
-        return batch
-
     def _cache_eval_max_samples(self) -> int:
         return max(self.test_batch_size * 16, 512)
 
@@ -192,9 +181,7 @@ class ServiceTestAccuracyLossRecorder(Service):
         if total_samples > self._cache_eval_max_samples():
             return dataloader
 
-        cached_batches = []
-        for batch in dataloader:
-            cached_batches.append(self._move_batch_to_device(batch))
+        cached_batches = cache_dataloader_on_device(dataloader, self._device)
         setattr(self, cache_attr_name, cached_batches)
         if self.enable_profiler and self.logger is not None:
             self.logger.info(

@@ -238,11 +238,19 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
 
     @staticmethod
     def _get_state_targets(model: nn.Module) -> dict[str, torch.Tensor]:
+        # Only include entries that are part of state_dict(). Some models
+        # register non-persistent buffers (for example Hugging Face
+        # ``position_ids``) that appear in named_buffers() but are not saved in
+        # checkpoints. The interpolation service operates on saved model states,
+        # so its live tensor targets must match that serializable key set.
+        state_dict_keys = set(model.state_dict().keys())
         state_targets: dict[str, torch.Tensor] = {}
         for name, parameter in model.named_parameters():
-            state_targets[name] = parameter
+            if name in state_dict_keys:
+                state_targets[name] = parameter
         for name, buffer in model.named_buffers():
-            state_targets[name] = buffer
+            if name in state_dict_keys:
+                state_targets[name] = buffer
         return state_targets
 
     def _load_interpolated_state(

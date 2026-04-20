@@ -108,9 +108,11 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
         raise _nie(mt, dt)
 
     elif mt == ModelType.vgg11_bn:
-        from .vgg import vgg11_bn_cifar10
+        from .vgg import vgg11_bn_cifar10, vgg11_bn_imagenet1k
         if _default or dt == DatasetType.cifar10:
             return vgg11_bn_cifar10()
+        elif dt == DatasetType.imagenet1k:
+            return vgg11_bn_imagenet1k(preset)
         raise _nie(mt, dt)
 
     elif mt == ModelType.vgg11_no_bn:
@@ -156,9 +158,11 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
         raise _nie(mt, dt)
 
     elif mt == ModelType.densenet121:
-        from .densenet import densenet121_cifar10
+        from .densenet import densenet121_cifar10, densenet121_imagenet1k
         if _default or dt == DatasetType.cifar10:
             return densenet121_cifar10()
+        elif dt == DatasetType.imagenet1k:
+            return densenet121_imagenet1k(preset)
         raise _nie(mt, dt)
 
     elif mt == ModelType.densenet_cifar:
@@ -173,6 +177,54 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
             return regnet_x_200mf_cifar10()
         elif dt == DatasetType.cifar100:
             return regnet_x_200mf_cifar100()
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.regnet_y_400mf:
+        from .regnet import regnet_y_400mf_imagenet1k
+        if _default or dt == DatasetType.imagenet1k:
+            return regnet_y_400mf_imagenet1k(preset)
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.vit_b_32:
+        from .vit import vit_b_32_imagenet1k
+        if _default or dt == DatasetType.imagenet1k:
+            return vit_b_32_imagenet1k(preset)
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.squeezenet1_1:
+        from .squeezenet import squeezenet1_1_imagenet1k
+        if _default or dt == DatasetType.imagenet1k:
+            return squeezenet1_1_imagenet1k(preset)
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.resnext50_32x4d:
+        from .resnext import resnext50_32x4d_imagenet1k
+        if _default or dt == DatasetType.imagenet1k:
+            return resnext50_32x4d_imagenet1k(preset)
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.mnasnet0_5:
+        from .mnasnet import mnasnet0_5_imagenet1k
+        if _default or dt == DatasetType.imagenet1k:
+            return mnasnet0_5_imagenet1k(preset)
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.mnasnet1_0:
+        from .mnasnet import mnasnet1_0_imagenet1k
+        if _default or dt == DatasetType.imagenet1k:
+            return mnasnet1_0_imagenet1k(preset)
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.convnext_tiny:
+        from .convnext import convnext_tiny_imagenet1k
+        if _default or dt == DatasetType.imagenet1k:
+            return convnext_tiny_imagenet1k(preset)
+        raise _nie(mt, dt)
+
+    elif mt == ModelType.alexnet:
+        from .alexnet import alexnet_imagenet1k
+        if _default or dt == DatasetType.imagenet1k:
+            return alexnet_imagenet1k()
         raise _nie(mt, dt)
 
     elif mt == ModelType.cct_7_3x1_32:

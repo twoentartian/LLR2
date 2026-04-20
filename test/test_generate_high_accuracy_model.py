@@ -19,11 +19,13 @@ import torch.nn.functional as F
 from torchvision import transforms
 
 from py_src.ml_setup import (
+    convnext_tiny_imagenet1k,
     arithmetic_addition_grokking,
     cct14_7x2_imagenet1k,
     cct_7_3x1_cifar10,
     ddpm_cifar10,
     densenet121_cifar10,
+    densenet121_imagenet1k,
     densenet_cifar_cifar10,
     dla46c_imagenet10,
     dla_cifar10,
@@ -35,20 +37,27 @@ from py_src.ml_setup import (
     lenet4_mnist,
     lenet5_large_fc_mnist,
     lenet5_mnist,
+    mnasnet0_5_imagenet1k,
+    mnasnet1_0_imagenet1k,
     mobilenet_v2_cifar10,
     mobilenet_v2_cifar100,
     mobilenet_v3_large_imagenet1k,
     nanoclip_flickr30k_default,
     regnet_x_200mf_cifar10,
     regnet_x_200mf_cifar100,
+    regnet_y_400mf_imagenet1k,
     resnet18_cifar10,
     resnet18_imagenet1k,
     resnet50_imagenet1k,
+    resnext50_32x4d_imagenet1k,
     shufflenet_v2_cifar10,
     shufflenet_v2_cifar100,
     simplenet_cifar10,
     simplenet_cifar100,
+    squeezenet1_1_imagenet1k,
+    vit_b_32_imagenet1k,
     vgg11_bn_cifar10,
+    vgg11_bn_imagenet1k,
     vgg11_no_bn_cifar10,
 )
 
@@ -386,6 +395,28 @@ class TestRunSingleBatch(unittest.TestCase):
             ),
             batch_size=1,
         )
+
+    def test_ported_imagenet_setups_build(self):
+        dummy_imagenet = make_dummy_imagenet1k(return_pil=False)
+        builders = [
+            ("vgg11_bn_imagenet1k", lambda: vgg11_bn_imagenet1k(override_dataset=dummy_imagenet)),
+            ("densenet121_imagenet1k", lambda: densenet121_imagenet1k(override_dataset=dummy_imagenet)),
+            ("regnet_y_400mf_imagenet1k", lambda: regnet_y_400mf_imagenet1k(override_dataset=dummy_imagenet)),
+            ("vit_b_32_imagenet1k", lambda: vit_b_32_imagenet1k(override_dataset=dummy_imagenet)),
+            ("squeezenet1_1_imagenet1k", lambda: squeezenet1_1_imagenet1k(override_dataset=dummy_imagenet)),
+            ("resnext50_32x4d_imagenet1k", lambda: resnext50_32x4d_imagenet1k(override_dataset=dummy_imagenet)),
+            ("mnasnet0_5_imagenet1k", lambda: mnasnet0_5_imagenet1k(override_dataset=dummy_imagenet)),
+            ("mnasnet1_0_imagenet1k", lambda: mnasnet1_0_imagenet1k(override_dataset=dummy_imagenet)),
+            ("convnext_tiny_imagenet1k", lambda: convnext_tiny_imagenet1k(override_dataset=dummy_imagenet)),
+        ]
+
+        for name, build in builders:
+            with self.subTest(name=name):
+                setup = build()
+                self.assertEqual(setup.dataset_type, DatasetType.imagenet1k)
+                self.assertIsNotNone(setup.model)
+                self.assertIsNotNone(setup.adapter)
+                self.assertIsNotNone(setup.criterion)
 
     @patch("py_src.ml_setup.nanoclip.AutoTokenizer.from_pretrained", return_value=object())
     @patch("py_src.ml_setup.nanoclip.NanoCLIP", side_effect=lambda *args, **kwargs: _DummyNanoCLIPModel())

@@ -185,8 +185,8 @@ def _check_number_of_sample(
 
     dataset_setup = get_random_dataset_setup(random_dataset_type, override_dataset_path=str(dataset_path))
     training_data = dataset_setup.train_data
-    default_batch_size = current_ml_setup.default_batch_size if current_ml_setup.default_batch_size > 0 else len(training_data)
-    batch_size = min(len(training_data), default_batch_size)
+    default_batch_size = current_ml_setup.default_batch_size if current_ml_setup.default_batch_size > 0 else len(training_data) # type: ignore
+    batch_size = min(len(training_data), default_batch_size) # type: ignore
 
     model = copy.deepcopy(current_ml_setup.model)
     util.re_initialize_model(model)

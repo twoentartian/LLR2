@@ -64,7 +64,6 @@ from py_src.simulation_runtime_parameters import SimulationPhase
 from py_src.special_torch_layers import find_layers_according_to_name_and_keyword, find_normalization_layers
 from py_src.util import (
     setup_logging,
-    setup_logging_exit_on_critical,
     geodesic_distance,
     prompt_selection,
 )
@@ -770,16 +769,19 @@ class FindHighAccuracyPathRunner:
             checkpoint_train_parameter = self.checkpoint_content.current_train_parameter
             checkpoint_rebuild_norm_parameter = self.checkpoint_content.current_rebuild_norm_parameter
 
+        self.arg_output_folder_path = os.path.join(runtime_parameter.output_folder_path, runtime_parameter.task_name)
+        output_path = self.arg_output_folder_path
+        os.makedirs(output_path, exist_ok=True)
+
         self.child_logger = logging.getLogger(f"find_high_accuracy_path.{runtime_parameter.task_name}")
         assert self.child_logger is not None
         child_logger = self.child_logger
-        setup_logging(child_logger, runtime_parameter.task_name)
-        setup_logging_exit_on_critical(child_logger)
-        log_file = os.path.join(runtime_parameter.output_folder_path, "info.log")
-        if not any(isinstance(handler, logging.FileHandler) for handler in child_logger.handlers):
-            file_handler = logging.FileHandler(log_file)
-            file_handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s"))
-            child_logger.addHandler(file_handler)
+        setup_logging(
+            child_logger,
+            runtime_parameter.task_name,
+            log_file_path=os.path.join(output_path, "info.log"),
+            exit_on_critical=True,
+        )
         child_logger.info("Logging setup complete")
         self._setup_performance_logger()
         if checkpoint_runtime_parameter is not None:
@@ -796,11 +798,6 @@ class FindHighAccuracyPathRunner:
         worker_count = max(1, runtime_parameter.worker_count or 1)
         thread_per_process = max(1, total_cpu_count // worker_count)
         torch.set_num_threads(thread_per_process)
-
-        self.arg_output_folder_path = os.path.join(runtime_parameter.output_folder_path, runtime_parameter.task_name)
-        assert self.arg_output_folder_path is not None
-        output_path = self.arg_output_folder_path
-        os.makedirs(output_path, exist_ok=True)
 
         self._load_model_and_setup()
         assert self.current_ml_setup is not None
@@ -2201,8 +2198,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     args = parser.parse_args(argv)
 
-    setup_logging(logger, "main")
-    setup_logging_exit_on_critical(logger)
+    setup_logging(logger, "main", exit_on_critical=True)
     logger.info("Logging initialized")
 
     runtime_parameter = _build_runtime_parameters_from_args(args)

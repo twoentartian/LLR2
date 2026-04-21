@@ -15,30 +15,51 @@ def re_initialize_model(model: torch.nn.Module):
         if hasattr(module, "reset_parameters"):
             module.reset_parameters() # type: ignore
 
-def setup_logging(target_logger: logging.Logger, tag: str):
-    if not target_logger.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter(
-            f"[%(asctime)s {tag}] %(levelname)s %(name)s: %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        ))
-        target_logger.addHandler(handler)
+def setup_logging(
+    target_logger: logging.Logger,
+    tag: str,
+    log_file_path: Optional[str | Path] = None,
+    exit_on_critical: bool = False,
+) -> None:
+    formatter = logging.Formatter(
+        f"[%(asctime)s {tag}] %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    has_stream_handler = any(
+        isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler)
+        for handler in target_logger.handlers
+    )
+    if not has_stream_handler:
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
+        target_logger.addHandler(stream_handler)
+
+    if log_file_path is not None:
+        file_path = Path(log_file_path).expanduser().resolve()
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        has_file_handler = any(
+            isinstance(handler, logging.FileHandler)
+            and Path(handler.baseFilename).expanduser().resolve() == file_path
+            for handler in target_logger.handlers
+        )
+        if not has_file_handler:
+            file_handler = logging.FileHandler(file_path, encoding="utf-8")
+            file_handler.setFormatter(formatter)
+            target_logger.addHandler(file_handler)
+
     target_logger.setLevel(logging.INFO)
     target_logger.propagate = False
 
-def setup_logging_exit_on_critical(target_logger: logging.Logger) -> None:
-    """Make ``target_logger.critical(...)`` terminate the current process."""
-    if getattr(target_logger, "_critical_exits_process", False):
-        return
+    if exit_on_critical and not getattr(target_logger, "_critical_exits_process", False):
+        original_critical = target_logger.critical
 
-    original_critical = target_logger.critical
+        def critical_and_exit(msg, *args, **kwargs):
+            original_critical(msg, *args, **kwargs)
+            raise SystemExit(1)
 
-    def critical_and_exit(msg, *args, **kwargs):
-        original_critical(msg, *args, **kwargs)
-        raise SystemExit(1)
-
-    target_logger.critical = critical_and_exit  # type: ignore[method-assign]
-    target_logger._critical_exits_process = True  # type: ignore[attr-defined]
+        target_logger.critical = critical_and_exit  # type: ignore[method-assign]
+        target_logger._critical_exits_process = True  # type: ignore[attr-defined]
 
 def set_seed(seed: int):
     random.seed(seed)

@@ -30,25 +30,6 @@ from py_src.model_opti_save_load import save_model_state
 LOGGER = logging.getLogger("measure_model_capacity_of_random_data")
 
 
-def _configure_logger(target_logger: logging.Logger, tag: str, log_file_path: Path) -> None:
-    target_logger.handlers.clear()
-    formatter = logging.Formatter(
-        f"[%(asctime)s {tag}] %(levelname)s %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-    target_logger.addHandler(stream_handler)
-
-    file_handler = logging.FileHandler(log_file_path, encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    target_logger.addHandler(file_handler)
-
-    target_logger.setLevel(logging.INFO)
-    target_logger.propagate = False
-
-
 def _save_lr_wd(model: torch.nn.Module, optimizer: torch.optim.Optimizer, file_path: Path) -> None:
     param_to_name = {param: name for name, param in model.named_parameters()}
     decays: dict[str, float] = {}
@@ -375,8 +356,7 @@ def main() -> None:
         output_folder_path = Path.cwd() / args.output_folder_name
     output_folder_path.mkdir(parents=True, exist_ok=True)
 
-    _configure_logger(LOGGER, "main", output_folder_path / "log.txt")
-    util.setup_logging_exit_on_critical(LOGGER)
+    util.setup_logging(LOGGER, "main", log_file_path=output_folder_path / "log.txt", exit_on_critical=True)
 
     current_ml_setup = ml_setup.get_ml_setup_from_config(args.model, dataset_type=args.dataset)
     random_dataset_type = dataset_type_to_random(current_ml_setup.dataset_type)

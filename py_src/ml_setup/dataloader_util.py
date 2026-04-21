@@ -78,6 +78,19 @@ def build_dataloader(
     """
     cfg = config or DataloaderConfig()
 
+    # Some dataset-like objects are not meant to be wrapped by PyTorch's
+    # DataLoader. For example, DALI-backed ImageNet stores only enough metadata
+    # to build a DALIGenericIterator, and indexing it with __getitem__ is not a
+    # valid access pattern. Let those backends construct their own iterable
+    # while keeping the public MLSetup.train_dataloader/val_dataloader API the
+    # same for callers.
+    if hasattr(dataset, "build_dataloader") and callable(dataset.build_dataloader):
+        return dataset.build_dataloader(
+            default_batch_size=default_batch_size,
+            config=cfg,
+            is_train=is_train,
+        ) # type: ignore
+
     # --- already an iterable (IterableDataset, existing DataLoader, etc.) ---
     if isinstance(dataset, (IterableDataset, DataLoader)):
         return dataset

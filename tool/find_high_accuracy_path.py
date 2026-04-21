@@ -949,6 +949,8 @@ class FindHighAccuracyPathRunner:
                     start_model_type.name,
                     dataset_type=runtime_parameter.dataset_type.name,
                     preset=runtime_parameter.pytorch_preset_version or 1,
+                    use_dali=runtime_parameter.use_dali,
+                    dali_device_id=runtime_parameter.dali_device_id,
                 )
             else:
                 dataset_type_name = dataset_type_in_file.name if dataset_type_in_file is not None else "default"
@@ -956,6 +958,8 @@ class FindHighAccuracyPathRunner:
                     start_model_type.name,
                     dataset_type=dataset_type_name,
                     preset=runtime_parameter.pytorch_preset_version or 1,
+                    use_dali=runtime_parameter.use_dali,
+                    dali_device_id=runtime_parameter.dali_device_id,
                 )
 
             assert self.current_ml_setup is not None
@@ -2065,6 +2069,8 @@ def _build_runtime_parameters_from_args(args) -> RuntimeParameters:
     runtime_parameter = RuntimeParameters()
     runtime_parameter.use_cpu = args.cpu
     runtime_parameter.use_amp = args.amp
+    runtime_parameter.use_dali = args.dali
+    runtime_parameter.dali_device_id = args.dali_device_id
     runtime_parameter.save_ticks = _parse_save_ticks(args.save_ticks)
     runtime_parameter.save_interval = args.save_interval
     runtime_parameter.save_format = args.save_format
@@ -2177,6 +2183,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--save_format", default="none", choices=["none", "file", "lmdb"])
     parser.add_argument("--cpu", action="store_true", help="Force CPU")
     parser.add_argument("--amp", action="store_true", help="Enable AMP")
+    parser.add_argument("--dali", action=argparse.BooleanOptionalAction, default=False, help="Use NVIDIA DALI for ImageNet dataloading")
+    parser.add_argument("--dali_device_id", type=int, default=0, help="CUDA device id used by DALI pipelines")
     parser.add_argument("--check_config", action="store_true", help="Check config only")
     parser.add_argument("--cosine_similarity_ref", help="Reference model for cosine similarity")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -2197,6 +2205,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--profiler", action=argparse.BooleanOptionalAction, default=False, help="Enable per-tick and per-service timing logs")
 
     args = parser.parse_args(argv)
+    if args.cpu and args.dali:
+        parser.error("--dali requires CUDA; do not combine it with --cpu")
 
     setup_logging(logger, "main", exit_on_critical=True)
     logger.info("Logging initialized")

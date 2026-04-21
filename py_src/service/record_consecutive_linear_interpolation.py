@@ -217,19 +217,24 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
             return  # nothing to do
 
         subset_override = base_train_dataset
+        num_samples = None
         if (
             self.dataset_size is not None
             and self.dataset_size > 0
             and hasattr(base_train_dataset, "__len__")
             and self.dataset_size < len(base_train_dataset)  # type: ignore[arg-type]
         ):
-            indices = torch.randperm(len(base_train_dataset))[:self.dataset_size].tolist()  # type: ignore[arg-type]
-            subset_override = Subset(base_train_dataset, indices)
+            if hasattr(base_train_dataset, "build_dataloader"):
+                num_samples = self.dataset_size
+            else:
+                indices = torch.randperm(len(base_train_dataset))[:self.dataset_size].tolist()  # type: ignore[arg-type]
+                subset_override = Subset(base_train_dataset, indices)
         self.dataloader = self._build_probe_dataloader(
             ml_setup,
             num_workers=num_workers,
             prefetch_factor=prefetch_factor,
             dataset_override=subset_override,
+            num_samples=num_samples,
         )
         self._maybe_cache_probe_batches()
 
@@ -362,6 +367,7 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
         *,
         num_workers: Optional[int] = None,
         prefetch_factor: Optional[int] = None,
+        num_samples: Optional[int] = None,
         dataset_override=None,
     ):
         loader_setup = copy.copy(ml_setup)
@@ -371,6 +377,7 @@ class ServiceConsecutiveLinearInterpolationRecorder(Service):
         loader_config = DataloaderConfig(
             batch_size=min(100, self.batch_size),
             num_workers=num_workers or 0,
+            num_samples=num_samples,
             shuffle=False,
             pin_memory=True,
             prefetch_factor=prefetch_factor,

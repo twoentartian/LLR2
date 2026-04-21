@@ -24,6 +24,8 @@ class RuntimeParameters:
     start_and_end_point_for_paths: list[tuple[str, str]] = None # type: ignore
     use_cpu: bool = None # type: ignore
     use_amp: bool = None # type: ignore
+    use_dali: bool = False
+    dali_device_id: int = 0
     work_mode: WorkMode = WorkMode.unknown
     output_folder_path: str = None # type: ignore
     total_cpu_count: int = None # type: ignore

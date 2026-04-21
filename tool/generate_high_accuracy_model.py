@@ -278,6 +278,8 @@ if __name__ == "__main__":
     parser.add_argument("-m", "--model_type", type=str, default="lenet5")
     parser.add_argument("-d", "--dataset_type", type=str, default="default")
     parser.add_argument("--cpu", action="store_true", help="force CPU training")
+    parser.add_argument("--dali", action=argparse.BooleanOptionalAction, default=False, help="use NVIDIA DALI for ImageNet dataloading")
+    parser.add_argument("--dali_device_id", type=int, default=0, help="CUDA device id used by DALI pipelines")
     parser.add_argument("-o", "--output_folder_name", default=None)
     parser.add_argument("--save_format", type=str, default="none", choices=["none", "file"],
                         help="save per-epoch checkpoints (file) or skip (none)")
@@ -297,6 +299,8 @@ if __name__ == "__main__":
     parser.add_argument("--enable_eval", action="store_true", help="evaluate on validation set each epoch")
 
     args = parser.parse_args()
+    if args.cpu and args.dali:
+        parser.error("--dali requires CUDA; do not combine it with --cpu")
 
     number_of_models = args.number_of_models
     worker_count = args.worker
@@ -315,7 +319,13 @@ if __name__ == "__main__":
         if not os.path.exists(args.opposite_init_model):
             raise FileNotFoundError(f"{args.opposite_init_model} does not exist")
 
-    current_ml_setup = get_ml_setup_from_config(args.model_type, args.dataset_type, args.preset)
+    current_ml_setup = get_ml_setup_from_config(
+        args.model_type,
+        args.dataset_type,
+        args.preset,
+        use_dali=args.dali,
+        dali_device_id=args.dali_device_id,
+    )
     logger.info("model: %s  dataset: %s", current_ml_setup.model_type.name, current_ml_setup.dataset_type.name)
 
     if args.output_folder_name is None:
@@ -330,6 +340,8 @@ if __name__ == "__main__":
         "dataset_type": current_ml_setup.dataset_type.name,
         "model_count": number_of_models,
         "generated_by_cpu": args.cpu,
+        "use_dali": args.dali,
+        "dali_device_id": args.dali_device_id,
         "opposite_init_model": args.opposite_init_model,
     }
     with open(os.path.join(output_folder_path, "info.json"), "w") as f:

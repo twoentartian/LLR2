@@ -265,6 +265,8 @@ class ServiceTestAccuracyLossRecorder(Service):
 
         if self.test_whole_dataset:
             if self.test_val_split is not None:
+                if hasattr(base_test_dataset, "build_dataloader"):
+                    raise ValueError("test_val_split is not supported with DALI-backed datasets")
                 assert 0.0 < self.test_val_split < 1.0
                 perm = torch.randperm(len(base_test_dataset)).tolist() # type: ignore[arg-type]
                 n_test = int(round(len(base_test_dataset) * self.test_val_split)) # type: ignore[arg-type]
@@ -294,23 +296,38 @@ class ServiceTestAccuracyLossRecorder(Service):
                 self.test_dataset = self._maybe_cache_eval_batches(self.test_dataset, "_cached_test_batches")
         else:
             if self.use_fixed_testing_dataset:
-                labels = np.array([base_test_dataset[i][1] for i in range(len(base_test_dataset))]) # type: ignore[index,arg-type]
-                unique_labels = sorted(set(labels.tolist()))
-                n_labels = len(unique_labels)
-                assert self.test_batch_size % n_labels == 0, \
-                    f"test_batch_size({self.test_batch_size}) must be divisible by n_labels({n_labels})"
-                per_label = self.test_batch_size // n_labels
-                balanced_idx = []
-                for lbl in unique_labels:
-                    idxs = np.where(labels == lbl)[0]
-                    balanced_idx.extend(np.random.choice(idxs, per_label, replace=False).tolist())
-                self.test_dataset = self._build_val_dataloader(
-                    ml_setup,
-                    batch_size=min(100, self.test_batch_size),
-                    num_workers=num_workers,
-                    prefetch_factor=prefetch_factor,
-                    dataset_override=Subset(base_test_dataset, balanced_idx), # type: ignore[arg-type]
-                )
+                if hasattr(base_test_dataset, "build_dataloader"):
+                    if self.logger is not None:
+                        self.logger.info(
+                            "Using first %s DALI validation sample(s); balanced fixed subsets are not available for DALI readers",
+                            self.test_batch_size,
+                        )
+                    self.test_dataset = self._build_val_dataloader(
+                        ml_setup,
+                        batch_size=min(100, self.test_batch_size),
+                        num_workers=num_workers,
+                        prefetch_factor=prefetch_factor,
+                        num_samples=self.test_batch_size,
+                        dataset_override=base_test_dataset,
+                    )
+                else:
+                    labels = np.array([base_test_dataset[i][1] for i in range(len(base_test_dataset))]) # type: ignore[index,arg-type]
+                    unique_labels = sorted(set(labels.tolist()))
+                    n_labels = len(unique_labels)
+                    assert self.test_batch_size % n_labels == 0, \
+                        f"test_batch_size({self.test_batch_size}) must be divisible by n_labels({n_labels})"
+                    per_label = self.test_batch_size // n_labels
+                    balanced_idx = []
+                    for lbl in unique_labels:
+                        idxs = np.where(labels == lbl)[0]
+                        balanced_idx.extend(np.random.choice(idxs, per_label, replace=False).tolist())
+                    self.test_dataset = self._build_val_dataloader(
+                        ml_setup,
+                        batch_size=min(100, self.test_batch_size),
+                        num_workers=num_workers,
+                        prefetch_factor=prefetch_factor,
+                        dataset_override=Subset(base_test_dataset, balanced_idx), # type: ignore[arg-type]
+                    )
                 self.test_dataset = self._maybe_cache_eval_batches(self.test_dataset, "_cached_test_batches")
             else:
                 self.test_dataset = self._build_val_dataloader(

@@ -14,6 +14,8 @@ def get_ml_setup_from_config(
     dataset_type: str = "default",
     preset: int = 0,
     device=None,
+    use_dali: bool = False,
+    dali_device_id: int = 0,
 ) -> MLSetup:
     try:
         mt = ModelType[model_type]
@@ -27,10 +29,27 @@ def get_ml_setup_from_config(
         print(f"Unknown dataset type: {dataset_type!r}. Valid options: {[e.name for e in DatasetType]}")
         sys.exit(1)
 
-    return _build(mt, dt, preset, device)
+    return _build(mt, dt, preset, device, use_dali=use_dali, dali_device_id=dali_device_id)
 
 
-def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
+def _imagenet_dataset_override(dataset_type: DatasetType, preset: int, use_dali: bool, dali_device_id: int):
+    if not use_dali:
+        return None
+
+    from py_src.ml_setup.imagenet_preset import preset_version
+    from py_src.ml_setup_dataset import dataset_imagenet1k, dataset_imagenet100, dataset_imagenet10
+
+    preprocessing_version = preset_version(preset)
+    if dataset_type == DatasetType.imagenet1k:
+        return dataset_imagenet1k(preprocessing_version, use_dali=True, dali_device_id=dali_device_id)
+    if dataset_type == DatasetType.imagenet100:
+        return dataset_imagenet100(preprocessing_version, use_dali=True, dali_device_id=dali_device_id)
+    if dataset_type == DatasetType.imagenet10:
+        return dataset_imagenet10(preprocessing_version, use_dali=True, dali_device_id=dali_device_id)
+    return None
+
+
+def _build(mt: ModelType, dt, preset: int, device, *, use_dali: bool = False, dali_device_id: int = 0) -> MLSetup:
     _default = dt is None
 
     if mt == ModelType.lenet5:
@@ -64,11 +83,14 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
         elif dt == DatasetType.cifar100:
             return resnet18_cifar100(use_gn=use_gn)
         elif dt == DatasetType.imagenet10:
-            return resnet18_imagenet10(preset=preset, use_gn=use_gn)
+            override = _imagenet_dataset_override(DatasetType.imagenet10, preset, use_dali, dali_device_id)
+            return resnet18_imagenet10(preset=preset, override_dataset=override, use_gn=use_gn)
         elif dt == DatasetType.imagenet100:
-            return resnet18_imagenet100(preset=preset, use_gn=use_gn)
+            override = _imagenet_dataset_override(DatasetType.imagenet100, preset, use_dali, dali_device_id)
+            return resnet18_imagenet100(preset=preset, override_dataset=override, use_gn=use_gn)
         elif dt == DatasetType.imagenet1k:
-            return resnet18_imagenet1k(preset=preset, use_gn=use_gn)
+            override = _imagenet_dataset_override(DatasetType.imagenet1k, preset, use_dali, dali_device_id)
+            return resnet18_imagenet1k(preset=preset, override_dataset=override, use_gn=use_gn)
         elif dt == DatasetType.imagenet1k_sam_mask_random_noise:
             if use_gn:
                 raise _nie(mt, dt)
@@ -82,15 +104,18 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
     elif mt == ModelType.resnet34:
         from .resnet import resnet34_imagenet1k
         if _default or dt == DatasetType.imagenet1k:
-            return resnet34_imagenet1k(preset)
+            override = _imagenet_dataset_override(DatasetType.imagenet1k, preset, use_dali, dali_device_id)
+            return resnet34_imagenet1k(preset, override_dataset=override)
         raise _nie(mt, dt)
 
     elif mt == ModelType.resnet50:
         from .resnet import resnet50_imagenet1k, resnet50_imagenet100
         if _default or dt == DatasetType.imagenet1k:
-            return resnet50_imagenet1k(preset)
+            override = _imagenet_dataset_override(DatasetType.imagenet1k, preset, use_dali, dali_device_id)
+            return resnet50_imagenet1k(preset, override_dataset=override)
         elif dt == DatasetType.imagenet100:
-            return resnet50_imagenet100(preset)
+            override = _imagenet_dataset_override(DatasetType.imagenet100, preset, use_dali, dali_device_id)
+            return resnet50_imagenet100(preset, override_dataset=override)
         raise _nie(mt, dt)
 
     elif mt == ModelType.mobilenet_v2:
@@ -104,7 +129,8 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
     elif mt == ModelType.mobilenet_v3_large:
         from .mobilenet import mobilenet_v3_large_imagenet1k
         if _default or dt == DatasetType.imagenet1k:
-            return mobilenet_v3_large_imagenet1k(preset)
+            override = _imagenet_dataset_override(DatasetType.imagenet1k, preset, use_dali, dali_device_id)
+            return mobilenet_v3_large_imagenet1k(preset, override_dataset=override)
         raise _nie(mt, dt)
 
     elif mt == ModelType.vgg11_bn:
@@ -112,7 +138,8 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
         if _default or dt == DatasetType.cifar10:
             return vgg11_bn_cifar10()
         elif dt == DatasetType.imagenet1k:
-            return vgg11_bn_imagenet1k(preset)
+            override = _imagenet_dataset_override(DatasetType.imagenet1k, preset, use_dali, dali_device_id)
+            return vgg11_bn_imagenet1k(preset, override_dataset=override)
         raise _nie(mt, dt)
 
     elif mt == ModelType.vgg11_no_bn:
@@ -148,13 +175,15 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
     elif mt == ModelType.efficientnet_v2_s:
         from .efficientnet import efficientnet_v2_s_imagenet1k
         if _default or dt == DatasetType.imagenet1k:
-            return efficientnet_v2_s_imagenet1k(preset)
+            override = _imagenet_dataset_override(DatasetType.imagenet1k, preset, use_dali, dali_device_id)
+            return efficientnet_v2_s_imagenet1k(preset, override_dataset=override)
         raise _nie(mt, dt)
 
     elif mt == ModelType.efficientnet_b1:
         from .efficientnet import efficientnet_b1_imagenet1k
         if _default or dt == DatasetType.imagenet1k:
-            return efficientnet_b1_imagenet1k(preset)
+            override = _imagenet_dataset_override(DatasetType.imagenet1k, preset, use_dali, dali_device_id)
+            return efficientnet_b1_imagenet1k(preset, override_dataset=override)
         raise _nie(mt, dt)
 
     elif mt == ModelType.densenet121:
@@ -162,7 +191,8 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
         if _default or dt == DatasetType.cifar10:
             return densenet121_cifar10()
         elif dt == DatasetType.imagenet1k:
-            return densenet121_imagenet1k(preset)
+            override = _imagenet_dataset_override(DatasetType.imagenet1k, preset, use_dali, dali_device_id)
+            return densenet121_imagenet1k(preset, override_dataset=override)
         raise _nie(mt, dt)
 
     elif mt == ModelType.densenet_cifar:
@@ -182,49 +212,57 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
     elif mt == ModelType.regnet_y_400mf:
         from .regnet import regnet_y_400mf_imagenet1k
         if _default or dt == DatasetType.imagenet1k:
-            return regnet_y_400mf_imagenet1k(preset)
+            override = _imagenet_dataset_override(DatasetType.imagenet1k, preset, use_dali, dali_device_id)
+            return regnet_y_400mf_imagenet1k(preset, override_dataset=override)
         raise _nie(mt, dt)
 
     elif mt == ModelType.vit_b_32:
         from .vit import vit_b_32_imagenet1k
         if _default or dt == DatasetType.imagenet1k:
-            return vit_b_32_imagenet1k(preset)
+            override = _imagenet_dataset_override(DatasetType.imagenet1k, preset, use_dali, dali_device_id)
+            return vit_b_32_imagenet1k(preset, override_dataset=override)
         raise _nie(mt, dt)
 
     elif mt == ModelType.squeezenet1_1:
         from .squeezenet import squeezenet1_1_imagenet1k
         if _default or dt == DatasetType.imagenet1k:
-            return squeezenet1_1_imagenet1k(preset)
+            override = _imagenet_dataset_override(DatasetType.imagenet1k, preset, use_dali, dali_device_id)
+            return squeezenet1_1_imagenet1k(preset, override_dataset=override)
         raise _nie(mt, dt)
 
     elif mt == ModelType.resnext50_32x4d:
         from .resnext import resnext50_32x4d_imagenet1k
         if _default or dt == DatasetType.imagenet1k:
-            return resnext50_32x4d_imagenet1k(preset)
+            override = _imagenet_dataset_override(DatasetType.imagenet1k, preset, use_dali, dali_device_id)
+            return resnext50_32x4d_imagenet1k(preset, override_dataset=override)
         raise _nie(mt, dt)
 
     elif mt == ModelType.mnasnet0_5:
         from .mnasnet import mnasnet0_5_imagenet1k
         if _default or dt == DatasetType.imagenet1k:
-            return mnasnet0_5_imagenet1k(preset)
+            override = _imagenet_dataset_override(DatasetType.imagenet1k, preset, use_dali, dali_device_id)
+            return mnasnet0_5_imagenet1k(preset, override_dataset=override)
         raise _nie(mt, dt)
 
     elif mt == ModelType.mnasnet1_0:
         from .mnasnet import mnasnet1_0_imagenet1k
         if _default or dt == DatasetType.imagenet1k:
-            return mnasnet1_0_imagenet1k(preset)
+            override = _imagenet_dataset_override(DatasetType.imagenet1k, preset, use_dali, dali_device_id)
+            return mnasnet1_0_imagenet1k(preset, override_dataset=override)
         raise _nie(mt, dt)
 
     elif mt == ModelType.convnext_tiny:
         from .convnext import convnext_tiny_imagenet1k
         if _default or dt == DatasetType.imagenet1k:
-            return convnext_tiny_imagenet1k(preset)
+            override = _imagenet_dataset_override(DatasetType.imagenet1k, preset, use_dali, dali_device_id)
+            return convnext_tiny_imagenet1k(preset, override_dataset=override)
         raise _nie(mt, dt)
 
     elif mt == ModelType.alexnet:
         from .alexnet import alexnet_imagenet1k
         if _default or dt == DatasetType.imagenet1k:
-            return alexnet_imagenet1k()
+            override = _imagenet_dataset_override(DatasetType.imagenet1k, preset, use_dali, dali_device_id)
+            return alexnet_imagenet1k(preset, override_dataset=override)
         raise _nie(mt, dt)
 
     elif mt == ModelType.cct_7_3x1_32:
@@ -238,7 +276,8 @@ def _build(mt: ModelType, dt, preset: int, device) -> MLSetup:
     elif mt == ModelType.dla_46_c:
         from .dla import dla46c_imagenet10
         if _default or dt == DatasetType.imagenet10:
-            return dla46c_imagenet10(preset)
+            override = _imagenet_dataset_override(DatasetType.imagenet10, preset, use_dali, dali_device_id)
+            return dla46c_imagenet10(preset, override_dataset=override)
         raise _nie(mt, dt)
 
     elif mt == ModelType.ddpm_cifar10:

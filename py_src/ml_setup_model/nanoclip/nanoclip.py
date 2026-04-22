@@ -6,6 +6,7 @@
 # Licensed under the MIT License. See LICENSE file in the project root.
 # ----------------------------------------------------------------------------
 
+import math
 import torch
 import torch.nn.functional as F
 import faiss
@@ -170,7 +171,8 @@ class NanoCLIP(L.LightningModule):
         # use faiss to calculate recall, images are gallery and texts are queries
         recall_1 = float(self._calculate_recall(img_descriptors, txt_descriptors, labels, k_values=[1])[0])
         self.latest_loss = recall_1
-        self.latest_correct_count = int(round(recall_1 * len(labels)))
+        # self.latest_correct_count = int(round(recall_1 * len(labels)))
+        self.latest_correct_count = math.nan
         self.validation_descriptors.clear()
 
     def get_validation_result(self):

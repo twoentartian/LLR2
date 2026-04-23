@@ -467,7 +467,7 @@ def dataset_imagenet1k_from_pytorch(train_crop_size=224, val_resize_size=256, va
                               interpolation=transforms.InterpolationMode.BILINEAR, auto_augment_policy=None,
                               random_erase_prob=0.0, ra_magnitude=9, augmix_severity=3,
                               backend='pil', use_v2=False):
-    from .dataset_imagenet_raw_pytorch import ClassificationPresetTrain
+    from py_src.torch_vision_train.presets import ClassificationPresetTrain
     dataset_type = DatasetType.imagenet1k
     dataset_path = f'{imagenet1k_path}/train' if imagenet1k_path is None else f"{imagenet1k_path}/train"
     dataset_train = datasets.ImageFolder(

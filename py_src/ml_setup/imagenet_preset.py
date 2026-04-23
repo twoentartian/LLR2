@@ -2,11 +2,8 @@ from typing import Callable, Optional
 
 import torch.nn as nn
 from torch.utils.data.dataloader import default_collate
-from torch.utils.data import Sampler
-from torchvision.transforms.v2 import RandomChoice
 
-from .transforms import RandomMixUp, RandomCutMix
-from .sampler import RASampler
+from py_src.torch_vision_train import RASampler, get_mixup_cutmix
 
 def preset_version(preset: int) -> int:
     """Map LLR2 preset index to imagenet preprocessing version.
@@ -29,22 +26,13 @@ class collate_fn_inst():
     def __call__(self, batch):
         return self.target(*default_collate(batch))
 
-def _get_mixup_cutmix(*, mixup_alpha, cutmix_alpha, num_classes):
-    mixup_cutmix = []
-    if mixup_alpha > 0:
-        mixup_cutmix.append(RandomMixUp(alpha=mixup_alpha, num_classes=num_classes))
-    if cutmix_alpha > 0:
-        mixup_cutmix.append(RandomCutMix(alpha=cutmix_alpha, num_classes=num_classes))
-    if not mixup_cutmix:
-        return None
-    return RandomChoice(mixup_cutmix)
 
 def imagenet_collate_fn(preset: int, mixup_alpha=0.2, cutmix_alpha=1.0, num_classes=1000) -> Optional[Callable]:
     assert preset in [1,2], f"preset has to be 1 or 2, get {preset}"
     if preset == 1:
         output_collate_fn = None
     else:
-        mixup_cutmix = _get_mixup_cutmix(mixup_alpha=mixup_alpha, cutmix_alpha=cutmix_alpha, num_classes=num_classes)
+        mixup_cutmix = get_mixup_cutmix(mixup_alpha=mixup_alpha, cutmix_alpha=cutmix_alpha, num_classes=num_classes, use_v2=True)
         output_collate_fn = collate_fn_inst(mixup_cutmix)
 
     return output_collate_fn

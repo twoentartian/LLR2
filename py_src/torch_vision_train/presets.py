@@ -61,7 +61,7 @@ class ClassificationPresetTrain:
 
         transforms.extend(
             [
-                T.ToDtype(torch.float, scale=True) if use_v2 else T.ConvertImageDtype(torch.float), # type: ignore
+                T.ToDtype(torch.float, scale=True) if use_v2 else T.ConvertImageDtype(torch.float),  # type: ignore[attr-defined]
                 T.Normalize(mean=mean, std=std),
             ]
         )
@@ -69,7 +69,7 @@ class ClassificationPresetTrain:
             transforms.append(T.RandomErasing(p=random_erase_prob))
 
         if use_v2:
-            transforms.append(T.ToPureTensor()) # type: ignore
+            transforms.append(T.ToPureTensor())  # type: ignore[attr-defined]
 
         self.transforms = T.Compose(transforms)
 
@@ -106,12 +106,12 @@ class ClassificationPresetEval:
             transforms.append(T.PILToTensor())
 
         transforms += [
-            T.ToDtype(torch.float, scale=True) if use_v2 else T.ConvertImageDtype(torch.float), # type: ignore
+            T.ToDtype(torch.float, scale=True) if use_v2 else T.ConvertImageDtype(torch.float),  # type: ignore[attr-defined]
             T.Normalize(mean=mean, std=std),
         ]
 
         if use_v2:
-            transforms.append(T.ToPureTensor()) # type: ignore
+            transforms.append(T.ToPureTensor())  # type: ignore[attr-defined]
 
         self.transforms = T.Compose(transforms)
 

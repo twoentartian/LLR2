@@ -1,5 +1,3 @@
-# source: https://github.com/pytorch/vision/blob/main/references/classification/transforms.py
-
 import math
 from typing import Tuple
 
@@ -7,18 +5,33 @@ import torch
 from torch import Tensor
 from torchvision.transforms import functional as F
 
-class RandomMixUp(torch.nn.Module):
-    """Randomly apply MixUp to the provided batch and targets.
-    The class implements the data augmentations as described in the paper
-    `"mixup: Beyond Empirical Risk Minimization" <https://arxiv.org/abs/1710.09412>`_.
+from .presets import get_module
 
-    Args:
-        num_classes (int): number of classes used for one-hot encoding.
-        p (float): probability of the batch being transformed. Default value is 0.5.
-        alpha (float): hyperparameter of the Beta distribution used for mixup.
-            Default value is 1.0.
-        inplace (bool): boolean to make this transform inplace. Default set to False.
-    """
+
+def get_mixup_cutmix(*, mixup_alpha, cutmix_alpha, num_classes, use_v2):
+    transforms_module = get_module(use_v2)
+
+    mixup_cutmix = []
+    if mixup_alpha > 0:
+        mixup_cutmix.append(
+            transforms_module.MixUp(alpha=mixup_alpha, num_classes=num_classes)
+            if use_v2
+            else RandomMixUp(num_classes=num_classes, p=1.0, alpha=mixup_alpha)
+        )
+    if cutmix_alpha > 0:
+        mixup_cutmix.append(
+            transforms_module.CutMix(alpha=cutmix_alpha, num_classes=num_classes)
+            if use_v2
+            else RandomCutMix(num_classes=num_classes, p=1.0, alpha=cutmix_alpha)
+        )
+    if not mixup_cutmix:
+        return None
+
+    return transforms_module.RandomChoice(mixup_cutmix)
+
+
+class RandomMixUp(torch.nn.Module):
+    """Randomly apply MixUp to the provided batch and targets."""
 
     def __init__(self, num_classes: int, p: float = 0.5, alpha: float = 1.0, inplace: bool = False) -> None:
         super().__init__()
@@ -37,14 +50,6 @@ class RandomMixUp(torch.nn.Module):
         self.inplace = inplace
 
     def forward(self, batch: Tensor, target: Tensor) -> Tuple[Tensor, Tensor]:
-        """
-        Args:
-            batch (Tensor): Float tensor of size (B, C, H, W)
-            target (Tensor): Integer tensor of size (B, )
-
-        Returns:
-            Tensor: Randomly transformed batch.
-        """
         if batch.ndim != 4:
             raise ValueError(f"Batch ndim should be 4. Got {batch.ndim}")
         if target.ndim != 1:
@@ -64,11 +69,9 @@ class RandomMixUp(torch.nn.Module):
         if torch.rand(1).item() >= self.p:
             return batch, target
 
-        # It's faster to roll the batch by one instead of shuffling it to create image pairs
         batch_rolled = batch.roll(1, 0)
         target_rolled = target.roll(1, 0)
 
-        # Implemented as on mixup paper, page 3.
         lambda_param = float(torch._sample_dirichlet(torch.tensor([self.alpha, self.alpha]))[0])
         batch_rolled.mul_(1.0 - lambda_param)
         batch.mul_(lambda_param).add_(batch_rolled)
@@ -91,18 +94,7 @@ class RandomMixUp(torch.nn.Module):
 
 
 class RandomCutMix(torch.nn.Module):
-    """Randomly apply CutMix to the provided batch and targets.
-    The class implements the data augmentations as described in the paper
-    `"CutMix: Regularization Strategy to Train Strong Classifiers with Localizable Features"
-    <https://arxiv.org/abs/1905.04899>`_.
-
-    Args:
-        num_classes (int): number of classes used for one-hot encoding.
-        p (float): probability of the batch being transformed. Default value is 0.5.
-        alpha (float): hyperparameter of the Beta distribution used for cutmix.
-            Default value is 1.0.
-        inplace (bool): boolean to make this transform inplace. Default set to False.
-    """
+    """Randomly apply CutMix to the provided batch and targets."""
 
     def __init__(self, num_classes: int, p: float = 0.5, alpha: float = 1.0, inplace: bool = False) -> None:
         super().__init__()
@@ -117,14 +109,6 @@ class RandomCutMix(torch.nn.Module):
         self.inplace = inplace
 
     def forward(self, batch: Tensor, target: Tensor) -> Tuple[Tensor, Tensor]:
-        """
-        Args:
-            batch (Tensor): Float tensor of size (B, C, H, W)
-            target (Tensor): Integer tensor of size (B, )
-
-        Returns:
-            Tensor: Randomly transformed batch.
-        """
         if batch.ndim != 4:
             raise ValueError(f"Batch ndim should be 4. Got {batch.ndim}")
         if target.ndim != 1:
@@ -144,11 +128,9 @@ class RandomCutMix(torch.nn.Module):
         if torch.rand(1).item() >= self.p:
             return batch, target
 
-        # It's faster to roll the batch by one instead of shuffling it to create image pairs
         batch_rolled = batch.roll(1, 0)
         target_rolled = target.roll(1, 0)
 
-        # Implemented as on cutmix paper, page 12 (with minor corrections on typos).
         lambda_param = float(torch._sample_dirichlet(torch.tensor([self.alpha, self.alpha]))[0])
         _, H, W = F.get_dimensions(batch)
 

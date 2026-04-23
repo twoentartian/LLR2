@@ -125,6 +125,7 @@ def training_model(
     num_workers = min(thread_per_process, 8)
 
     dataloader = arg_ml_setup.train_dataloader(DataloaderConfig(num_workers=num_workers))
+    steps_per_epoch = len(dataloader) # type: ignore
 
     if enable_validation and arg_ml_setup.application_type==ApplicationType.classifier:
         dataloader_test = arg_ml_setup.val_dataloader(DataloaderConfig(num_workers=num_workers))
@@ -168,7 +169,7 @@ def training_model(
         if isinstance(model, L.LightningModule):
             optimizer_lit, lr_scheduler_lit = model.configure_optimizers()  # type: ignore
             optimizer_cfg, lr_scheduler_cfg, epochs_cfg = FastTrainingSetup.get_optimizer_lr_scheduler_epoch(
-                arg_ml_setup, model, arg_preset
+                arg_ml_setup, model, arg_preset, override_steps_per_epoch=steps_per_epoch
             )
             optimizer = optimizer_lit if optimizer_cfg is None else optimizer_cfg
             lr_scheduler = lr_scheduler_lit if lr_scheduler_cfg is None else lr_scheduler_cfg
@@ -176,7 +177,7 @@ def training_model(
                 epochs = epochs_cfg
         else:
             optimizer, lr_scheduler, epochs_cfg = FastTrainingSetup.get_optimizer_lr_scheduler_epoch(
-                arg_ml_setup, model, arg_preset
+                arg_ml_setup, model, arg_preset, override_steps_per_epoch=steps_per_epoch
             )
             if epochs is None:
                 epochs = epochs_cfg
@@ -189,7 +190,14 @@ def training_model(
         model.to(device.device)
         child_logger.info("mode: ||||||||    TRANSFER TRAINING    ||||||||")
         src_dt = DatasetType[src_dataset_type] if src_dataset_type else None
-        optimizer, lr_scheduler, epochs_cfg = TransferTrainingSetup.get_optimizer_lr_scheduler_epoch(src_dt, arg_ml_setup, model, arg_preset) # type: ignore
+        assert src_dt is not None, f"dataset type is None for {transfer_learn_model_path}"
+        optimizer, lr_scheduler, epochs_cfg = TransferTrainingSetup.get_optimizer_lr_scheduler_epoch(
+            src_dt,
+            arg_ml_setup,
+            model,
+            arg_preset,
+            override_steps_per_epoch=steps_per_epoch,
+        ) # type: ignore
         if epochs is None:
             epochs = epochs_cfg
 
@@ -199,6 +207,7 @@ def training_model(
     log_csv.flush()
 
     child_logger.info("begin training for %d epochs", epochs)
+    child_logger.info("steps_per_epoch = %d", steps_per_epoch)
 
     if hasattr(model, "set_batches_per_epoch"):
         model.set_batches_per_epoch(len(dataloader)) # type: ignore

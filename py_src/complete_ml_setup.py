@@ -19,6 +19,7 @@ class FastTrainingSetup:
         preset: int = 0,
         override_dataset=None,
         override_batch_size=None,
+        override_steps_per_epoch=None,
     ):
         err = NotImplementedError(
             f"no preset for {arg_ml_setup.model_type} @ {arg_ml_setup.dataset_type} preset={preset}"
@@ -26,7 +27,10 @@ class FastTrainingSetup:
 
         training_data = arg_ml_setup.training_data if override_dataset is None else override_dataset
         batch_size = arg_ml_setup.default_batch_size if override_batch_size is None else override_batch_size
-        steps_per_epoch = len(training_data) // batch_size + 1
+        if override_steps_per_epoch is None:
+            steps_per_epoch = len(training_data) // batch_size + 1
+        else:
+            steps_per_epoch = max(1, int(override_steps_per_epoch))
 
         mt = arg_ml_setup.model_type
         dt = arg_ml_setup.dataset_type
@@ -341,12 +345,21 @@ class FastTrainingSetup:
 
 class TransferTrainingSetup:
     @staticmethod
-    def get_optimizer_lr_scheduler_epoch(src_dataset_type: DatasetType, arg_ml_setup: MLSetup, model, preset: int = 0):
+    def get_optimizer_lr_scheduler_epoch(
+        src_dataset_type: DatasetType,
+        arg_ml_setup: MLSetup,
+        model,
+        preset: int = 0,
+        override_steps_per_epoch=None,
+    ):
         err = NotImplementedError(
             f"no transfer preset for {arg_ml_setup.model_type} @ {arg_ml_setup.dataset_type} from {src_dataset_type}"
         )
         mt, dt = arg_ml_setup.model_type, arg_ml_setup.dataset_type
-        steps_per_epoch = len(arg_ml_setup.training_data) // arg_ml_setup.default_batch_size + 1
+        if override_steps_per_epoch is None:
+            steps_per_epoch = len(arg_ml_setup.training_data) // arg_ml_setup.default_batch_size + 1
+        else:
+            steps_per_epoch = max(1, int(override_steps_per_epoch))
 
         if mt == ModelType.resnet18_bn:
             if dt == DatasetType.svhn and src_dataset_type == DatasetType.cifar10:

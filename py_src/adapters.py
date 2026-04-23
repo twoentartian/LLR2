@@ -41,6 +41,21 @@ def _classification_target_indices(label: torch.Tensor, num_classes: int) -> Opt
     return None
 
 
+def _step_optimizer_with_scaler(
+    scaler: torch.amp.GradScaler, # type: ignore
+    optimizer: torch.optim.Optimizer,
+) -> bool:
+    """Run ``scaler.step`` / ``scaler.update`` and report whether the step happened.
+
+    ``GradScaler`` skips the underlying optimizer step when it detects inf/nan
+    gradients. In that case we must not advance the LR scheduler either.
+    """
+    old_scale = scaler.get_scale()
+    scaler.step(optimizer)
+    scaler.update()
+    return scaler.get_scale() >= old_scale
+
+
 # ---------------------------------------------------------------------------
 # Abstract base
 # ---------------------------------------------------------------------------
@@ -118,17 +133,19 @@ class StandardAdapter(ModelAdapter):
             optimizer.zero_grad(set_to_none=True)
 
         use_amp = scaler is not None
+        optimizer_was_run = False
         if use_amp:
             with torch.amp.autocast(device.type):               # type: ignore
                 outputs = self._model(data)
                 loss = self._criterion(outputs, label)
             if backpropagation:
+                assert optimizer is not None
+                assert scaler is not None
                 scaler.scale(loss).backward()
                 if self._clip_grad_norm is not None:
                     scaler.unscale_(optimizer)                  # type: ignore
                     nn.utils.clip_grad_norm_(self._model.parameters(), self._clip_grad_norm)
-                scaler.step(optimizer)                          # type: ignore
-                scaler.update()
+                optimizer_was_run = _step_optimizer_with_scaler(scaler, optimizer)
         else:
             outputs = self._model(data)
             loss = self._criterion(outputs, label)
@@ -137,8 +154,9 @@ class StandardAdapter(ModelAdapter):
                 if self._clip_grad_norm is not None:
                     nn.utils.clip_grad_norm_(self._model.parameters(), self._clip_grad_norm)
                 optimizer.step()
+                optimizer_was_run = True
 
-        if backpropagation and lr_scheduler is not None:
+        if backpropagation and lr_scheduler is not None and optimizer_was_run:
             lr_scheduler.step()
 
         # Accuracy is well-defined for standard classification logits even if
@@ -290,20 +308,23 @@ class DiffusionAdapter(ModelAdapter):
             optimizer.zero_grad(set_to_none=True)
 
         use_amp = scaler is not None
+        optimizer_was_run = False
         if use_amp:
             with torch.amp.autocast(device.type): # type: ignore
                 loss = self._model(data)
             if backpropagation:
+                assert optimizer is not None
+                assert scaler is not None
                 scaler.scale(loss).backward()
-                scaler.step(optimizer) # type: ignore
-                scaler.update()
+                optimizer_was_run = _step_optimizer_with_scaler(scaler, optimizer)
         else:
             loss = self._model(data)
             if backpropagation and optimizer is not None:
                 loss.backward()
                 optimizer.step()
+                optimizer_was_run = True
 
-        if backpropagation and lr_scheduler is not None:
+        if backpropagation and lr_scheduler is not None and optimizer_was_run:
             lr_scheduler.step()
 
         return StepOutput(

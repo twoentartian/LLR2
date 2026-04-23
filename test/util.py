@@ -71,11 +71,21 @@ def run_single_batch(
     # Build optimizer / scheduler — mirrors the logic in training_model()
     if isinstance(model, L.LightningModule):
         optimizer_lit, lr_scheduler_lit = model.configure_optimizers()  # type: ignore[call-arg]
-        optimizer_cfg, lr_scheduler_cfg, _ = FastTrainingSetup.get_optimizer_lr_scheduler_epoch(ml_setup, model, preset)
+        optimizer_cfg, lr_scheduler_cfg, _ = FastTrainingSetup.get_optimizer_lr_scheduler_epoch(
+            ml_setup,
+            model,
+            preset,
+            override_steps_per_epoch=len(train_loader), # type: ignore
+        )
         optimizer = optimizer_cfg if optimizer_cfg is not None else optimizer_lit
         lr_scheduler = lr_scheduler_cfg if lr_scheduler_cfg is not None else lr_scheduler_lit
     else:
-        optimizer, lr_scheduler, _ = FastTrainingSetup.get_optimizer_lr_scheduler_epoch(ml_setup, model, preset)
+        optimizer, lr_scheduler, _ = FastTrainingSetup.get_optimizer_lr_scheduler_epoch(
+            ml_setup,
+            model,
+            preset,
+            override_steps_per_epoch=len(train_loader), # type: ignore
+        )
 
     scaler = device.make_scaler() if amp else None
 

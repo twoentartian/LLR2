@@ -71,6 +71,8 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from py_src.ml_setup.ml_setup import MLSetup
+from py_src.complete_ml_setup import FastTrainingSetup
+from py_src.ml_setup.dataloader_util import DataloaderConfig
 from py_src.ml_setup_dataset import DatasetSetup, DatasetType
 from test.util import (
     DummyDatasetNanoCLIP,
@@ -207,6 +209,31 @@ class TestRunSingleBatch(unittest.TestCase):
             batch_size=1,
             use_cpu=False,
         )
+
+    def test_resnet50_imagenet1k_p2_scheduler_uses_actual_dataloader_length(self):
+        setup = resnet50_imagenet1k(
+            2,
+            override_dataset=make_dummy_imagenet1k(num_samples=300, return_pil=False),
+        )
+        train_loader = setup.train_dataloader(
+            DataloaderConfig(num_workers=0),
+            ignore_override=True,
+        )
+        actual_steps_per_epoch = len(train_loader)
+        nominal_steps_per_epoch = len(setup.training_data) // setup.default_batch_size + 1
+
+        self.assertGreater(actual_steps_per_epoch, nominal_steps_per_epoch)
+
+        _, scheduler, epochs = FastTrainingSetup.get_optimizer_lr_scheduler_epoch(
+            setup,
+            setup.model,
+            preset=2,
+            override_steps_per_epoch=actual_steps_per_epoch,
+        )
+
+        self.assertIsInstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR)
+        assert scheduler is not None
+        self.assertEqual(scheduler.T_max, epochs * actual_steps_per_epoch)
 
     def test_cct_7_3x1_cifar10_train_and_val(self):
         self._assert_classifier_single_batch(

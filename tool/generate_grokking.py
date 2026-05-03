@@ -289,21 +289,6 @@ def train_grokking(parameters: GrokkingParameters):
 
     model = parameters.model
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        weight_decay=parameters.weight_decay,
-        lr=parameters.learning_rate,
-        betas=(0.9, 0.98),
-        eps=1e-8,
-    )
-    warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-8, end_factor=1.0, total_iters=parameters.warmup_epoch)
-    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=parameters.total_epoch - parameters.warmup_epoch,
-        eta_min=parameters.min_lr,
-    )
-    lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[parameters.warmup_epoch])
-
     device = next(model.parameters()).device
     if parameters.logger is not None:
         parameters.logger.info("caching train/val batches on %s", device)
@@ -317,6 +302,33 @@ def train_grokking(parameters: GrokkingParameters):
         cached_val = cache_dataloader_on_device(parameters.val_dataloader, device)
     if parameters.logger is not None:
         parameters.logger.info("cached %d train batches, %d val batches", len(cached_train), len(cached_val))
+
+    steps_per_epoch = max(1, len(cached_train))
+    warmup_steps = parameters.warmup_epoch * steps_per_epoch
+    total_steps = parameters.total_epoch * steps_per_epoch
+    cosine_steps = max(1, total_steps - warmup_steps)
+    if parameters.logger is not None:
+        parameters.logger.info(
+            "lr scheduler stepping per iteration: steps_per_epoch=%d warmup_steps=%d total_steps=%d",
+            steps_per_epoch,
+            warmup_steps,
+            total_steps,
+        )
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        weight_decay=parameters.weight_decay,
+        lr=parameters.learning_rate,
+        betas=(0.9, 0.98),
+        eps=1e-8,
+    )
+    warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps)
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=cosine_steps,
+        eta_min=parameters.min_lr,
+    )
+    lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
 
     runtime_model = model
     compile_available = hasattr(torch, "compile")

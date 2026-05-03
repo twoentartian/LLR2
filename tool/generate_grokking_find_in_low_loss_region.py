@@ -324,7 +324,7 @@ def main():
 
     batch_size = default_batch_size(merged_train_dataset) if args.batchsize is None else args.batchsize
     logger.info("batch size = %s", batch_size)
-    total_epoch = 150000 if args.epoch is None else args.epoch
+    total_epoch = 10000 if args.epoch is None else args.epoch
     record_weight_norm_interval = max(1, total_epoch // 2000) if args.record_weight_norm is None else args.record_weight_norm
 
     run_results: list[RunResult] = []
@@ -357,7 +357,7 @@ def main():
     params.set_ml_hyperparameter(
         learning_rate=1e-3 if args.learning_rate is None else args.learning_rate,
         weight_decay=0.0 if args.weight_decay is None else args.weight_decay,
-        min_lr=1e-4 if args.min_lr is None else args.min_lr,
+        min_lr=1e-5 if args.min_lr is None else args.min_lr,
         warmup_epoch=10,
         total_epoch=total_epoch,
     )

@@ -310,6 +310,14 @@ class FastTrainingSetup:
             else:
                 raise err
 
+        elif mt == ModelType.ddpm_flowers102:
+            if dt == DatasetType.flowers102:
+                epochs = 4096
+                optimizer = torch.optim.Adam(model.parameters(), lr=8e-5)
+                return optimizer, None, epochs
+            else:
+                raise err
+
         elif mt == ModelType.nanoclip_default:
             if dt == DatasetType.flickr30k:
                 epochs, warmup_epochs, lr = 400, 5, 1e-3

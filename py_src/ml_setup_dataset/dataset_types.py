@@ -15,6 +15,7 @@ class DatasetType(Enum):
     cifar100 = auto()
     cifar100_224 = auto()
     random_cifar100 = auto()
+    flowers102 = auto()
     imagenet10 = auto()
     random_imagenet10 = auto()
     imagenet100 = auto()
@@ -35,4 +36,3 @@ class DatasetSetup:
     dataset_type: DatasetType
     train_data: Dataset
     valdation_data: Dataset
-

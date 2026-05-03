@@ -286,6 +286,12 @@ def _build(mt: ModelType, dt, preset: int, device, *, use_dali: bool = False, da
             return ddpm_cifar10()
         raise _nie(mt, dt)
 
+    elif mt == ModelType.ddpm_flowers102:
+        from py_src.ml_setup.ddpm import ddpm_flowers102
+        if _default or dt == DatasetType.flowers102:
+            return ddpm_flowers102()
+        raise _nie(mt, dt)
+
     elif mt == ModelType.nanoclip_default:
         from .nanoclip import nanoclip_flickr30k_default
         if _default or dt == DatasetType.flickr30k:

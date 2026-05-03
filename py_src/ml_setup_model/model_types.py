@@ -40,5 +40,6 @@ class ModelType(Enum):
     dla_46_c = auto()
 
     ddpm_cifar10 = auto()
+    ddpm_flowers102 = auto()
     nanoclip_default = auto()
     transformer_for_grokking = auto()

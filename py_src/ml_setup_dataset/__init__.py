@@ -3,6 +3,7 @@ from .dataset_modular import ArithmeticDataset, ArithmeticIterator, ArithmeticTo
 from .dataset_masked import MaskedImageDataset
 
 from .dataset_cifar import dataset_cifar10, dataset_cifar100
+from .dataset_flowers import dataset_flowers102
 from .dataset_flickr import CollateFlickr, dataset_flickr30k
 from .dataset_mnist import dataset_mnist
 from .dataset_imagenet import (
@@ -20,6 +21,7 @@ __all__ = [
     "ArithmeticDataset", "ArithmeticIterator", "ArithmeticTokenizer",
     "MaskedImageDataset",
     "dataset_cifar10", "dataset_cifar100",
+    "dataset_flowers102",
     "CollateFlickr", "dataset_flickr30k",
     "dataset_mnist",
     "get_imagenet_preprocessing",

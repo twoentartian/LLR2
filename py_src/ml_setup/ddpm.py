@@ -6,8 +6,11 @@ This wraps the existing GaussianDiffusion model with a
 
 from __future__ import annotations
 
+import importlib
 import os
-from typing import Literal, Optional
+from pathlib import Path
+import sys
+from typing import Literal, Optional, Callable, Any
 
 from PIL import Image
 import numpy as np
@@ -15,10 +18,10 @@ import torch
 import torch.nn.functional as F
 import torchvision
 
-from py_src.ml_setup_dataset import DatasetSetup, DatasetType, dataset_cifar10
+from py_src.ml_setup_dataset import DatasetSetup, DatasetType, dataset_cifar10, dataset_flowers102
 from py_src.ml_setup_model import ModelType
 from py_src.adapters import DiffusionAdapter
-from py_src.ml_setup import ApplicationType, MLSetup
+from py_src.ml_setup.ml_setup import ApplicationType, MLSetup
 
 
 # ---------------------------------------------------------------------------
@@ -30,12 +33,29 @@ class RescaleChannels:
     def __call__(self, sample):
         return 2 * sample - 1
 
+def _load_vendored_denoising_diffusion_pytorch():
+    module_name = "denoising_diffusion_pytorch"
+    vendor_root = Path(__file__).resolve().parent.parent / "third_party" / module_name
+    vendor_package_dir = vendor_root / module_name
 
-def _ddpm_transform():
-    return [torchvision.transforms.ToTensor(), RescaleChannels()]
+    existing_module = sys.modules.get(module_name)
+    if existing_module is not None:
+        existing_file = getattr(existing_module, "__file__", None)
+        if existing_file is not None and vendor_package_dir in Path(existing_file).resolve().parents:
+            return existing_module
+        for loaded_name in list(sys.modules):
+            if loaded_name == module_name or loaded_name.startswith(f"{module_name}."):
+                del sys.modules[loaded_name]
+
+    vendor_root_str = str(vendor_root)
+    if vendor_root_str not in sys.path:
+        sys.path.insert(0, vendor_root_str)
+
+    importlib.invalidate_caches()
+    return importlib.import_module(module_name)
 
 
-def _build_ddpm_model(
+def _build_ddpm_cifar_model(
     img_channels: int = 3,
     img_size: int = 32,
     num_classes: int = 10,
@@ -98,26 +118,72 @@ def _build_ddpm_model(
     )
 
 
+def _build_ddpm_flowers102_model(
+    image_size: int = 128,
+    timesteps: int = 1000,
+    sampling_timesteps: int = 250,
+):
+    denoising_diffusion_pytorch = _load_vendored_denoising_diffusion_pytorch()
+    unet = denoising_diffusion_pytorch.Unet(
+        dim=64,
+        dim_mults=(1, 2, 4, 8),
+        channels=3,
+        flash_attn=True,
+    )
+    return denoising_diffusion_pytorch.GaussianDiffusion(
+        unet,
+        image_size=image_size,
+        timesteps=timesteps,
+        sampling_timesteps=sampling_timesteps,
+        objective="pred_v",
+        beta_schedule="sigmoid",
+    )
+
+
 # ---------------------------------------------------------------------------
-# Public factory
+# Generate samples
 # ---------------------------------------------------------------------------
 
-def generate_sample(model: torch.nn.Module, output_folder:str, current_epoch:int, device:torch.device) -> None:
-    model.eval()
-    samples = model.sample(10, device) # type: ignore
-    samples = ((samples + 1) / 2).clip(0, 1).permute(0, 2, 3, 1).cpu().numpy()
-    for i, sample in enumerate(samples):
+def _save_samples(samples: torch.Tensor, output_folder: str, current_epoch: int) -> None:
+    samples_ndarray = torch.clamp(samples, 0, 1).permute(0, 2, 3, 1).cpu().numpy()
+    for i, sample in enumerate(samples_ndarray):
         Image.fromarray((sample * 255).astype(np.uint8)).save(
             os.path.join(output_folder, f"epoch{current_epoch}_{i}.png")
         )
 
+def _generate_sample_from_neg_one_to_one(
+    model: torch.nn.Module,
+    output_folder: str,
+    current_epoch: int,
+    device: torch.device,
+) -> None:
+    model.eval()
+    samples = model.sample(10, device) # type: ignore
+    _save_samples((samples + 1) / 2, output_folder, current_epoch)
+
+def _generate_sample_from_zero_to_one(
+    model: torch.nn.Module,
+    output_folder: str,
+    current_epoch: int,
+    device: torch.device,
+) -> None:
+    del device
+    model.eval()
+    samples = model.sample(batch_size=10) # type: ignore
+    _save_samples(samples, output_folder, current_epoch)
+
+
+# ---------------------------------------------------------------------------
+# Public factory
+# ---------------------------------------------------------------------------
+
 def ddpm_cifar10(override_dataset:Optional[DatasetSetup]=None) -> MLSetup:
-    transform = _ddpm_transform()
+    transform = [torchvision.transforms.ToTensor(), RescaleChannels()]
     dataset = override_dataset if override_dataset is not None else dataset_cifar10(
         transforms_training=transform,
         transforms_testing=transform,
     )
-    model = _build_ddpm_model()
+    model = _build_ddpm_cifar_model()
 
     output_ml_setup = MLSetup(
         model=model,
@@ -125,11 +191,50 @@ def ddpm_cifar10(override_dataset:Optional[DatasetSetup]=None) -> MLSetup:
         model_type=ModelType.ddpm_cifar10,
         training_data=dataset.train_data,
         testing_data=dataset.valdation_data,
-        dataset_type=DatasetType.cifar10,
+        dataset_type=dataset.dataset_type,
         default_batch_size=128,
         has_normalization_layer=True,
         application_type=ApplicationType.diffusion,
     )
-    output_ml_setup.difussion_generate_sample = generate_sample
+    output_ml_setup.difussion_generate_sample = _generate_sample_from_neg_one_to_one
+
+    return output_ml_setup
+
+
+
+
+def _lucidrains_ddpm_transform(image_size: int, augmentation: bool = False):
+    transforms_list: list[Callable[[Any], Any]] = [torchvision.transforms.Resize(image_size)]
+    if augmentation:
+        transforms_list.append(torchvision.transforms.RandomHorizontalFlip())
+    transforms_list.extend(
+        [
+            torchvision.transforms.CenterCrop(image_size),
+            torchvision.transforms.ToTensor(),
+        ]
+    )
+    return transforms_list
+
+def ddpm_flowers102(override_dataset: Optional[DatasetSetup] = None) -> MLSetup:
+    image_size = 128
+    dataset = override_dataset if override_dataset is not None else dataset_flowers102(
+        image_size=image_size,
+        transforms_training=_lucidrains_ddpm_transform(image_size, augmentation=True),
+        transforms_testing=_lucidrains_ddpm_transform(image_size, augmentation=False),
+    )
+    model = _build_ddpm_flowers102_model(image_size=image_size)
+
+    output_ml_setup = MLSetup(
+        model=model,
+        adapter=DiffusionAdapter(model),
+        model_type=ModelType.ddpm_flowers102,
+        training_data=dataset.train_data,
+        testing_data=dataset.valdation_data,
+        dataset_type=dataset.dataset_type,
+        default_batch_size=32,
+        has_normalization_layer=True,
+        application_type=ApplicationType.diffusion,
+    )
+    output_ml_setup.difussion_generate_sample = _generate_sample_from_zero_to_one
 
     return output_ml_setup

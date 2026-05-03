@@ -24,6 +24,7 @@ from py_src.ml_setup import (
     cct14_7x2_imagenet1k,
     cct_7_3x1_cifar10,
     ddpm_cifar10,
+    ddpm_flowers102,
     densenet121_cifar10,
     densenet121_imagenet1k,
     densenet_cifar_cifar10,
@@ -78,6 +79,7 @@ from test.util import (
     DummyDatasetNanoCLIP,
     make_dummy_cifar10,
     make_dummy_cifar100,
+    make_dummy_flowers102,
     make_dummy_imagenet10,
     make_dummy_imagenet1k,
     make_dummy_mnist,
@@ -172,6 +174,36 @@ class TestRunSingleBatch(unittest.TestCase):
         print("ddpm_cifar10")
         print(f"train loss:{train_result.avg_loss:.4f}")
 
+    def test_ddpm_flowers102_disables_flash_attention_and_exposes_ema_hook(self):
+        setup = ddpm_flowers102(
+            override_dataset=make_dummy_flowers102(num_samples=1, return_pil=False)
+        )
+
+        self.assertTrue(hasattr(setup.model, "update_ema"))
+        self.assertTrue(hasattr(setup.model, "train_diffusion"))
+        self.assertTrue(hasattr(setup.model, "ema_diffusion"))
+
+        attention_modules = [
+            module for module in setup.model.train_diffusion.model.modules()
+            if hasattr(module, "attend") and hasattr(module.attend, "flash")
+        ]
+        self.assertGreater(len(attention_modules), 0)
+        self.assertTrue(all(module.attend.flash is False for module in attention_modules))
+
+    def test_ddpm_flowers102_train_no_val(self):
+        setup = ddpm_flowers102(override_dataset=make_dummy_flowers102(num_samples=1, return_pil=False))
+        train_result, val_result = run_single_batch(
+            setup,
+            run_val=False,
+            batch_size=1,
+            use_cpu=False,
+        )
+        self.assertGreater(train_result.iterations, 0)
+        self.assertGreater(train_result.total_count, 0)
+        self.assertIsNone(val_result)
+        print("ddpm_flowers102")
+        print(f"train loss:{train_result.avg_loss:.4f}")
+
     def test_arithmetic_addition_grokking_train_and_val(self):
         self._assert_classifier_single_batch(
             "arithmetic_addition_grokking",
@@ -219,7 +251,7 @@ class TestRunSingleBatch(unittest.TestCase):
             DataloaderConfig(num_workers=0),
             ignore_override=True,
         )
-        actual_steps_per_epoch = len(train_loader)
+        actual_steps_per_epoch = len(train_loader) # type: ignore
         nominal_steps_per_epoch = len(setup.training_data) // setup.default_batch_size + 1
 
         self.assertGreater(actual_steps_per_epoch, nominal_steps_per_epoch)

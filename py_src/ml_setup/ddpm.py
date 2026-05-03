@@ -227,13 +227,18 @@ def _build_ddpm_flowers102_model(
     sampling_timesteps: int = 250,
     ema_decay: float = 0.995,
     ema_update_every: int = 10,
+    flash_attn: bool = False,
 ):
     denoising_diffusion_pytorch = _load_vendored_denoising_diffusion_pytorch()
     unet = denoising_diffusion_pytorch.Unet(
         dim=64,
         dim_mults=(1, 2, 4, 8),
         channels=3,
-        flash_attn=True,
+        # LLR2 commonly trains through float32 paths unless callers opt into
+        # ``--amp``. Disabling flash attention by default avoids hard failures
+        # on GPUs where lucidrains' attention wrapper requests a flash-only
+        # kernel for float32 inputs.
+        flash_attn=flash_attn,
     )
     diffusion = denoising_diffusion_pytorch.GaussianDiffusion(
         unet,

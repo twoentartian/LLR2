@@ -282,6 +282,30 @@ def make_dummy_imagenet10(
     )
 
 
+def make_dummy_flowers102(
+    num_samples: int = 32,
+    transforms_training: _type_transform_config | None = None,
+    transforms_testing: _type_transform_config | None = None,
+    transform: _type_transform | None = None,
+    target_transform: Callable[[int], Any] | None = None,
+    return_pil: bool = True,
+    image_size: tuple[int, int] = (128, 128),
+) -> DatasetSetup:
+    return _make_dummy_image_classification_setup(
+        dataset_type=DatasetType.flowers102,
+        num_samples=num_samples,
+        num_classes=102,
+        image_size=image_size,
+        channels=3,
+        transforms_training=transforms_training,
+        transforms_testing=transforms_testing,
+        transform=transform,
+        target_transform=target_transform,
+        return_pil=return_pil,
+        seed=102,
+    )
+
+
 def make_dummy_cifar10(
     num_samples: int = 32,
     transforms_training: _type_transform_config | None = None,

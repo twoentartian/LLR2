@@ -7,3 +7,6 @@
 [submodule "py_src/third_party/ddpm"]
 	path = py_src/third_party/ddpm
 	url = https://github.com/abarankab/DDPM.git
+[submodule "py_src/third_party/denoising_diffusion_pytorch"]
+	path = py_src/third_party/denoising_diffusion_pytorch
+	url = https://github.com/lucidrains/denoising-diffusion-pytorch.git

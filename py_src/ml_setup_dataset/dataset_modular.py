@@ -81,6 +81,8 @@ class ArithmeticTokenizer:
         if isinstance(obj, str):
             return self._encode(obj)
         elif isinstance(obj, list):
+            if len(obj) == 0:
+                return torch.empty((0, 0), dtype=torch.long)
             return torch.stack([self._encode(s) for s in obj], dim=0)
         else:
             raise NotImplementedError
@@ -263,7 +265,9 @@ class ArithmeticDataset:
 
         # Read equations from file
         with bf.BlobFile(filepath, "r") as f:
-            equations = f.read().strip().split("\n")
+            raw_text = f.read()
+        stripped = raw_text.strip()
+        equations = [] if stripped == "" else stripped.split("\n")
 
         print(f"Loaded {len(equations)} equations from {filepath}")
         return cls(name, equations, modulus, train, tokenizer=tokenizer)

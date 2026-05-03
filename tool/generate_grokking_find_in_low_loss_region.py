@@ -13,6 +13,7 @@ import torch
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from py_src.model_opti_save_load import save_model_state
 from py_src.ml_setup_dataset.dataset_modular import ArithmeticDataset, ArithmeticIterator
 from py_src.util import set_seed, setup_logging
 
@@ -21,9 +22,9 @@ from generate_grokking import (
     GrokkingParameters,
     build_grokking_model,
     default_batch_size,
-    generate_dataset,
     initialize_model_for_training,
     loading_dataset_from,
+    normalize_expression,
     train_grokking,
 )
 
@@ -68,6 +69,34 @@ def _merge_datasets(*datasets: ArithmeticDataset, name_suffix: str) -> Arithmeti
         base.modulus,
         train=True,
         tokenizer=base.tokenizer,
+    )
+
+
+def _empty_dataset_like(dataset: ArithmeticDataset, *, name_suffix: str) -> ArithmeticDataset:
+    if dataset.data.ndim == 1:
+        width = int(dataset.data.shape[0])
+    elif dataset.data.ndim >= 2:
+        width = int(dataset.data.shape[1])
+    else:
+        width = 0
+    empty_data = torch.empty((0, width), dtype=dataset.data.dtype)
+    return ArithmeticDataset(
+        f"{dataset.name}_{name_suffix}",
+        empty_data,
+        dataset.modulus,
+        train=False,
+        tokenizer=dataset.tokenizer,
+    )
+
+
+def build_dataset_without_saving(train_pct: float, expression: str, modulus: int, split_type: str, operand_length: int | None):
+    normalized_expression = normalize_expression(expression, modulus)
+    return ArithmeticDataset.splits(
+        train_pct=train_pct,
+        operator=normalized_expression,
+        train_split_type=split_type, # type: ignore
+        modulus=modulus,
+        operand_length=operand_length,
     )
 
 
@@ -144,17 +173,10 @@ def save_requirement_datasets(
     output_folder_path: str,
     train_dataset: ArithmeticDataset,
     val_dataset: ArithmeticDataset,
-    *,
-    train_partition_dataset: ArithmeticDataset | None = None,
-    val_partition_dataset: ArithmeticDataset | None = None,
 ):
     dataset_dir = os.path.join(output_folder_path, "region_dataset")
     train_dataset.save_to_file(os.path.join(dataset_dir, "train.txt"))
     val_dataset.save_to_file(os.path.join(dataset_dir, "val.txt"))
-    if train_partition_dataset is not None:
-        train_partition_dataset.save_to_file(os.path.join(dataset_dir, "train_partition.txt"))
-    if val_partition_dataset is not None:
-        val_partition_dataset.save_to_file(os.path.join(dataset_dir, "val_partition.txt"))
     train_dataset.tokenizer.save_tokens(os.path.join(dataset_dir, "tokenizer.txt"))
     return dataset_dir
 
@@ -260,8 +282,7 @@ def main():
     else:
         if args.dataset_exp is None:
             raise ValueError("--dataset_exp is required when --dataset_path is not provided")
-        train_dataset, val_dataset = generate_dataset(
-            output_folder_path,
+        train_dataset, val_dataset = build_dataset_without_saving(
             args.train_pct,
             args.dataset_exp,
             args.modulus,
@@ -288,12 +309,11 @@ def main():
         partition_name="val",
     )
     merged_train_dataset = _merge_datasets(required_train_dataset, required_val_dataset, name_suffix="merged_train")
+    empty_val_dataset = _empty_dataset_like(required_val_dataset, name_suffix="empty_val")
     requirement_dataset_dir = save_requirement_datasets(
         output_folder_path,
         merged_train_dataset,
-        required_val_dataset,
-        train_partition_dataset=required_train_dataset,
-        val_partition_dataset=required_val_dataset,
+        empty_val_dataset,
     )
     logger.info(
         "training on merged dataset: %d train-partition examples + %d val-partition examples = %d total",
@@ -353,10 +373,12 @@ def main():
         params.set_high_loss_train_stop()
 
     train_grokking(params)
+    final_model_path = os.path.join(output_folder_path, "final.model.pt")
+    save_model_state(final_model_path, model.state_dict(), args.model_type, merged_train_dataset.name)
 
     run_result = summarize_run(
         os.path.join(output_folder_path, f"{save_name}.log.csv"),
-        os.path.join(output_folder_path, f"{save_name}.model.pt"),
+        final_model_path,
         run_index=run_index,
         save_name=save_name,
         success_threshold=args.success_threshold,
@@ -388,11 +410,12 @@ def main():
         "dataset_exp": args.dataset_exp,
         "modulus": train_dataset.modulus,
         "train_examples": len(merged_train_dataset),
-        "val_examples": len(val_dataset),
+        "val_examples": 0,
         "train_partition_examples": len(required_train_dataset),
         "val_partition_examples": len(required_val_dataset),
         "validation_disabled": True,
         "requirement_dataset_dir": requirement_dataset_dir,
+        "final_model_path": final_model_path,
         "runs_attempted": len(run_results),
         "runs_requested": 1,
         "runs": [asdict(run_result) for run_result in run_results],

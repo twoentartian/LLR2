@@ -532,6 +532,8 @@ def main():
     args = parse_args()
     if args.model_type != "transformer_for_grokking":
         raise ValueError("generate_grokking.py only supports --model_type transformer_for_grokking")
+    if args.disable_validation and args.inverse_train_val:
+        raise ValueError("--disable_validation cannot be combined with --inverse_train_val")
 
     torch.set_num_threads(max(1, min(args.core, 8)))
     setup_logging(logger, "main")
@@ -585,7 +587,7 @@ def main():
                 initialize_model_for_training(model, transfer_learn_path=args.transfer_learn, init_model_path=args.init_model, disable_reinit=args.disable_reinit, device=device)
                 inverse_initial_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
                 train_dl = ArithmeticIterator(train_ds, device, batchsize_hint=batch_size)
-                val_dl = ArithmeticIterator(val_ds, device, batchsize_hint=batch_size, shuffle=False)
+                val_dl = None if args.disable_validation else ArithmeticIterator(val_ds, device, batchsize_hint=batch_size, shuffle=False)
                 output_folder_path_current = os.path.join(output_folder_path, "train")
                 logger.info("inverse train/val mode: currently training on train partition")
             elif run_offset == 1:
@@ -593,7 +595,7 @@ def main():
                 model.load_state_dict(inverse_initial_state)
                 model.to(device)
                 train_dl = ArithmeticIterator(val_ds, device, batchsize_hint=batch_size)
-                val_dl = ArithmeticIterator(train_ds, device, batchsize_hint=batch_size, shuffle=False)
+                val_dl = None if args.disable_validation else ArithmeticIterator(train_ds, device, batchsize_hint=batch_size, shuffle=False)
                 output_folder_path_current = os.path.join(output_folder_path, "val")
                 logger.info("inverse train/val mode: currently training on val partition")
             else:
@@ -601,7 +603,7 @@ def main():
         else:
             initialize_model_for_training(model, transfer_learn_path=args.transfer_learn, init_model_path=args.init_model, disable_reinit=args.disable_reinit, device=device)
             train_dl = ArithmeticIterator(train_ds, device, batchsize_hint=batch_size)
-            val_dl = ArithmeticIterator(val_ds, device, batchsize_hint=batch_size, shuffle=False)
+            val_dl = None if args.disable_validation else ArithmeticIterator(val_ds, device, batchsize_hint=batch_size, shuffle=False)
             output_folder_path_current = output_folder_path
 
         os.makedirs(output_folder_path_current, exist_ok=True)

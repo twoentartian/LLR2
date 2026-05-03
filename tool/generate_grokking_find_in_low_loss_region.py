@@ -175,9 +175,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Train a grokking model toward a requested train/validation fit region",
     )
-    parser.add_argument("-n", "--number_of_models", type=int, default=1)
     parser.add_argument("-c", "--core", type=int, default=4)
-    parser.add_argument("-w", "--worker", type=int, default=1, help="kept for CLI compatibility; training is sequential")
     parser.add_argument("-o", "--output_folder_name", default=None)
     parser.add_argument("-m", "--model_type", type=str, default="transformer_for_grokking")
     parser.add_argument("-dpath", "--dataset_path", type=str, default=None)
@@ -186,21 +184,17 @@ def parse_args():
     parser.add_argument("-tp", "--train_pct", type=float, default=50)
     parser.add_argument("-st", "--split_type", type=str, default="random", choices=SPLIT_CHOICES)
     parser.add_argument("-ol", "--operand_length", type=int, default=None)
-    parser.add_argument("--train_requirement", type=str, default="fit", choices=REQUIREMENT_CHOICES)
-    parser.add_argument("--val_requirement", type=str, default="fit", choices=REQUIREMENT_CHOICES)
+    parser.add_argument("-train", "--train_requirement", type=str, default="fit", choices=REQUIREMENT_CHOICES)
+    parser.add_argument("-val", "--val_requirement", type=str, default="fit", choices=REQUIREMENT_CHOICES)
     parser.add_argument("--label_shift", type=int, default=1)
-    parser.add_argument("--success_threshold", type=float, default=1.0)
+    parser.add_argument("--success_threshold", type=float, default=0.96)
     parser.add_argument("-lr", "--learning_rate", type=float, default=None)
     parser.add_argument("-minlr", "--min_lr", type=float, default=None)
     parser.add_argument("-epoch", "--epoch", type=int, default=None)
     parser.add_argument("-wd", "--weight_decay", type=float, default=None)
     parser.add_argument("-bs", "--batchsize", type=int, default=None)
-    parser.add_argument("--save_format", type=str, default="none", choices=["none", "file", "lmdb"])
-    parser.add_argument("--save_interval", type=int, default=1)
     parser.add_argument("--record_weight_norm", type=int, default=None)
     parser.add_argument("-s", "--random_seed", type=int, default=None)
-    parser.add_argument("-i", "--start_index", type=int, default=0)
-    parser.add_argument("-t", "--transfer_learn", type=str, default=None)
     parser.add_argument("--init_model", type=str, default=None)
     parser.add_argument("--disable_reinit", action="store_true")
     parser.add_argument("--m_nlayer", default=None, type=int)
@@ -208,7 +202,6 @@ def parse_args():
     parser.add_argument("--m_d_model", default=None, type=int)
     parser.add_argument("--m_context_len", default=None, type=int)
     parser.add_argument("--m_pos_encoding", default=None, type=str, choices=["default", "trainable"])
-    parser.add_argument("--enable_ineffective_training_stop", action="store_true")
     parser.add_argument("--enable_high_loss_train_stop", action="store_true")
     return parser.parse_args()
 
@@ -217,16 +210,12 @@ def main():
     args = parse_args()
     if args.model_type != "transformer_for_grokking":
         raise ValueError("generate_grokking_in_region.py only supports --model_type transformer_for_grokking")
-    if args.number_of_models < 1:
-        raise ValueError("--number_of_models must be at least 1")
     if not (0.0 < args.success_threshold <= 1.0):
         raise ValueError("--success_threshold must be in the interval (0, 1]")
 
     torch.set_num_threads(max(1, min(args.core, 8)))
     setup_logging(logger, "main")
     logger.info("logging setup complete")
-    if args.worker != 1:
-        logger.warning("--worker is accepted for CLI compatibility but this port trains sequentially")
     if args.random_seed is not None:
         set_seed(args.random_seed)
         logger.info("random seed = %d", args.random_seed)
@@ -280,80 +269,74 @@ def main():
     total_epoch = 150000 if args.epoch is None else args.epoch
     record_weight_norm_interval = max(1, total_epoch // 2000) if args.record_weight_norm is None else args.record_weight_norm
 
-    run_indices = list(range(args.start_index, args.start_index + args.number_of_models))
-    digit_width = max(1, len(str(run_indices[-1]))) if run_indices else 1
     run_results: list[RunResult] = []
     found = False
+    run_index = 0
+    save_name = "0"
+    logger.info("starting run %s", save_name)
+    model = build_grokking_model(
+        required_train_dataset,
+        n_layers=args.m_nlayer,
+        n_heads=args.m_n_heads,
+        d_model=args.m_d_model,
+        context_len=args.m_context_len,
+        position_encoding=args.m_pos_encoding,
+    )
+    initialize_model_for_training(
+        model,
+        transfer_learn_path=None,
+        init_model_path=args.init_model,
+        disable_reinit=args.disable_reinit,
+        device=device,
+    )
 
-    for run_index in run_indices:
-        save_name = str(run_index).zfill(digit_width)
-        logger.info("starting run %s", save_name)
-        model = build_grokking_model(
-            required_train_dataset,
-            n_layers=args.m_nlayer,
-            n_heads=args.m_n_heads,
-            d_model=args.m_d_model,
-            context_len=args.m_context_len,
-            position_encoding=args.m_pos_encoding,
-        )
-        initialize_model_for_training(
-            model,
-            transfer_learn_path=args.transfer_learn,
-            init_model_path=args.init_model,
-            disable_reinit=args.disable_reinit,
-            device=device,
-        )
+    train_dataloader = ArithmeticIterator(required_train_dataset, device, batchsize_hint=batch_size)
+    val_dataloader = ArithmeticIterator(required_val_dataset, device, batchsize_hint=batch_size, shuffle=False)
 
-        train_dataloader = ArithmeticIterator(required_train_dataset, device, batchsize_hint=batch_size)
-        val_dataloader = ArithmeticIterator(required_val_dataset, device, batchsize_hint=batch_size, shuffle=False)
+    params = GrokkingParameters()
+    params.set_env(output_folder_path, True, logger=logger)
+    params.set_early_stop_thresholds(train_accuracy=args.success_threshold, val_accuracy=args.success_threshold)
+    params.set_ml_env(model, args.model_type, required_train_dataset.name, required_train_dataset.tokenizer)
+    params.set_ml_hyperparameter(
+        learning_rate=1e-3 if args.learning_rate is None else args.learning_rate,
+        weight_decay=0.0 if args.weight_decay is None else args.weight_decay,
+        min_lr=1e-4 if args.min_lr is None else args.min_lr,
+        warmup_epoch=10,
+        total_epoch=total_epoch,
+    )
+    params.set_dataloader(train_dataloader, val_dataloader)
+    params.set_model_save(
+        save_name,
+        save_format="none",
+        save_interval=1,
+        record_weight_norm_interval=record_weight_norm_interval,
+    )
+    if args.enable_high_loss_train_stop:
+        params.set_high_loss_train_stop()
 
-        params = GrokkingParameters()
-        params.set_env(output_folder_path, True, logger=logger)
-        params.set_early_stop_thresholds(train_accuracy=args.success_threshold, val_accuracy=args.success_threshold)
-        params.set_ml_env(model, args.model_type, required_train_dataset.name, required_train_dataset.tokenizer)
-        params.set_ml_hyperparameter(
-            learning_rate=1e-3 if args.learning_rate is None else args.learning_rate,
-            weight_decay=0.0 if args.weight_decay is None else args.weight_decay,
-            min_lr=1e-4 if args.min_lr is None else args.min_lr,
-            warmup_epoch=10,
-            total_epoch=total_epoch,
-        )
-        params.set_dataloader(train_dataloader, val_dataloader)
-        params.set_model_save(
-            save_name,
-            save_format=args.save_format,
-            save_interval=args.save_interval,
-            record_weight_norm_interval=record_weight_norm_interval,
-        )
-        if args.enable_ineffective_training_stop:
-            params.set_ineffective_train_stop()
-        if args.enable_high_loss_train_stop:
-            params.set_high_loss_train_stop()
+    train_grokking(params)
 
-        train_grokking(params)
+    run_result = summarize_run(
+        os.path.join(output_folder_path, f"{save_name}.log.csv"),
+        os.path.join(output_folder_path, f"{save_name}.model.pt"),
+        run_index=run_index,
+        save_name=save_name,
+        success_threshold=args.success_threshold,
+    )
+    run_results.append(run_result)
+    logger.info(
+        "run %s finished: success=%s final(train,val)=(%.4f, %.4f) best(train,val)=(%.4f, %.4f)",
+        save_name,
+        run_result.success,
+        run_result.final_train_accuracy,
+        run_result.final_val_accuracy,
+        run_result.best_train_accuracy,
+        run_result.best_val_accuracy,
+    )
 
-        run_result = summarize_run(
-            os.path.join(output_folder_path, f"{save_name}.log.csv"),
-            os.path.join(output_folder_path, f"{save_name}.model.pt"),
-            run_index=run_index,
-            save_name=save_name,
-            success_threshold=args.success_threshold,
-        )
-        run_results.append(run_result)
-        logger.info(
-            "run %s finished: success=%s final(train,val)=(%.4f, %.4f) best(train,val)=(%.4f, %.4f)",
-            save_name,
-            run_result.success,
-            run_result.final_train_accuracy,
-            run_result.final_val_accuracy,
-            run_result.best_train_accuracy,
-            run_result.best_val_accuracy,
-        )
-
-        if run_result.success:
-            found = True
-            logger.info("found a model satisfying the requested region at epoch %s", run_result.success_epoch)
-            break
+    if run_result.success:
+        found = True
+        logger.info("found a model satisfying the requested region at epoch %s", run_result.success_epoch)
 
     summary = {
         "possible": found,
@@ -370,7 +353,7 @@ def main():
         "val_examples": len(val_dataset),
         "requirement_dataset_dir": requirement_dataset_dir,
         "runs_attempted": len(run_results),
-        "runs_requested": args.number_of_models,
+        "runs_requested": 1,
         "runs": [asdict(run_result) for run_result in run_results],
     }
     write_summary(output_folder_path, summary)

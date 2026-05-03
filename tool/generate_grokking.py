@@ -74,6 +74,8 @@ class GrokkingParameters:
         self.save_interval = None
         self.save_name = None
         self.record_weight_norm_interval = None
+        self.early_stop_train_accuracy = 1.00
+        self.early_stop_val_accuracy = 1.00
 
     def set_ml_env(self, model, model_name, dataset_name, tokenizer):
         self.model = model
@@ -96,6 +98,10 @@ class GrokkingParameters:
         self.output_folder_path = output_path
         self.logger = logger
         self.early_stop = early_stop
+
+    def set_early_stop_thresholds(self, train_accuracy=0.96, val_accuracy=0.96):
+        self.early_stop_train_accuracy = float(train_accuracy)
+        self.early_stop_val_accuracy = float(val_accuracy)
 
     def set_model_save(self, save_name, save_format="none", save_interval=500, record_weight_norm_interval=100):
         self.save_name = save_name
@@ -400,7 +406,11 @@ def train_grokking(parameters: GrokkingParameters):
             speed_window_start_time = time.time()
             speed_window_start_epoch = epoch + 1
 
-        if parameters.early_stop and train_accuracy > 0.95 and val_accuracy > 0.95:
+        if (
+            parameters.early_stop
+            and train_accuracy >= parameters.early_stop_train_accuracy
+            and val_accuracy >= parameters.early_stop_val_accuracy
+        ):
             break
 
         train_loss_history.append(float(train_loss))

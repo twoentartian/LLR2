@@ -28,7 +28,7 @@ from generate_grokking import (
 )
 
 
-logger = logging.getLogger("generate_grokking_in_region")
+logger = logging.getLogger("generate_grokking_find_in_low_loss_region")
 REQUIREMENT_CHOICES = ["fit", "shift"]
 
 
@@ -54,6 +54,20 @@ def _clone_dataset(dataset: ArithmeticDataset, data: torch.Tensor, *, name_suffi
         dataset.modulus,
         dataset.train,
         tokenizer=dataset.tokenizer,
+    )
+
+
+def _merge_datasets(*datasets: ArithmeticDataset, name_suffix: str) -> ArithmeticDataset:
+    if len(datasets) == 0:
+        raise ValueError("At least one dataset is required for merging")
+    base = datasets[0]
+    merged_data = torch.cat([dataset.data for dataset in datasets], dim=0)
+    return ArithmeticDataset(
+        f"{base.name}_{name_suffix}",
+        merged_data,
+        base.modulus,
+        train=True,
+        tokenizer=base.tokenizer,
     )
 
 
@@ -126,10 +140,21 @@ def transform_dataset_for_requirement(
     raise ValueError(f"Unknown requirement: {requirement}")
 
 
-def save_requirement_datasets(output_folder_path: str, train_dataset: ArithmeticDataset, val_dataset: ArithmeticDataset):
+def save_requirement_datasets(
+    output_folder_path: str,
+    train_dataset: ArithmeticDataset,
+    val_dataset: ArithmeticDataset,
+    *,
+    train_partition_dataset: ArithmeticDataset | None = None,
+    val_partition_dataset: ArithmeticDataset | None = None,
+):
     dataset_dir = os.path.join(output_folder_path, "region_dataset")
     train_dataset.save_to_file(os.path.join(dataset_dir, "train.txt"))
     val_dataset.save_to_file(os.path.join(dataset_dir, "val.txt"))
+    if train_partition_dataset is not None:
+        train_partition_dataset.save_to_file(os.path.join(dataset_dir, "train_partition.txt"))
+    if val_partition_dataset is not None:
+        val_partition_dataset.save_to_file(os.path.join(dataset_dir, "val_partition.txt"))
     train_dataset.tokenizer.save_tokens(os.path.join(dataset_dir, "tokenizer.txt"))
     return dataset_dir
 
@@ -173,7 +198,7 @@ def write_summary(output_folder_path: str, payload: dict):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train a grokking model toward a requested train/validation fit region",
+        description="Train a grokking model inside a requested low-loss region",
     )
     parser.add_argument("-c", "--core", type=int, default=4)
     parser.add_argument("-o", "--output_folder_name", default=None)
@@ -209,7 +234,7 @@ def parse_args():
 def main():
     args = parse_args()
     if args.model_type != "transformer_for_grokking":
-        raise ValueError("generate_grokking_in_region.py only supports --model_type transformer_for_grokking")
+        raise ValueError("generate_grokking_find_in_low_loss_region.py only supports --model_type transformer_for_grokking")
     if not (0.0 < args.success_threshold <= 1.0):
         raise ValueError("--success_threshold must be in the interval (0, 1]")
 
@@ -223,7 +248,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("device = %s", device)
     if args.output_folder_name is None:
-        output_folder_path = os.path.join(os.curdir, f"generate_grokking_in_region_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S_%f')}")
+        output_folder_path = os.path.join(os.curdir, f"generate_grokking_find_in_low_loss_region_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S_%f')}")
     else:
         output_folder_path = os.path.join(os.curdir, args.output_folder_name)
     os.makedirs(output_folder_path, exist_ok=False)
@@ -262,9 +287,22 @@ def main():
         label_shift=effective_shift,
         partition_name="val",
     )
-    requirement_dataset_dir = save_requirement_datasets(output_folder_path, required_train_dataset, required_val_dataset)
+    merged_train_dataset = _merge_datasets(required_train_dataset, required_val_dataset, name_suffix="merged_train")
+    requirement_dataset_dir = save_requirement_datasets(
+        output_folder_path,
+        merged_train_dataset,
+        required_val_dataset,
+        train_partition_dataset=required_train_dataset,
+        val_partition_dataset=required_val_dataset,
+    )
+    logger.info(
+        "training on merged dataset: %d train-partition examples + %d val-partition examples = %d total",
+        len(required_train_dataset),
+        len(required_val_dataset),
+        len(merged_train_dataset),
+    )
 
-    batch_size = default_batch_size(required_train_dataset) if args.batchsize is None else args.batchsize
+    batch_size = default_batch_size(merged_train_dataset) if args.batchsize is None else args.batchsize
     logger.info("batch size = %s", batch_size)
     total_epoch = 150000 if args.epoch is None else args.epoch
     record_weight_norm_interval = max(1, total_epoch // 2000) if args.record_weight_norm is None else args.record_weight_norm
@@ -275,7 +313,7 @@ def main():
     save_name = "0"
     logger.info("starting run %s", save_name)
     model = build_grokking_model(
-        required_train_dataset,
+        merged_train_dataset,
         n_layers=args.m_nlayer,
         n_heads=args.m_n_heads,
         d_model=args.m_d_model,
@@ -290,13 +328,12 @@ def main():
         device=device,
     )
 
-    train_dataloader = ArithmeticIterator(required_train_dataset, device, batchsize_hint=batch_size)
-    val_dataloader = ArithmeticIterator(required_val_dataset, device, batchsize_hint=batch_size, shuffle=False)
+    train_dataloader = ArithmeticIterator(merged_train_dataset, device, batchsize_hint=batch_size)
 
     params = GrokkingParameters()
     params.set_env(output_folder_path, True, logger=logger)
     params.set_early_stop_thresholds(train_accuracy=args.success_threshold, val_accuracy=args.success_threshold)
-    params.set_ml_env(model, args.model_type, required_train_dataset.name, required_train_dataset.tokenizer)
+    params.set_ml_env(model, args.model_type, merged_train_dataset.name, merged_train_dataset.tokenizer)
     params.set_ml_hyperparameter(
         learning_rate=1e-3 if args.learning_rate is None else args.learning_rate,
         weight_decay=0.0 if args.weight_decay is None else args.weight_decay,
@@ -304,7 +341,8 @@ def main():
         warmup_epoch=10,
         total_epoch=total_epoch,
     )
-    params.set_dataloader(train_dataloader, val_dataloader)
+    params.set_dataloader(train_dataloader, None)
+    params.set_disable_validation()
     params.set_model_save(
         save_name,
         save_format="none",
@@ -349,8 +387,11 @@ def main():
         "dataset_path": args.dataset_path,
         "dataset_exp": args.dataset_exp,
         "modulus": train_dataset.modulus,
-        "train_examples": len(train_dataset),
+        "train_examples": len(merged_train_dataset),
         "val_examples": len(val_dataset),
+        "train_partition_examples": len(required_train_dataset),
+        "val_partition_examples": len(required_val_dataset),
+        "validation_disabled": True,
         "requirement_dataset_dir": requirement_dataset_dir,
         "runs_attempted": len(run_results),
         "runs_requested": 1,

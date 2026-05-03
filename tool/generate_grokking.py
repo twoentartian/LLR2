@@ -76,6 +76,7 @@ class GrokkingParameters:
         self.record_weight_norm_interval = None
         self.early_stop_train_accuracy = 1.00
         self.early_stop_val_accuracy = 1.00
+        self.disable_validation = False
 
     def set_ml_env(self, model, model_name, dataset_name, tokenizer):
         self.model = model
@@ -102,6 +103,9 @@ class GrokkingParameters:
     def set_early_stop_thresholds(self, train_accuracy=0.96, val_accuracy=0.96):
         self.early_stop_train_accuracy = float(train_accuracy)
         self.early_stop_val_accuracy = float(val_accuracy)
+
+    def set_disable_validation(self, enabled=True):
+        self.disable_validation = enabled
 
     def set_model_save(self, save_name, save_format="none", save_interval=500, record_weight_norm_interval=100):
         self.save_name = save_name
@@ -273,7 +277,7 @@ def train_grokking(parameters: GrokkingParameters):
     assert parameters.warmup_epoch is not None
     assert parameters.min_lr is not None
     assert parameters.train_dataloader is not None
-    assert parameters.val_dataloader is not None
+    assert parameters.disable_validation or parameters.val_dataloader is not None
     assert parameters.output_folder_path is not None
     assert parameters.tokenizer is not None
     assert parameters.model_name is not None
@@ -302,7 +306,13 @@ def train_grokking(parameters: GrokkingParameters):
     if parameters.logger is not None:
         parameters.logger.info("caching train/val batches on %s", device)
     cached_train = cache_dataloader_on_device(parameters.train_dataloader, device)
-    cached_val = cache_dataloader_on_device(parameters.val_dataloader, device)
+    if parameters.disable_validation:
+        cached_val = []
+        if parameters.logger is not None:
+            parameters.logger.info("validation evaluation disabled; train metrics will be mirrored into val columns")
+    else:
+        assert parameters.val_dataloader is not None
+        cached_val = cache_dataloader_on_device(parameters.val_dataloader, device)
     if parameters.logger is not None:
         parameters.logger.info("cached %d train batches, %d val batches", len(cached_train), len(cached_val))
 
@@ -359,19 +369,22 @@ def train_grokking(parameters: GrokkingParameters):
             train_count += output.sample_count
             train_correct += output.correct_count
 
-        total_val_loss = 0.0
-        val_correct = 0
-        val_count = 0
-        for batch_idx, batch in enumerate(cached_val):
-            output = grokking_step(batch_idx, batch, parameters.model, None, None, parameters.tokenizer, train=False)
-            total_val_loss += output.loss_value * output.sample_count
-            val_correct += output.correct_count
-            val_count += output.sample_count
-
         train_accuracy = train_correct / train_count
         train_loss = train_loss_sum / train_count
-        val_accuracy = val_correct / val_count
-        val_loss = total_val_loss / val_count
+        if parameters.disable_validation:
+            val_accuracy = train_accuracy
+            val_loss = train_loss
+        else:
+            total_val_loss = 0.0
+            val_correct = 0
+            val_count = 0
+            for batch_idx, batch in enumerate(cached_val):
+                output = grokking_step(batch_idx, batch, parameters.model, None, None, parameters.tokenizer, train=False)
+                total_val_loss += output.loss_value * output.sample_count
+                val_correct += output.correct_count
+                val_count += output.sample_count
+            val_accuracy = val_correct / val_count
+            val_loss = total_val_loss / val_count
         lrs = [param_group["lr"] for param_group in optimizer.param_groups]
 
         if parameters.logger is not None:
@@ -506,6 +519,7 @@ def parse_args():
     parser.add_argument("--init_model", type=str, default=None)
     parser.add_argument("--disable_reinit", action="store_true")
     parser.add_argument("--inverse_train_val", action="store_true")
+    parser.add_argument("--disable_validation", action="store_true")
     parser.add_argument("--m_nlayer", default=None, type=int)
     parser.add_argument("--m_n_heads", default=None, type=int)
     parser.add_argument("--m_d_model", default=None, type=int)
@@ -605,6 +619,8 @@ def main():
             total_epoch=total_epoch,
         )
         params.set_dataloader(train_dl, val_dl)
+        if args.disable_validation:
+            params.set_disable_validation()
         params.set_model_save(save_name, save_format=args.save_format, save_interval=args.save_interval, record_weight_norm_interval=record_weight_norm_interval)
         params.set_ineffective_train_stop()
         params.set_high_loss_train_stop()

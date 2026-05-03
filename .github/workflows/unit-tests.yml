@@ -39,6 +39,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
           python -m pip install lightning timm transformers faiss-cpu pillow numpy pyyaml mod blobfile
+          python -m pip install accelerate einops ema-pytorch packaging pytorch-fid scipy tqdm
 
       - name: Run unit tests
         run: |

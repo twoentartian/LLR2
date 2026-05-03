@@ -101,9 +101,10 @@ def _generate_sample_from_neg_one_to_one(
     output_folder: str,
     current_epoch: int,
     device: torch.device,
+    count: int,
 ) -> None:
     model.eval()
-    samples = model.sample(10, device)  # type: ignore
+    samples = model.sample(count, device)  # type: ignore
     _save_samples((samples + 1) / 2, output_folder, current_epoch)
 
 

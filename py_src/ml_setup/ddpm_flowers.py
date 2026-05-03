@@ -215,10 +215,11 @@ def _generate_sample_from_zero_to_one(
     output_folder: str,
     current_epoch: int,
     device: torch.device,
+    count: int,
 ) -> None:
     del device
     model.eval()
-    samples = model.sample(batch_size=10)  # type: ignore
+    samples = model.sample(batch_size=count)  # type: ignore
     _save_samples(samples, output_folder, current_epoch)
 
 

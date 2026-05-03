@@ -45,7 +45,7 @@ class MLSetup:
     override_test_loader: Optional[Iterable] = None
 
     # ---- special functions ------------------------------------------------
-    difussion_generate_sample: Optional[Callable[[nn.Module, str, int, torch.device], None]] = None
+    difussion_generate_sample: Optional[Callable[[nn.Module, str, int, torch.device, int], None]] = None
 
     # ------------------------------------------------------------------
     # Public API: get dataloaders

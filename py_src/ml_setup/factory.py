@@ -281,13 +281,13 @@ def _build(mt: ModelType, dt, preset: int, device, *, use_dali: bool = False, da
         raise _nie(mt, dt)
 
     elif mt == ModelType.ddpm_cifar10:
-        from py_src.ml_setup.ddpm import ddpm_cifar10
+        from py_src.ml_setup.ddpm_cifar import ddpm_cifar10
         if _default or dt == DatasetType.cifar10:
             return ddpm_cifar10()
         raise _nie(mt, dt)
 
     elif mt == ModelType.ddpm_flowers102:
-        from py_src.ml_setup.ddpm import ddpm_flowers102
+        from py_src.ml_setup.ddpm_flowers import ddpm_flowers102
         if _default or dt == DatasetType.flowers102:
             return ddpm_flowers102()
         raise _nie(mt, dt)

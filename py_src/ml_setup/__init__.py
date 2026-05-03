@@ -21,7 +21,8 @@ from .vit import vit_b_32_imagenet1k
 
 from .cct import cct_7_3x1_cifar10, cct_7_3x1_cifar100, cct14_7x2_imagenet1k
 
-from .ddpm import ddpm_cifar10, ddpm_flowers102
+from .ddpm_cifar import ddpm_cifar10
+from .ddpm_flowers import ddpm_flowers102
 from .grokking import (
     arithmetic_addition_grokking,
     arithmetic_cubepoly_grokking,

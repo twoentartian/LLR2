@@ -6,6 +6,7 @@ This wraps the existing GaussianDiffusion model with a
 
 from __future__ import annotations
 
+import copy
 import importlib
 import os
 from pathlib import Path
@@ -32,6 +33,108 @@ class RescaleChannels:
     """Scale pixel values from [0, 1] to [-1, 1]."""
     def __call__(self, sample):
         return 2 * sample - 1
+
+
+class _LucidrainsDiffusionWithEMA(torch.nn.Module):
+    """LLR2 wrapper that adds EMA behavior around lucidrains diffusion models.
+
+    LLR2 trains through ``engine.py`` and ``DiffusionAdapter`` instead of the
+    upstream lucidrains ``Trainer``. This wrapper restores the two main pieces
+    of trainer behavior that the engine expects:
+
+    * ``forward(...)`` uses the live training diffusion model.
+    * ``sample(...)`` uses an EMA copy for generation.
+    * ``update_ema()`` is called from ``DiffusionAdapter.post_train_step()``.
+    """
+
+    def __init__(
+        self,
+        diffusion_model: torch.nn.Module,
+        *,
+        ema_decay: float = 0.995,
+        ema_update_every: int = 10,
+    ) -> None:
+        super().__init__()
+        self.train_diffusion = diffusion_model
+        self.ema_diffusion = copy.deepcopy(diffusion_model)
+        self.ema_diffusion.requires_grad_(False)
+
+        self.ema_decay = ema_decay
+        self.ema_update_every = ema_update_every
+        self.register_buffer("_ema_step", torch.zeros((), dtype=torch.long))
+
+        self._copy_parameters_from_train_model()
+        self._copy_buffers_from_train_model()
+
+    @property
+    def channels(self):
+        return self.train_diffusion.channels
+
+    @property
+    def image_size(self):
+        return self.train_diffusion.image_size
+
+    @property
+    def num_timesteps(self):
+        return self.train_diffusion.num_timesteps
+
+    @property
+    def is_ddim_sampling(self):
+        return self.train_diffusion.is_ddim_sampling
+
+    def parameters(self, recurse: bool = True):
+        return self.train_diffusion.parameters(recurse=recurse)
+
+    def named_parameters(self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True):
+        return self.train_diffusion.named_parameters(
+            prefix=prefix,
+            recurse=recurse,
+            remove_duplicate=remove_duplicate,
+        )
+
+    def forward(self, *args, **kwargs):
+        return self.train_diffusion(*args, **kwargs)
+
+    @torch.no_grad()
+    def update_ema(self) -> None:
+        self._ema_step.add_(1) # type: ignore
+        step = int(self._ema_step.item()) # type: ignore
+        if step % self.ema_update_every != 0:
+            return
+
+        for ema_param, train_param in zip(
+            self.ema_diffusion.parameters(),
+            self.train_diffusion.parameters(),
+        ):
+            ema_param.lerp_(train_param.detach(), 1 - self.ema_decay)
+
+        self._copy_buffers_from_train_model()
+
+    @torch.no_grad()
+    def sample(self, *args, **kwargs):
+        old_mode = self.ema_diffusion.training
+        self.ema_diffusion.eval()
+        try:
+            return self.ema_diffusion.sample(*args, **kwargs) # type: ignore
+        finally:
+            self.ema_diffusion.train(old_mode)
+
+    @torch.no_grad()
+    def _copy_buffers_from_train_model(self) -> None:
+        for ema_buffer, train_buffer in zip(
+            self.ema_diffusion.buffers(),
+            self.train_diffusion.buffers(),
+        ):
+            ema_buffer.copy_(train_buffer.detach())
+
+    @torch.no_grad()
+    def _copy_parameters_from_train_model(self) -> None:
+        for ema_param, train_param in zip(
+            self.ema_diffusion.parameters(),
+            self.train_diffusion.parameters(),
+        ):
+            ema_param.copy_(train_param.detach())
+
 
 def _load_vendored_denoising_diffusion_pytorch():
     module_name = "denoising_diffusion_pytorch"
@@ -122,6 +225,8 @@ def _build_ddpm_flowers102_model(
     image_size: int = 128,
     timesteps: int = 1000,
     sampling_timesteps: int = 250,
+    ema_decay: float = 0.995,
+    ema_update_every: int = 10,
 ):
     denoising_diffusion_pytorch = _load_vendored_denoising_diffusion_pytorch()
     unet = denoising_diffusion_pytorch.Unet(
@@ -130,13 +235,18 @@ def _build_ddpm_flowers102_model(
         channels=3,
         flash_attn=True,
     )
-    return denoising_diffusion_pytorch.GaussianDiffusion(
+    diffusion = denoising_diffusion_pytorch.GaussianDiffusion(
         unet,
         image_size=image_size,
         timesteps=timesteps,
         sampling_timesteps=sampling_timesteps,
         objective="pred_v",
         beta_schedule="sigmoid",
+    )
+    return _LucidrainsDiffusionWithEMA(
+        diffusion,
+        ema_decay=ema_decay,
+        ema_update_every=ema_update_every,
     )
 
 

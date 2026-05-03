@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from contextlib import contextmanager
 import importlib
 import os
@@ -30,18 +29,20 @@ class _LucidrainsDiffusionWithEMA(torch.nn.Module):
         *,
         ema_decay: float = 0.995,
         ema_update_every: int = 10,
+        ema_update_after_step: int = 100,
     ) -> None:
         super().__init__()
+        from ema_pytorch import EMA
+
         self.train_diffusion = diffusion_model
-        self.ema_diffusion = copy.deepcopy(diffusion_model)
-        self.ema_diffusion.requires_grad_(False)
-
-        self.ema_decay = ema_decay
-        self.ema_update_every = ema_update_every
-        self.register_buffer("_ema_step", torch.zeros((), dtype=torch.long))
-
-        self._copy_parameters_from_train_model()
-        self._copy_buffers_from_train_model()
+        self.ema = EMA(
+            diffusion_model,
+            beta=ema_decay,
+            update_every=ema_update_every,
+            update_after_step=ema_update_after_step,
+            include_online_model=False,
+        )
+        self.ema_diffusion.requires_grad_(False) # type: ignore
 
     @property
     def channels(self):
@@ -54,6 +55,10 @@ class _LucidrainsDiffusionWithEMA(torch.nn.Module):
     @property
     def num_timesteps(self):
         return self.train_diffusion.num_timesteps
+
+    @property
+    def ema_diffusion(self):
+        return self.ema.ema_model
 
     @property
     def is_ddim_sampling(self):
@@ -79,28 +84,17 @@ class _LucidrainsDiffusionWithEMA(torch.nn.Module):
 
     @torch.no_grad()
     def update_ema(self) -> None:
-        self._ema_step.add_(1)  # type: ignore
-        step = int(self._ema_step.item())  # type: ignore
-        if step % self.ema_update_every != 0:
-            return
-
-        for ema_param, train_param in zip(
-            self.ema_diffusion.parameters(),
-            self.train_diffusion.parameters(),
-        ):
-            ema_param.lerp_(train_param.detach(), 1 - self.ema_decay)
-
-        self._copy_buffers_from_train_model()
+        self.ema.update()
 
     @torch.no_grad()
     def sample(self, *args, **kwargs):
-        old_mode = self.ema_diffusion.training
-        self.ema_diffusion.eval()
+        old_mode = self.ema_diffusion.training # type: ignore
+        self.ema_diffusion.eval() # type: ignore
         try:
             with self._disable_sampling_progress_bar():
                 return self.ema_diffusion.sample(*args, **kwargs)  # type: ignore
         finally:
-            self.ema_diffusion.train(old_mode)
+            self.ema_diffusion.train(old_mode) # type: ignore
 
     @contextmanager
     def _disable_sampling_progress_bar(self):
@@ -119,23 +113,6 @@ class _LucidrainsDiffusionWithEMA(torch.nn.Module):
             yield
         finally:
             setattr(diffusion_module, "tqdm", original_tqdm)
-
-    @torch.no_grad()
-    def _copy_buffers_from_train_model(self) -> None:
-        for ema_buffer, train_buffer in zip(
-            self.ema_diffusion.buffers(),
-            self.train_diffusion.buffers(),
-        ):
-            ema_buffer.copy_(train_buffer.detach())
-
-    @torch.no_grad()
-    def _copy_parameters_from_train_model(self) -> None:
-        for ema_param, train_param in zip(
-            self.ema_diffusion.parameters(),
-            self.train_diffusion.parameters(),
-        ):
-            ema_param.copy_(train_param.detach())
-
 
 def _load_vendored_denoising_diffusion_pytorch():
     module_name = "denoising_diffusion_pytorch"
@@ -165,6 +142,7 @@ def _build_ddpm_flowers102_model(
     sampling_timesteps: int = 250,
     ema_decay: float = 0.995,
     ema_update_every: int = 10,
+    ema_update_after_step: int = 100,
     flash_attn: bool = False,
 ):
     denoising_diffusion_pytorch = _load_vendored_denoising_diffusion_pytorch()
@@ -186,6 +164,7 @@ def _build_ddpm_flowers102_model(
         diffusion,
         ema_decay=ema_decay,
         ema_update_every=ema_update_every,
+        ema_update_after_step=ema_update_after_step,
     )
 
 

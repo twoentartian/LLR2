@@ -201,6 +201,9 @@ class TestRunSingleBatch(unittest.TestCase):
         self.assertGreater(train_result.iterations, 0)
         self.assertGreater(train_result.total_count, 0)
         self.assertIsNone(val_result)
+        self.assertTrue(hasattr(setup.model, "ema"))
+        self.assertEqual(int(setup.model.ema.step.item()), 1)
+        self.assertTrue(bool(setup.model.ema.initted.item()))
         print("ddpm_flowers102")
         print(f"train loss:{train_result.avg_loss:.4f}")
 

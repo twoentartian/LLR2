@@ -22,14 +22,18 @@ def setup_logging(
     exit_on_critical: bool = False,
 ) -> None:
     formatter = logging.Formatter(
-        f"[%(asctime)s {tag}] %(levelname)s %(name)s: %(message)s",
+        f"[%(asctime)s {tag}] %(levelname)s %(name)s %(filename)s:%(lineno)d: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    has_stream_handler = any(
-        isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler)
+    stream_handlers = [
+        handler
         for handler in target_logger.handlers
-    )
+        if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler)
+    ]
+    has_stream_handler = len(stream_handlers) > 0
+    for handler in stream_handlers:
+        handler.setFormatter(formatter)
     if not has_stream_handler:
         stream_handler = logging.StreamHandler()
         stream_handler.setFormatter(formatter)
@@ -38,11 +42,15 @@ def setup_logging(
     if log_file_path is not None:
         file_path = Path(log_file_path).expanduser().resolve()
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        has_file_handler = any(
-            isinstance(handler, logging.FileHandler)
-            and Path(handler.baseFilename).expanduser().resolve() == file_path
+        matching_file_handlers = [
+            handler
             for handler in target_logger.handlers
-        )
+            if isinstance(handler, logging.FileHandler)
+            and Path(handler.baseFilename).expanduser().resolve() == file_path
+        ]
+        has_file_handler = len(matching_file_handlers) > 0
+        for handler in matching_file_handlers:
+            handler.setFormatter(formatter)
         if not has_file_handler:
             file_handler = logging.FileHandler(file_path, encoding="utf-8")
             file_handler.setFormatter(formatter)

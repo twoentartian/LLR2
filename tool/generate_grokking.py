@@ -53,7 +53,7 @@ class GrokkingStepOutput:
 
 class GrokkingParameters:
     def __init__(self):
-        self.model = None
+        self.model: Optional[torch.nn.Module] = None
         self.tokenizer = None
         self.model_name = None
         self.dataset_name = None
@@ -167,7 +167,7 @@ def generate_dataset(output_folder_path, train_pct, expression, modulus, train_s
 
 
 def default_batch_size(dataset):
-    return ArithmeticIterator.calculate_batchsize(len(dataset), batchsize_hint=0)
+    return ArithmeticIterator.calculate_batchsize(len(dataset), batchsize_hint=-1)
 
 
 def build_grokking_model(dataset, *, n_layers=None, n_heads=None, d_model=None, context_len=None, position_encoding=None):
@@ -287,8 +287,10 @@ def train_grokking(parameters: GrokkingParameters):
     assert parameters.save_interval is not None
     assert parameters.record_weight_norm_interval is not None
 
+    model = parameters.model
+
     optimizer = torch.optim.AdamW(
-        parameters.model.parameters(),
+        model.parameters(),
         weight_decay=parameters.weight_decay,
         lr=parameters.learning_rate,
         betas=(0.9, 0.98),
@@ -302,7 +304,7 @@ def train_grokking(parameters: GrokkingParameters):
     )
     lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[parameters.warmup_epoch])
 
-    device = next(parameters.model.parameters()).device
+    device = next(model.parameters()).device
     if parameters.logger is not None:
         parameters.logger.info("caching train/val batches on %s", device)
     cached_train = cache_dataloader_on_device(parameters.train_dataloader, device)
@@ -315,6 +317,21 @@ def train_grokking(parameters: GrokkingParameters):
         cached_val = cache_dataloader_on_device(parameters.val_dataloader, device)
     if parameters.logger is not None:
         parameters.logger.info("cached %d train batches, %d val batches", len(cached_train), len(cached_val))
+
+    runtime_model = model
+    compile_available = hasattr(torch, "compile")
+    if compile_available:
+        try:
+            compiled_model = torch.compile(model)
+            if isinstance(compiled_model, torch.nn.Module):
+                runtime_model = compiled_model
+                if parameters.logger is not None:
+                    parameters.logger.info("torch.compile enabled")
+            elif parameters.logger is not None:
+                parameters.logger.info("torch.compile returned a non-Module wrapper; using the original module")
+        except Exception as exc:
+            if parameters.logger is not None:
+                parameters.logger.info("torch.compile skipped: %s", exc)
 
     use_amp = device.type == "cuda"
     amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
@@ -333,7 +350,7 @@ def train_grokking(parameters: GrokkingParameters):
         )
 
     distance_to_origin_service = record_weights_difference.ServiceDistanceToOriginRecorder(1, [0])
-    distance_to_origin_service.initialize_without_runtime_parameters({0: parameters.model.state_dict()}, parameters.output_folder_path, logger=parameters.logger)
+    distance_to_origin_service.initialize_without_runtime_parameters({0: model.state_dict()}, parameters.output_folder_path, logger=parameters.logger)
 
     log_csv_path = os.path.join(parameters.output_folder_path, f"{parameters.save_name}.log.csv")
     log_csv_file = open(log_csv_path, "w", encoding="utf-8")
@@ -352,13 +369,13 @@ def train_grokking(parameters: GrokkingParameters):
         train_correct = 0
 
         if epoch == 0 and record_model_service is not None:
-            record_model_service.trigger_without_runtime_parameters(-1, [0], [parameters.model.state_dict()])
+            record_model_service.trigger_without_runtime_parameters(-1, [0], [model.state_dict()])
 
         for batch_idx, batch in enumerate(cached_train):
             output = grokking_step(
                 batch_idx,
                 batch,
-                parameters.model,
+                runtime_model,
                 optimizer,
                 lr_scheduler,
                 parameters.tokenizer,
@@ -379,7 +396,7 @@ def train_grokking(parameters: GrokkingParameters):
             val_correct = 0
             val_count = 0
             for batch_idx, batch in enumerate(cached_val):
-                output = grokking_step(batch_idx, batch, parameters.model, None, None, parameters.tokenizer, train=False)
+                output = grokking_step(batch_idx, batch, runtime_model, None, None, parameters.tokenizer, train=False)
                 total_val_loss += output.loss_value * output.sample_count
                 val_correct += output.correct_count
                 val_count += output.sample_count
@@ -458,18 +475,18 @@ def train_grokking(parameters: GrokkingParameters):
 
         model_stat = None
         if record_model_service is not None and epoch % parameters.save_interval == 0:
-            model_stat = parameters.model.state_dict()
+            model_stat = model.state_dict()
             record_model_service.trigger_without_runtime_parameters(epoch, [0], [model_stat])
         if epoch % parameters.record_weight_norm_interval == 0:
-            model_stat = parameters.model.state_dict() if model_stat is None else model_stat
+            model_stat = model.state_dict() if model_stat is None else model_stat
             distance_to_origin_service.trigger_without_runtime_parameters(epoch, {0: model_stat})
 
     log_csv_file.flush()
     log_csv_file.close()
-    _write_final_correct_position(parameters.output_folder_path, parameters.tokenizer, parameters.model, cached_train, cached_val)
+    _write_final_correct_position(parameters.output_folder_path, parameters.tokenizer, runtime_model, cached_train, cached_val)
     save_model_state(
         os.path.join(parameters.output_folder_path, f"{parameters.save_name}.model.pt"),
-        parameters.model.state_dict(),
+        model.state_dict(),
         parameters.model_name,
         parameters.dataset_name,
     )

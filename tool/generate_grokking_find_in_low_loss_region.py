@@ -234,7 +234,7 @@ def parse_args():
     parser.add_argument("-train", "--train_requirement", type=str, default="fit", choices=REQUIREMENT_CHOICES)
     parser.add_argument("-val", "--val_requirement", type=str, default="fit", choices=REQUIREMENT_CHOICES)
     parser.add_argument("--label_shift", type=int, default=1)
-    parser.add_argument("--success_threshold", type=float, default=0.96)
+    parser.add_argument("--success_threshold", type=float, default=0.999)
     parser.add_argument("-lr", "--learning_rate", type=float, default=None)
     parser.add_argument("-minlr", "--min_lr", type=float, default=None)
     parser.add_argument("-epoch", "--epoch", type=int, default=None)

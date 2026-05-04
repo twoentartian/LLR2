@@ -625,7 +625,7 @@ class ArithmeticIterator(torch.utils.data.IterableDataset):
         self.reset_iteration(shuffle=shuffle)
 
     @staticmethod
-    def calculate_batchsize(ds_size: int, batchsize_hint: int = 0) -> int:
+    def calculate_batchsize(ds_size: int, batchsize_hint: int|float = 0) -> int:
         """
         Calculates which batch size to use
 
@@ -645,6 +645,7 @@ class ArithmeticIterator(torch.utils.data.IterableDataset):
         elif (batchsize_hint > 0) and (batchsize_hint < 1):
             return math.ceil(ds_size * batchsize_hint)
         elif batchsize_hint > 1:
+            assert isinstance(batchsize_hint, int)
             return min(batchsize_hint, ds_size)
         else:
             raise ValueError("batchsize_hint must be >= -1")

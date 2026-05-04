@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import json
 import logging
 import os
 import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 
@@ -14,7 +16,9 @@ import torch
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from py_src.model_opti_save_load import save_model_state
+from py_src.ml_setup.dataloader_util import cache_dataloader_on_device
 from py_src.ml_setup_dataset.dataset_modular import ArithmeticDataset, ArithmeticIterator
+import py_src.service.record_weights_difference as record_weights_difference
 from py_src.util import set_seed, setup_logging
 
 from generate_grokking import (
@@ -25,12 +29,18 @@ from generate_grokking import (
     initialize_model_for_training,
     loading_dataset_from,
     normalize_expression,
-    train_grokking,
 )
 
 
 logger = logging.getLogger("generate_grokking_find_in_low_loss_region")
-REQUIREMENT_CHOICES = ["fit", "shift"]
+REQUIREMENT_CHOICES = ["fit", "shift", "mismatch"]
+REQUIREMENT_TO_CODE = {
+    "fit": 0,
+    "shift": 1,
+    "mismatch": 2,
+}
+MISMATCH_MARGIN = 0.0
+SPEED_REPORT_INTERVAL = 100
 
 
 @dataclass
@@ -44,8 +54,31 @@ class RunResult:
     final_val_accuracy: float
     best_train_accuracy: float
     best_val_accuracy: float
+    final_train_fit_accuracy: float
+    final_val_fit_accuracy: float
+    best_train_fit_accuracy: float
+    best_val_fit_accuracy: float
     log_csv_path: str
     model_path: str
+
+
+@dataclass
+class TrainStepOutput:
+    loss_value: float
+    sample_count: int
+
+
+@dataclass
+class ObjectiveMetrics:
+    loss: float
+    accuracy: float
+
+
+@dataclass
+class PartitionMetrics:
+    loss: float
+    requirement_score: float
+    fit_accuracy: float
 
 
 def _clone_dataset(dataset: ArithmeticDataset, data: torch.Tensor, *, name_suffix: str) -> ArithmeticDataset:
@@ -94,7 +127,7 @@ def build_dataset_without_saving(train_pct: float, expression: str, modulus: int
     return ArithmeticDataset.splits(
         train_pct=train_pct,
         operator=normalized_expression,
-        train_split_type=split_type, # type: ignore
+        train_split_type=split_type,  # type: ignore[arg-type]
         modulus=modulus,
         operand_length=operand_length,
     )
@@ -166,6 +199,8 @@ def transform_dataset_for_requirement(
     if requirement == "shift":
         shifted = _shift_rhs_labels(dataset, label_shift=label_shift, partition_name=partition_name)
         return _clone_dataset(dataset, shifted, name_suffix=f"{partition_name}_shift")
+    if requirement == "mismatch":
+        return _clone_dataset(dataset, dataset.data.clone(), name_suffix=f"{partition_name}_mismatch")
     raise ValueError(f"Unknown requirement: {requirement}")
 
 
@@ -179,6 +214,15 @@ def save_requirement_datasets(
     val_dataset.save_to_file(os.path.join(dataset_dir, "val.txt"))
     train_dataset.tokenizer.save_tokens(os.path.join(dataset_dir, "tokenizer.txt"))
     return dataset_dir
+
+
+def _csv_float(row: dict[str, str], key: str, *, fallback_key: str | None = None) -> float:
+    value = row.get(key)
+    if value not in (None, ""):
+        return float(value)
+    if fallback_key is not None:
+        return float(row[fallback_key])
+    raise KeyError(f"CSV column '{key}' is missing")
 
 
 def summarize_run(log_csv_path: str, model_path: str, *, run_index: int, save_name: str, success_threshold: float) -> RunResult:
@@ -208,6 +252,10 @@ def summarize_run(log_csv_path: str, model_path: str, *, run_index: int, save_na
         final_val_accuracy=float(final_row["validation_accuracy"]),
         best_train_accuracy=max(float(row["training_accuracy"]) for row in rows),
         best_val_accuracy=max(float(row["validation_accuracy"]) for row in rows),
+        final_train_fit_accuracy=_csv_float(final_row, "train_fit_accuracy", fallback_key="training_accuracy"),
+        final_val_fit_accuracy=_csv_float(final_row, "val_fit_accuracy", fallback_key="validation_accuracy"),
+        best_train_fit_accuracy=max(_csv_float(row, "train_fit_accuracy", fallback_key="training_accuracy") for row in rows),
+        best_val_fit_accuracy=max(_csv_float(row, "val_fit_accuracy", fallback_key="validation_accuracy") for row in rows),
         log_csv_path=log_csv_path,
         model_path=model_path,
     )
@@ -216,6 +264,408 @@ def summarize_run(log_csv_path: str, model_path: str, *, run_index: int, save_na
 def write_summary(output_folder_path: str, payload: dict):
     with open(os.path.join(output_folder_path, "summary.json"), "w", encoding="utf-8") as outfile:
         json.dump(payload, outfile, indent=2)
+
+
+def _check_loss_above_initial(loss_above_initial_counter, initial_loss, current_loss, current_epoch, total_epoch, *, initial_loss_multiplier=1.1, lookback_ratio=0.1):
+    threshold = initial_loss * initial_loss_multiplier
+    loss_above_initial_counter = loss_above_initial_counter + 1 if current_loss > threshold else 0
+    required = max(1, int(total_epoch * lookback_ratio))
+    return (current_epoch >= required and loss_above_initial_counter >= required), loss_above_initial_counter
+
+
+def _build_requirement_codes(train_size: int, train_requirement: str, val_size: int, val_requirement: str) -> torch.Tensor:
+    train_codes = torch.full((train_size,), REQUIREMENT_TO_CODE[train_requirement], dtype=torch.long)
+    val_codes = torch.full((val_size,), REQUIREMENT_TO_CODE[val_requirement], dtype=torch.long)
+    return torch.cat([train_codes, val_codes], dim=0)
+
+
+def _cache_partition_batches(dataset: ArithmeticDataset, device: torch.device, batchsize_hint: int | float, *, shuffle: bool) -> list[dict[str, torch.Tensor]]:
+    if len(dataset) == 0:
+        return []
+    dataloader = ArithmeticIterator(dataset, device, batchsize_hint=batchsize_hint, shuffle=shuffle)
+    return cache_dataloader_on_device(dataloader, device)
+
+
+def _cache_merged_training_batches(
+    dataset: ArithmeticDataset,
+    requirement_codes: torch.Tensor,
+    device: torch.device,
+    batchsize_hint: int | float,
+) -> list[dict[str, torch.Tensor]]:
+    actual_batchsize = ArithmeticIterator.calculate_batchsize(len(dataset), batchsize_hint=batchsize_hint)
+    permutation = torch.randperm(len(dataset))
+    batches: list[dict[str, torch.Tensor]] = []
+    for batch_begin in range(0, len(dataset), actual_batchsize):
+        indices = permutation[batch_begin : batch_begin + actual_batchsize]
+        batch_data = dataset.data[indices]
+        batches.append(
+            {
+                "text": batch_data[:, :-1].to(device),
+                "target": batch_data[:, 1:].to(device),
+                "requirement_codes": requirement_codes[indices].to(device),
+            }
+        )
+    return batches
+
+
+def _rhs_logits_and_targets(model, batch: dict[str, torch.Tensor], tokenizer, *, train: bool):
+    x = batch["text"]
+    y = batch["target"]
+    use_amp = train and x.device.type == "cuda"
+    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
+    autocast_context = torch.autocast(device_type=x.device.type, dtype=amp_dtype) if use_amp else contextlib.nullcontext()
+    grad_context = contextlib.nullcontext() if train else torch.inference_mode()
+    with grad_context:
+        with autocast_context:
+            y_hat, _, _ = model(x=x)
+            y_hat = y_hat.transpose(-2, -1)
+            eq_token_index = tokenizer.stoi["="]
+            eq_position_tensor = torch.nonzero(y[0, :] == eq_token_index, as_tuple=False)
+            eq_position = int(eq_position_tensor.squeeze())
+            y_rhs = y[..., eq_position + 1:]
+            y_hat_rhs = y_hat[..., eq_position + 1:]
+    return y_hat_rhs, y_rhs
+
+
+def _fit_loss_per_sample(y_hat_rhs: torch.Tensor, y_rhs: torch.Tensor) -> torch.Tensor:
+    per_token_loss = torch.nn.functional.cross_entropy(y_hat_rhs, y_rhs, reduction="none")
+    return per_token_loss.mean(dim=-1)
+
+
+def _mismatch_loss_per_sample(y_hat_rhs: torch.Tensor, y_rhs: torch.Tensor) -> torch.Tensor:
+    correct_logits = y_hat_rhs.gather(dim=1, index=y_rhs.unsqueeze(1)).squeeze(1)
+    correct_mask = torch.zeros_like(y_hat_rhs, dtype=torch.bool)
+    correct_mask.scatter_(1, y_rhs.unsqueeze(1), True)
+    max_wrong_logits = y_hat_rhs.masked_fill(correct_mask, float("-inf")).amax(dim=1)
+    per_token_loss = torch.relu(correct_logits - max_wrong_logits + MISMATCH_MARGIN)
+    return per_token_loss.mean(dim=-1)
+
+
+def _objective_loss_per_sample(y_hat_rhs: torch.Tensor, y_rhs: torch.Tensor, requirement_codes: torch.Tensor) -> torch.Tensor:
+    fit_loss = _fit_loss_per_sample(y_hat_rhs, y_rhs)
+    mismatch_loss = _mismatch_loss_per_sample(y_hat_rhs, y_rhs)
+    mismatch_mask = requirement_codes == REQUIREMENT_TO_CODE["mismatch"]
+    return torch.where(mismatch_mask, mismatch_loss, fit_loss)
+
+
+def _row_accuracy(y_hat_rhs: torch.Tensor, y_rhs: torch.Tensor) -> torch.Tensor:
+    y_hat_max = y_hat_rhs.argmax(dim=-2)
+    return (y_hat_max == y_rhs).all(dim=-1)
+
+
+def _partition_training_step(batch, model, optimizer, lr_scheduler, tokenizer, *, scaler=None) -> TrainStepOutput:
+    optimizer.zero_grad(set_to_none=True)
+    y_hat_rhs, y_rhs = _rhs_logits_and_targets(model, batch, tokenizer, train=True)
+    per_sample_loss = _objective_loss_per_sample(y_hat_rhs, y_rhs, batch["requirement_codes"])
+    loss = per_sample_loss.mean()
+
+    if scaler is not None and scaler.is_enabled():
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        loss.backward()
+        optimizer.step()
+    if lr_scheduler is not None:
+        lr_scheduler.step()
+
+    return TrainStepOutput(
+        loss_value=float(loss.item()),
+        sample_count=int(y_rhs.shape[0]),
+    )
+
+
+def _evaluate_batches(model, tokenizer, batches: list[dict[str, torch.Tensor]], *, objective: str) -> ObjectiveMetrics:
+    if len(batches) == 0:
+        return ObjectiveMetrics(loss=0.0, accuracy=1.0)
+
+    total_loss = 0.0
+    total_count = 0
+    total_correct = 0
+    for batch in batches:
+        y_hat_rhs, y_rhs = _rhs_logits_and_targets(model, batch, tokenizer, train=False)
+        if objective == "fit":
+            per_sample_loss = _fit_loss_per_sample(y_hat_rhs, y_rhs)
+        elif objective == "mismatch":
+            per_sample_loss = _mismatch_loss_per_sample(y_hat_rhs, y_rhs)
+        else:
+            raise ValueError(f"Unknown objective: {objective}")
+        correct_location = _row_accuracy(y_hat_rhs, y_rhs)
+        total_loss += float(per_sample_loss.sum().item())
+        total_count += int(y_rhs.shape[0])
+        total_correct += int(correct_location.int().sum().item())
+
+    return ObjectiveMetrics(
+        loss=total_loss / total_count,
+        accuracy=total_correct / total_count,
+    )
+
+
+def _evaluate_partition(
+    model,
+    tokenizer,
+    *,
+    original_batches: list[dict[str, torch.Tensor]],
+    required_batches: list[dict[str, torch.Tensor]],
+    requirement: str,
+) -> PartitionMetrics:
+    if len(original_batches) == 0 and len(required_batches) == 0:
+        return PartitionMetrics(loss=0.0, requirement_score=1.0, fit_accuracy=1.0)
+
+    fit_metrics = _evaluate_batches(model, tokenizer, original_batches, objective="fit")
+    if requirement == "fit":
+        return PartitionMetrics(loss=fit_metrics.loss, requirement_score=fit_metrics.accuracy, fit_accuracy=fit_metrics.accuracy)
+    if requirement == "shift":
+        shift_metrics = _evaluate_batches(model, tokenizer, required_batches, objective="fit")
+        return PartitionMetrics(loss=shift_metrics.loss, requirement_score=shift_metrics.accuracy, fit_accuracy=fit_metrics.accuracy)
+    if requirement == "mismatch":
+        mismatch_metrics = _evaluate_batches(model, tokenizer, original_batches, objective="mismatch")
+        return PartitionMetrics(loss=mismatch_metrics.loss, requirement_score=1.0 - fit_metrics.accuracy, fit_accuracy=fit_metrics.accuracy)
+    raise ValueError(f"Unknown requirement: {requirement}")
+
+
+def _write_final_correct_position(output_folder_path, tokenizer, model, train_batches, val_batches):
+    def token_to_repr(token_id: int) -> str:
+        token = tokenizer.itos[token_id]
+        try:
+            return str(int(token))
+        except ValueError:
+            return token
+
+    rows = []
+    for batch in [*train_batches, *val_batches]:
+        y_hat_rhs, y_rhs = _rhs_logits_and_targets(model, batch, tokenizer, train=False)
+        correct_location = _row_accuracy(y_hat_rhs, y_rhs)
+        lhs_tokens = batch["text"][:, 1].detach().cpu().tolist()
+        rhs_tokens = batch["text"][:, 3].detach().cpu().tolist()
+        for lhs, rhs, correct in zip(lhs_tokens, rhs_tokens, correct_location.tolist()):
+            rows.append((token_to_repr(lhs), token_to_repr(rhs), int(bool(correct))))
+
+    rows.sort(key=lambda item: (item[0], item[1]))
+    with open(os.path.join(output_folder_path, "final_correct_position.csv"), "w", newline="", encoding="utf-8") as outfile:
+        writer = csv.writer(outfile)
+        writer.writerow(["lhs", "rhs", "correct?"])
+        writer.writerows(rows)
+
+
+def train_grokking_partition_requirements(
+    parameters: GrokkingParameters,
+    *,
+    merged_train_dataset: ArithmeticDataset,
+    original_train_dataset: ArithmeticDataset,
+    original_val_dataset: ArithmeticDataset,
+    required_train_dataset: ArithmeticDataset,
+    required_val_dataset: ArithmeticDataset,
+    batchsize_hint: int | float,
+    train_requirement: str,
+    val_requirement: str,
+):
+    assert parameters.model is not None
+    assert parameters.learning_rate is not None
+    assert parameters.weight_decay is not None
+    assert parameters.total_epoch is not None
+    assert parameters.warmup_epoch is not None
+    assert parameters.min_lr is not None
+    assert parameters.output_folder_path is not None
+    assert parameters.tokenizer is not None
+    assert parameters.model_name is not None
+    assert parameters.dataset_name is not None
+    assert parameters.save_name is not None
+    assert parameters.record_weight_norm_interval is not None
+
+    model = parameters.model
+    device = next(model.parameters()).device
+    if parameters.logger is not None:
+        parameters.logger.info("caching merged training batches and partition-eval batches on %s", device)
+
+    requirement_codes = _build_requirement_codes(
+        len(required_train_dataset),
+        train_requirement,
+        len(required_val_dataset),
+        val_requirement,
+    )
+    cached_train = _cache_merged_training_batches(merged_train_dataset, requirement_codes, device, batchsize_hint)
+    cached_train_original = _cache_partition_batches(original_train_dataset, device, batchsize_hint, shuffle=False)
+    cached_val_original = _cache_partition_batches(original_val_dataset, device, batchsize_hint, shuffle=False)
+    cached_train_required = _cache_partition_batches(required_train_dataset, device, batchsize_hint, shuffle=False)
+    cached_val_required = _cache_partition_batches(required_val_dataset, device, batchsize_hint, shuffle=False)
+    if parameters.logger is not None:
+        parameters.logger.info(
+            "cached %d merged train batches, %d/%d train/val original eval batches, %d/%d train/val requirement eval batches",
+            len(cached_train),
+            len(cached_train_original),
+            len(cached_val_original),
+            len(cached_train_required),
+            len(cached_val_required),
+        )
+
+    steps_per_epoch = max(1, len(cached_train))
+    warmup_steps = parameters.warmup_epoch * steps_per_epoch
+    total_steps = parameters.total_epoch * steps_per_epoch
+    cosine_steps = max(1, total_steps - warmup_steps)
+    if parameters.logger is not None:
+        parameters.logger.info(
+            "lr scheduler stepping per iteration: steps_per_epoch=%d warmup_steps=%d total_steps=%d",
+            steps_per_epoch,
+            warmup_steps,
+            total_steps,
+        )
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        weight_decay=parameters.weight_decay,
+        lr=parameters.learning_rate,
+        betas=(0.9, 0.98),
+        eps=1e-8,
+    )
+    warmup = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps)
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=cosine_steps,
+        eta_min=parameters.min_lr,
+    )
+    lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
+
+    runtime_model = model
+    if hasattr(torch, "compile"):
+        try:
+            compiled_model = torch.compile(model)
+            if isinstance(compiled_model, torch.nn.Module):
+                runtime_model = compiled_model
+                if parameters.logger is not None:
+                    parameters.logger.info("torch.compile enabled")
+            elif parameters.logger is not None:
+                parameters.logger.info("torch.compile returned a non-Module wrapper; using the original module")
+        except Exception as exc:
+            if parameters.logger is not None:
+                parameters.logger.info("torch.compile skipped: %s", exc)
+
+    use_amp = device.type == "cuda"
+    amp_dtype = torch.bfloat16 if use_amp and torch.cuda.is_bf16_supported() else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16)) if use_amp else None  # type: ignore[arg-type]
+
+    distance_to_origin_service = record_weights_difference.ServiceDistanceToOriginRecorder(1, [0])
+    distance_to_origin_service.initialize_without_runtime_parameters({0: model.state_dict()}, parameters.output_folder_path, logger=parameters.logger)
+
+    log_csv_path = os.path.join(parameters.output_folder_path, f"{parameters.save_name}.log.csv")
+    log_csv_file = open(log_csv_path, "w", encoding="utf-8")
+    log_csv_file.write(
+        "epoch,training_loss,training_accuracy,validation_loss,validation_accuracy,"
+        "train_fit_accuracy,val_fit_accuracy,merged_objective_loss,lrs\n"
+    )
+    log_csv_file.flush()
+
+    speed_window_start_time = time.time()
+    speed_window_start_epoch = 0
+    initial_merged_objective_loss = None
+    loss_above_initial_counter = 0
+
+    for epoch in range(parameters.total_epoch):
+        merged_loss_sum = 0.0
+        merged_count = 0
+        for batch in cached_train:
+            output = _partition_training_step(
+                batch,
+                runtime_model,
+                optimizer,
+                lr_scheduler,
+                parameters.tokenizer,
+                scaler=scaler,
+            )
+            merged_loss_sum += output.loss_value * output.sample_count
+            merged_count += output.sample_count
+        merged_objective_loss = merged_loss_sum / merged_count
+
+        train_metrics = _evaluate_partition(
+            runtime_model,
+            parameters.tokenizer,
+            original_batches=cached_train_original,
+            required_batches=cached_train_required,
+            requirement=train_requirement,
+        )
+        val_metrics = _evaluate_partition(
+            runtime_model,
+            parameters.tokenizer,
+            original_batches=cached_val_original,
+            required_batches=cached_val_required,
+            requirement=val_requirement,
+        )
+        lrs = [param_group["lr"] for param_group in optimizer.param_groups]
+
+        if parameters.logger is not None:
+            parameters.logger.info(
+                "epoch[%d] merged_loss=%.4f train(loss,score,fit)=%.4f,%.4f,%.4f val(loss,score,fit)=%.4f,%.4f,%.4f lrs=%s",
+                epoch,
+                merged_objective_loss,
+                train_metrics.loss,
+                train_metrics.requirement_score,
+                train_metrics.fit_accuracy,
+                val_metrics.loss,
+                val_metrics.requirement_score,
+                val_metrics.fit_accuracy,
+                lrs,
+            )
+        log_csv_file.write(
+            f"{epoch},{train_metrics.loss:.4e},{train_metrics.requirement_score:.4e},"
+            f"{val_metrics.loss:.4e},{val_metrics.requirement_score:.4e},"
+            f"{train_metrics.fit_accuracy:.4e},{val_metrics.fit_accuracy:.4e},"
+            f"{merged_objective_loss:.4e},{lrs}\n"
+        )
+        if epoch % 100 == 0:
+            log_csv_file.flush()
+
+        epochs_since_report = epoch - speed_window_start_epoch + 1
+        if epochs_since_report >= SPEED_REPORT_INTERVAL:
+            elapsed = time.time() - speed_window_start_time
+            epochs_remaining = parameters.total_epoch - epoch - 1
+            time_per_epoch = elapsed / epochs_since_report
+            eta_seconds = time_per_epoch * epochs_remaining
+            if parameters.logger is not None:
+                parameters.logger.info(
+                    "[Speed] last %d epochs: %.1fs (%.2fs/epoch) | remaining: %d epochs, ETA: %s",
+                    epochs_since_report,
+                    elapsed,
+                    time_per_epoch,
+                    epochs_remaining,
+                    time.strftime("%H:%M:%S", time.gmtime(eta_seconds)),
+                )
+            speed_window_start_time = time.time()
+            speed_window_start_epoch = epoch + 1
+
+        if (
+            parameters.early_stop
+            and train_metrics.requirement_score >= parameters.early_stop_train_accuracy
+            and val_metrics.requirement_score >= parameters.early_stop_val_accuracy
+        ):
+            break
+
+        if initial_merged_objective_loss is None:
+            initial_merged_objective_loss = float(merged_objective_loss)
+        if parameters.high_loss_train_stop:
+            should_stop, loss_above_initial_counter = _check_loss_above_initial(
+                loss_above_initial_counter,
+                initial_merged_objective_loss,
+                float(merged_objective_loss),
+                epoch,
+                parameters.total_epoch,
+            )
+            if should_stop:
+                if parameters.logger is not None:
+                    parameters.logger.info("loss_above_initial_stop triggered at epoch %d", epoch)
+                break
+
+        if epoch % parameters.record_weight_norm_interval == 0:
+            distance_to_origin_service.trigger_without_runtime_parameters(epoch, {0: model.state_dict()})
+
+    log_csv_file.flush()
+    log_csv_file.close()
+    _write_final_correct_position(parameters.output_folder_path, parameters.tokenizer, runtime_model, cached_train_original, cached_val_original)
+    save_model_state(
+        os.path.join(parameters.output_folder_path, f"{parameters.save_name}.model.pt"),
+        model.state_dict(),
+        parameters.model_name,
+        parameters.dataset_name,
+    )
 
 
 def parse_args():
@@ -321,6 +771,11 @@ def main():
         len(required_val_dataset),
         len(merged_train_dataset),
     )
+    logger.info(
+        "partition requirements: train=%s val=%s",
+        args.train_requirement,
+        args.val_requirement,
+    )
 
     batch_size = default_batch_size(merged_train_dataset) if args.batchsize is None else args.batchsize
     logger.info("batch size = %s", batch_size)
@@ -348,8 +803,6 @@ def main():
         device=device,
     )
 
-    train_dataloader = ArithmeticIterator(merged_train_dataset, device, batchsize_hint=batch_size)
-
     params = GrokkingParameters()
     params.set_env(output_folder_path, True, logger=logger)
     params.set_early_stop_thresholds(train_accuracy=args.success_threshold, val_accuracy=args.success_threshold)
@@ -361,8 +814,6 @@ def main():
         warmup_epoch=10,
         total_epoch=total_epoch,
     )
-    params.set_dataloader(train_dataloader, None)
-    params.set_disable_validation()
     params.set_model_save(
         save_name,
         save_format="none",
@@ -372,9 +823,22 @@ def main():
     if args.enable_high_loss_train_stop:
         params.set_high_loss_train_stop()
 
-    train_grokking(params)
+    train_grokking_partition_requirements(
+        params,
+        merged_train_dataset=merged_train_dataset,
+        original_train_dataset=train_dataset,
+        original_val_dataset=val_dataset,
+        required_train_dataset=required_train_dataset,
+        required_val_dataset=required_val_dataset,
+        batchsize_hint=batch_size,
+        train_requirement=args.train_requirement,
+        val_requirement=args.val_requirement,
+    )
+    numbered_model_path = os.path.join(output_folder_path, f"{save_name}.model.pt")
     final_model_path = os.path.join(output_folder_path, "final.model.pt")
     save_model_state(final_model_path, model.state_dict(), args.model_type, merged_train_dataset.name)
+    if not os.path.exists(numbered_model_path):
+        save_model_state(numbered_model_path, model.state_dict(), args.model_type, merged_train_dataset.name)
 
     run_result = summarize_run(
         os.path.join(output_folder_path, f"{save_name}.log.csv"),
@@ -385,11 +849,13 @@ def main():
     )
     run_results.append(run_result)
     logger.info(
-        "run %s finished: success=%s final(train,val)=(%.4f, %.4f) best(train,val)=(%.4f, %.4f)",
+        "run %s finished: success=%s final(score train,val)=(%.4f, %.4f) final(fit train,val)=(%.4f, %.4f) best(score train,val)=(%.4f, %.4f)",
         save_name,
         run_result.success,
         run_result.final_train_accuracy,
         run_result.final_val_accuracy,
+        run_result.final_train_fit_accuracy,
+        run_result.final_val_fit_accuracy,
         run_result.best_train_accuracy,
         run_result.best_val_accuracy,
     )
@@ -404,6 +870,7 @@ def main():
         "success_threshold": args.success_threshold,
         "train_requirement": args.train_requirement,
         "val_requirement": args.val_requirement,
+        "mismatch_margin": MISMATCH_MARGIN,
         "label_shift": effective_shift,
         "dataset_name": train_dataset.name,
         "dataset_path": args.dataset_path,
@@ -413,9 +880,11 @@ def main():
         "val_examples": 0,
         "train_partition_examples": len(required_train_dataset),
         "val_partition_examples": len(required_val_dataset),
-        "validation_disabled": True,
+        "validation_disabled": False,
+        "saved_val_dataset_empty": True,
         "requirement_dataset_dir": requirement_dataset_dir,
         "final_model_path": final_model_path,
+        "numbered_model_path": numbered_model_path,
         "runs_attempted": len(run_results),
         "runs_requested": 1,
         "runs": [asdict(run_result) for run_result in run_results],

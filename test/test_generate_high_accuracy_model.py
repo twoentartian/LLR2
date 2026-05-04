@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 from typing import Any
 from unittest.mock import patch
@@ -139,6 +140,11 @@ class _DummyNanoCLIPModel(L.LightningModule):
         return self.latest_loss, int(self.latest_accuracy)
 
 
+class _RandomSamplingModel(nn.Module):
+    def sample(self, *, batch_size: int) -> torch.Tensor:
+        return torch.rand(batch_size, 3, 8, 8)
+
+
 class TestRunSingleBatch(unittest.TestCase):
     """Smoke-tests: one train batch + one val batch (where applicable)."""
 
@@ -206,6 +212,26 @@ class TestRunSingleBatch(unittest.TestCase):
         self.assertTrue(bool(setup.model.ema.initted.item()))
         print("ddpm_flowers102")
         print(f"train loss:{train_result.avg_loss:.4f}")
+
+    def test_ddpm_flowers102_sample_hook_uses_fixed_seed_and_saves_ten_images(self):
+        from py_src.ml_setup.ddpm_flowers import _generate_sample_from_zero_to_one
+
+        model = _RandomSamplingModel()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _generate_sample_from_zero_to_one(model, tmpdir, 0, torch.device("cpu"), 10)
+            _generate_sample_from_zero_to_one(model, tmpdir, 10, torch.device("cpu"), 10)
+
+            for epoch in (0, 10):
+                for image_index in range(10):
+                    image_path = os.path.join(tmpdir, f"epoch{epoch}_{image_index}.png")
+                    self.assertTrue(os.path.exists(image_path))
+
+            for image_index in range(10):
+                first_path = os.path.join(tmpdir, f"epoch0_{image_index}.png")
+                second_path = os.path.join(tmpdir, f"epoch10_{image_index}.png")
+                with open(first_path, "rb") as first_file, open(second_path, "rb") as second_file:
+                    self.assertEqual(first_file.read(), second_file.read())
 
     def test_arithmetic_addition_grokking_train_and_val(self):
         self._assert_classifier_single_batch(

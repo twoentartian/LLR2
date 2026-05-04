@@ -253,11 +253,12 @@ def training_model(
                 arg_ml_setup.model_type.name, arg_ml_setup.dataset_type.name,
             )
 
-        # DDPM: generate sample images after each epoch
+        # DDPM: generate sample images every 10 epochs
         if arg_ml_setup.application_type == ApplicationType.diffusion and epoch%10 == 0:
             if arg_ml_setup.difussion_generate_sample is not None:
+                sample_count = 10
                 with torch.no_grad():
-                    arg_ml_setup.difussion_generate_sample(model, output_folder, epoch, device.device, 1)
+                    arg_ml_setup.difussion_generate_sample(model, output_folder, epoch, device.device, sample_count)
 
     child_logger.info("training complete")
     log_csv.flush()

@@ -312,7 +312,7 @@ class FastTrainingSetup:
 
         elif mt == ModelType.ddpm_flowers102:
             if dt == DatasetType.flowers102:
-                epochs = 4096
+                epochs = 3000
                 optimizer = torch.optim.Adam(model.parameters(), lr=8e-5)
                 return optimizer, None, epochs
             else:

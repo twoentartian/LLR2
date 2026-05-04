@@ -19,6 +19,8 @@ from py_src.ml_setup.ml_setup import ApplicationType, MLSetup
 from py_src.ml_setup_dataset import DatasetSetup, dataset_flowers102
 from py_src.ml_setup_model import ModelType
 
+_FLOWERS_SAMPLE_SEED = 20260504
+
 
 class _LucidrainsDiffusionWithEMA(torch.nn.Module):
     """LLR2 wrapper that adds EMA behavior around lucidrains diffusion models."""
@@ -189,6 +191,18 @@ def _save_samples(samples: torch.Tensor, output_folder: str, current_epoch: int)
         )
 
 
+@contextmanager
+def _fixed_sampling_seed(device: torch.device, seed: int):
+    devices: list[int] = []
+    if device.type == "cuda":
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        devices = [device_index]
+
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(seed)
+        yield
+
+
 def _generate_sample_from_zero_to_one(
     model: torch.nn.Module,
     output_folder: str,
@@ -196,10 +210,14 @@ def _generate_sample_from_zero_to_one(
     device: torch.device,
     count: int,
 ) -> None:
-    del device
+    old_mode = model.training
     model.eval()
-    samples = model.sample(batch_size=count)  # type: ignore
-    _save_samples(samples, output_folder, current_epoch)
+    try:
+        with _fixed_sampling_seed(device, _FLOWERS_SAMPLE_SEED):
+            samples = model.sample(batch_size=count)  # type: ignore
+        _save_samples(samples, output_folder, current_epoch)
+    finally:
+        model.train(old_mode)
 
 
 def ddpm_flowers102(override_dataset: Optional[DatasetSetup] = None) -> MLSetup:

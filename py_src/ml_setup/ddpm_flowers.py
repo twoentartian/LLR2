@@ -238,6 +238,8 @@ def ddpm_flowers102(override_dataset: Optional[DatasetSetup] = None) -> MLSetup:
         dataset_type=dataset.dataset_type,
         default_batch_size=32,
         has_normalization_layer=True,
+        gradient_accumulate_every=2,
+        max_grad_norm=1.0,
         application_type=ApplicationType.diffusion,
     )
     output_ml_setup.difussion_generate_sample = _generate_sample_from_zero_to_one

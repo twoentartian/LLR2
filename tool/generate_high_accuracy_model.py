@@ -215,7 +215,16 @@ def training_model(
     scaler = device.make_scaler() if arg_amp else None
 
     for epoch in range(epochs):
-        train_result = train(adapter, dataloader, optimizer, lr_scheduler, device=device, scaler=scaler) # type: ignore
+        train_result = train(
+            adapter,
+            dataloader,
+            optimizer,
+            lr_scheduler,
+            device=device,
+            scaler=scaler,
+            gradient_accumulate_every=arg_ml_setup.gradient_accumulate_every,
+            max_grad_norm=arg_ml_setup.max_grad_norm,
+        ) # type: ignore
 
         lrs = [pg["lr"] for pg in optimizer.param_groups] # type: ignore
 

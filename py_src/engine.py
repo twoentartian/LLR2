@@ -160,6 +160,8 @@ def train(
     min_rounds: Optional[int] = None,
     max_rounds: Optional[int] = None,
     loss_threshold: Optional[float] = None,
+    gradient_accumulate_every: int = 1,
+    max_grad_norm: Optional[float] = None,
 ) -> TrainResult:
     """Run training for one epoch or for an adaptive number of batches.
 
@@ -187,6 +189,9 @@ def train(
         ``min_rounds`` losses drops below ``loss_threshold`` (after at least
         ``min_rounds`` batches) or when ``max_rounds`` batches have been run.
     """
+    if gradient_accumulate_every < 1:
+        raise ValueError("gradient_accumulate_every must be at least 1")
+
     model = adapter.get_model()
     model.train(training_mode)
     model.to(device.device)
@@ -202,14 +207,40 @@ def train(
     moving_average = MovingAverage(max(1, min_rounds_value)) if adaptive_mode else None
     stop_after_single_epoch = not adaptive_mode
     step_context = nullcontext if backpropagation else torch.inference_mode
+    end_of_epoch = object()
 
     should_stop = False
+    accumulated_batches = 0
     while result.iterations < step_limit and not should_stop:
         epoch_had_batches = False
-        for batch_idx, batch in enumerate(dataloader):
-            if result.iterations >= step_limit:
-                break
+        batch_iterator = iter(dataloader)
+        batch_idx = 0
+        next_batch = next(batch_iterator, end_of_epoch)
+
+        while next_batch is not end_of_epoch and result.iterations < step_limit and not should_stop:
             epoch_had_batches = True
+            batch = next_batch
+
+            next_batch = next(batch_iterator, end_of_epoch)
+            is_last_batch_in_epoch = next_batch is end_of_epoch
+
+            accumulated_batches += 1
+            zero_grad = backpropagation and accumulated_batches == 1
+            is_accumulation_boundary = accumulated_batches >= gradient_accumulate_every
+            is_last_allowed_round = (result.iterations + 1) >= step_limit
+            step_optimizer = (
+                backpropagation
+                and (
+                    is_accumulation_boundary
+                    or is_last_batch_in_epoch
+                    or is_last_allowed_round
+                )
+            )
+            loss_divisor = (
+                accumulated_batches
+                if step_optimizer and accumulated_batches < gradient_accumulate_every
+                else gradient_accumulate_every
+            )
 
             with step_context():
                 out = adapter.train_step(
@@ -220,6 +251,10 @@ def train(
                     device=device.device,
                     scaler=scaler,
                     backpropagation=backpropagation,
+                    zero_grad=zero_grad,
+                    step_optimizer=step_optimizer,
+                    loss_divisor=loss_divisor,
+                    max_grad_norm=max_grad_norm,
                 )
 
             result.total_loss += out.loss * out.sample_count
@@ -228,7 +263,10 @@ def train(
                 result.total_correct = (result.total_correct or 0) + out.correct_count
             result.iterations += 1
 
-            if backpropagation:
+            if step_optimizer:
+                accumulated_batches = 0
+
+            if backpropagation and out.optimizer_was_run:
                 adapter.post_train_step()
 
             if moving_average is not None:
@@ -236,11 +274,14 @@ def train(
                 if (
                     loss_threshold is not None
                     and result.iterations >= min_rounds_value
+                    and (not backpropagation or accumulated_batches == 0)
                     and result.moving_average_loss <= loss_threshold
                 ):
                     result.stop_reason = "loss_threshold"
                     should_stop = True
                     break
+
+            batch_idx += 1
 
         if not epoch_had_batches:
             break

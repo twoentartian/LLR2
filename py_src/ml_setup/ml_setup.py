@@ -39,6 +39,8 @@ class MLSetup:
     default_collate_fn_val: Optional[Callable] = None
     default_sampler_fn: Optional[Callable] = None
     has_normalization_layer: bool = False
+    gradient_accumulate_every: int = 1
+    max_grad_norm: Optional[float] = None
 
     # ---- dataloader overrides (pre-built loaders) -------------------------
     override_train_loader: Optional[Iterable] = None

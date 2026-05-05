@@ -27,6 +27,11 @@ class _FixedLossAdapter(ModelAdapter):
         device,
         scaler,
         backpropagation=True,
+        *,
+        zero_grad=True,
+        step_optimizer=True,
+        loss_divisor=1.0,
+        max_grad_norm=None,
     ) -> StepOutput:
         loss = self._losses[self._index % len(self._losses)]
         self._index += 1
@@ -55,6 +60,11 @@ class _ModeTrackingAdapter(ModelAdapter):
         device,
         scaler,
         backpropagation=True,
+        *,
+        zero_grad=True,
+        step_optimizer=True,
+        loss_divisor=1.0,
+        max_grad_norm=None,
     ) -> StepOutput:
         self.saw_training_mode = self._model.training
         self.saw_grad_enabled = torch.is_grad_enabled()
@@ -102,6 +112,40 @@ class _OverflowSkippingScaler:
 
     def get_scale(self) -> float:
         return self._scale
+
+
+class _AccumulationTrackingAdapter(ModelAdapter):
+    def __init__(self):
+        self._model = torch.nn.Linear(1, 1)
+        self.flags: list[tuple[int, bool, bool, float, float | None]] = []
+        self.post_step_calls = 0
+
+    def get_model(self) -> torch.nn.Module:
+        return self._model
+
+    def train_step(
+        self,
+        batch,
+        batch_idx,
+        optimizer,
+        lr_scheduler,
+        device,
+        scaler,
+        backpropagation=True,
+        *,
+        zero_grad=True,
+        step_optimizer=True,
+        loss_divisor=1.0,
+        max_grad_norm=None,
+    ) -> StepOutput:
+        self.flags.append((batch_idx, zero_grad, step_optimizer, loss_divisor, max_grad_norm))
+        return StepOutput(loss=1.0, sample_count=1, optimizer_was_run=step_optimizer)
+
+    def val_step(self, batch, batch_idx, device) -> StepOutput:
+        raise NotImplementedError
+
+    def post_train_step(self) -> None:
+        self.post_step_calls += 1
 
 
 class TestEngineTrain(unittest.TestCase):
@@ -187,3 +231,51 @@ class TestEngineTrain(unittest.TestCase):
 
         self.assertEqual(result.iterations, 1)
         self.assertEqual(scheduler.step_calls, 0)
+
+    def test_gradient_accumulation_groups_batches_and_only_posts_on_optimizer_step(self):
+        adapter = _AccumulationTrackingAdapter()
+
+        result = train(
+            adapter,
+            [object(), object(), object(), object(), object()],
+            optimizer=None,
+            lr_scheduler=None,
+            device=Device.cpu(),
+            max_rounds=5,
+            gradient_accumulate_every=2,
+            max_grad_norm=1.0,
+        )
+
+        self.assertEqual(result.iterations, 5)
+        self.assertEqual(
+            adapter.flags,
+            [
+                (0, True, False, 2, 1.0),
+                (1, False, True, 2, 1.0),
+                (2, True, False, 2, 1.0),
+                (3, False, True, 2, 1.0),
+                (4, True, True, 1, 1.0),
+            ],
+        )
+        self.assertEqual(adapter.post_step_calls, 3)
+
+    def test_engine_level_grad_clipping_limits_parameter_update(self):
+        model = torch.nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            model.weight.fill_(1.0)
+        adapter = StandardAdapter(model, torch.nn.MSELoss())
+        optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+        batch = (torch.tensor([[100.0]]), torch.tensor([[0.0]]))
+
+        result = train(
+            adapter,
+            [batch],
+            optimizer=optimizer,
+            lr_scheduler=None,
+            device=Device.cpu(),
+            max_rounds=1,
+            max_grad_norm=1.0,
+        )
+
+        self.assertEqual(result.iterations, 1)
+        self.assertAlmostEqual(model.weight.item(), 0.99, places=6)

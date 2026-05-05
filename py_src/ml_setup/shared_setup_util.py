@@ -8,8 +8,9 @@ from py_src.ml_setup.ml_setup import ApplicationType, MLSetup
 # ---------------------------------------------------------------------------
 
 def make_setup(model, model_type, dataset_setup, batch_size, has_normalization=True,
-                criterion=None, clip_grad_norm=None, application_type=ApplicationType.classifier, 
-                default_collate_fn=None, default_collate_fn_val=None, default_sampler_fn=None) -> MLSetup:
+                criterion=None, clip_grad_norm=None, application_type=ApplicationType.classifier,
+                default_collate_fn=None, default_collate_fn_val=None, default_sampler_fn=None,
+                gradient_accumulate_every=1, max_grad_norm=None) -> MLSetup:
     if criterion is None:
         criterion = nn.CrossEntropyLoss()
     adapter = StandardAdapter(model, criterion, clip_grad_norm=clip_grad_norm)
@@ -23,6 +24,8 @@ def make_setup(model, model_type, dataset_setup, batch_size, has_normalization=T
         default_batch_size=batch_size,
         criterion=criterion,
         has_normalization_layer=has_normalization,
+        gradient_accumulate_every=gradient_accumulate_every,
+        max_grad_norm=max_grad_norm,
         application_type=application_type,
         default_collate_fn=default_collate_fn,
         default_collate_fn_val=default_collate_fn_val,

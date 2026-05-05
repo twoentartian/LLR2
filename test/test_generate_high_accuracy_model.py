@@ -188,6 +188,8 @@ class TestRunSingleBatch(unittest.TestCase):
         self.assertTrue(hasattr(setup.model, "update_ema"))
         self.assertTrue(hasattr(setup.model, "train_diffusion"))
         self.assertTrue(hasattr(setup.model, "ema_diffusion"))
+        self.assertEqual(setup.gradient_accumulate_every, 2)
+        self.assertEqual(setup.max_grad_norm, 1.0)
 
         attention_modules = [
             module for module in setup.model.train_diffusion.model.modules()

@@ -91,7 +91,11 @@ def run_single_batch(
 
     train_result = train(
         adapter, train_loader, optimizer, lr_scheduler, # type: ignore
-        device=device, scaler=scaler, max_rounds=1,
+        device=device,
+        scaler=scaler,
+        max_rounds=1,
+        gradient_accumulate_every=ml_setup.gradient_accumulate_every,
+        max_grad_norm=ml_setup.max_grad_norm,
     )
 
     val_result = None

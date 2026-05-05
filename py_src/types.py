@@ -16,4 +16,5 @@ class StepOutput:
     loss: float
     sample_count: int
     correct_count: Optional[int] = None
+    optimizer_was_run: bool = False
     extra: dict = field(default_factory=dict)

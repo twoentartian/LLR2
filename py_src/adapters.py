@@ -56,6 +56,15 @@ def _step_optimizer_with_scaler(
     return scaler.get_scale() >= old_scale
 
 
+def _resolve_max_grad_norm(
+    explicit_max_grad_norm: Optional[float],
+    default_max_grad_norm: Optional[float] = None,
+) -> Optional[float]:
+    if explicit_max_grad_norm is not None:
+        return explicit_max_grad_norm
+    return default_max_grad_norm
+
+
 # ---------------------------------------------------------------------------
 # Abstract base
 # ---------------------------------------------------------------------------
@@ -77,6 +86,11 @@ class ModelAdapter(ABC):
         device: torch.device,
         scaler: Optional[torch.amp.GradScaler], # type: ignore
         backpropagation: bool = True,
+        *,
+        zero_grad: bool = True,
+        step_optimizer: bool = True,
+        loss_divisor: float = 1.0,
+        max_grad_norm: Optional[float] = None,
     ) -> StepOutput:
         """One training iteration on *batch*."""
 
@@ -124,16 +138,22 @@ class StandardAdapter(ModelAdapter):
     def train_step(
         self, batch, batch_idx, optimizer, lr_scheduler, device, scaler,
         backpropagation=True,
+        *,
+        zero_grad: bool = True,
+        step_optimizer: bool = True,
+        loss_divisor: float = 1.0,
+        max_grad_norm: Optional[float] = None,
     ) -> StepOutput:
         data, label = batch
         data = data.to(device, non_blocking=True)
         label = label.to(device, non_blocking=True)
 
-        if backpropagation and optimizer is not None:
+        if backpropagation and optimizer is not None and zero_grad:
             optimizer.zero_grad(set_to_none=True)
 
         use_amp = scaler is not None
         optimizer_was_run = False
+        clip_grad_norm = _resolve_max_grad_norm(max_grad_norm, self._clip_grad_norm)
         if use_amp:
             with torch.amp.autocast(device.type):               # type: ignore
                 outputs = self._model(data)
@@ -141,22 +161,26 @@ class StandardAdapter(ModelAdapter):
             if backpropagation:
                 assert optimizer is not None
                 assert scaler is not None
-                scaler.scale(loss).backward()
-                if self._clip_grad_norm is not None:
-                    scaler.unscale_(optimizer)                  # type: ignore
-                    nn.utils.clip_grad_norm_(self._model.parameters(), self._clip_grad_norm)
-                optimizer_was_run = _step_optimizer_with_scaler(scaler, optimizer)
+                loss_for_backward = loss / loss_divisor
+                scaler.scale(loss_for_backward).backward()
+                if step_optimizer:
+                    if clip_grad_norm is not None:
+                        scaler.unscale_(optimizer)              # type: ignore
+                        nn.utils.clip_grad_norm_(self._model.parameters(), clip_grad_norm)
+                    optimizer_was_run = _step_optimizer_with_scaler(scaler, optimizer)
         else:
             outputs = self._model(data)
             loss = self._criterion(outputs, label)
             if backpropagation and optimizer is not None:
-                loss.backward()
-                if self._clip_grad_norm is not None:
-                    nn.utils.clip_grad_norm_(self._model.parameters(), self._clip_grad_norm)
-                optimizer.step()
-                optimizer_was_run = True
+                loss_for_backward = loss / loss_divisor
+                loss_for_backward.backward()
+                if step_optimizer:
+                    if clip_grad_norm is not None:
+                        nn.utils.clip_grad_norm_(self._model.parameters(), clip_grad_norm)
+                    optimizer.step()
+                    optimizer_was_run = True
 
-        if backpropagation and lr_scheduler is not None and optimizer_was_run:
+        if backpropagation and step_optimizer and lr_scheduler is not None and optimizer_was_run:
             lr_scheduler.step()
 
         # Accuracy is well-defined for standard classification logits even if
@@ -172,6 +196,7 @@ class StandardAdapter(ModelAdapter):
             loss=loss.item(),
             sample_count=label.size(0),
             correct_count=correct, # type: ignore
+            optimizer_was_run=optimizer_was_run,
         )
 
     # ---- validation ----
@@ -223,18 +248,30 @@ class LightningAdapter(ModelAdapter):
     def train_step(
         self, batch, batch_idx, optimizer, lr_scheduler, device, scaler,
         backpropagation=True,
+        *,
+        zero_grad: bool = True,
+        step_optimizer: bool = True,
+        loss_divisor: float = 1.0,
+        max_grad_norm: Optional[float] = None,
     ) -> StepOutput:
         batch = _to_device(batch, device)
 
-        if backpropagation and optimizer is not None:
+        if backpropagation and optimizer is not None and zero_grad:
             optimizer.zero_grad(set_to_none=True)
 
         loss, batch_accuracy = self._model.training_step(batch, batch_idx)  # type: ignore
 
+        optimizer_was_run = False
         if backpropagation:
-            loss.backward()                                                                        # type: ignore
-            self._model.optimizer_step(0, batch_idx, optimizer, optimizer_closure=None)            # type: ignore
-            if lr_scheduler is not None:
+            loss_for_backward = loss / loss_divisor                                                # type: ignore
+            loss_for_backward.backward()                                                           # type: ignore
+            if step_optimizer:
+                assert optimizer is not None
+                if max_grad_norm is not None:
+                    nn.utils.clip_grad_norm_(self._model.parameters(), max_grad_norm)
+                self._model.optimizer_step(0, batch_idx, optimizer, optimizer_closure=None)        # type: ignore
+                optimizer_was_run = True
+            if step_optimizer and lr_scheduler is not None and optimizer_was_run:
                 lr_scheduler.step()
 
         # infer batch size
@@ -249,6 +286,7 @@ class LightningAdapter(ModelAdapter):
             loss=loss.item(),                                                                      # type: ignore
             sample_count=bs,
             correct_count=int(batch_accuracy.item() * bs) if batch_accuracy is not None else None, # type: ignore
+            optimizer_was_run=optimizer_was_run,
         )
 
     # ---- validation ----
@@ -289,8 +327,9 @@ class DiffusionAdapter(ModelAdapter):
     EMA update happens in ``post_train_step``.
     """
 
-    def __init__(self, diffusion_model: nn.Module):
+    def __init__(self, diffusion_model: nn.Module, clip_grad_norm: Optional[float] = None):
         self._model = diffusion_model
+        self._clip_grad_norm = clip_grad_norm
 
     def get_model(self) -> nn.Module:
         return self._model
@@ -300,36 +339,52 @@ class DiffusionAdapter(ModelAdapter):
     def train_step(
         self, batch, batch_idx, optimizer, lr_scheduler, device, scaler,
         backpropagation=True,
+        *,
+        zero_grad: bool = True,
+        step_optimizer: bool = True,
+        loss_divisor: float = 1.0,
+        max_grad_norm: Optional[float] = None,
     ) -> StepOutput:
         data, label = batch
         data = data.to(device, non_blocking=True)
 
-        if backpropagation and optimizer is not None:
+        if backpropagation and optimizer is not None and zero_grad:
             optimizer.zero_grad(set_to_none=True)
 
         use_amp = scaler is not None
         optimizer_was_run = False
+        clip_grad_norm = _resolve_max_grad_norm(max_grad_norm, self._clip_grad_norm)
         if use_amp:
             with torch.amp.autocast(device.type): # type: ignore
                 loss = self._model(data)
             if backpropagation:
                 assert optimizer is not None
                 assert scaler is not None
-                scaler.scale(loss).backward()
-                optimizer_was_run = _step_optimizer_with_scaler(scaler, optimizer)
+                loss_for_backward = loss / loss_divisor
+                scaler.scale(loss_for_backward).backward()
+                if step_optimizer:
+                    if clip_grad_norm is not None:
+                        scaler.unscale_(optimizer)              # type: ignore
+                        nn.utils.clip_grad_norm_(self._model.parameters(), clip_grad_norm)
+                    optimizer_was_run = _step_optimizer_with_scaler(scaler, optimizer)
         else:
             loss = self._model(data)
             if backpropagation and optimizer is not None:
-                loss.backward()
-                optimizer.step()
-                optimizer_was_run = True
+                loss_for_backward = loss / loss_divisor
+                loss_for_backward.backward()
+                if step_optimizer:
+                    if clip_grad_norm is not None:
+                        nn.utils.clip_grad_norm_(self._model.parameters(), clip_grad_norm)
+                    optimizer.step()
+                    optimizer_was_run = True
 
-        if backpropagation and lr_scheduler is not None and optimizer_was_run:
+        if backpropagation and step_optimizer and lr_scheduler is not None and optimizer_was_run:
             lr_scheduler.step()
 
         return StepOutput(
             loss=loss.item(),
             sample_count=data.size(0),
+            optimizer_was_run=optimizer_was_run,
         )
 
     def post_train_step(self) -> None:
@@ -376,6 +431,11 @@ class CustomStepAdapter(ModelAdapter):
     def train_step(
         self, batch, batch_idx, optimizer, lr_scheduler, device, scaler,
         backpropagation=True,
+        *,
+        zero_grad: bool = True,
+        step_optimizer: bool = True,
+        loss_divisor: float = 1.0,
+        max_grad_norm: Optional[float] = None,
     ) -> StepOutput:
         batch = _to_device(batch, device)
         effective_optimizer = optimizer if backpropagation else None
@@ -414,7 +474,7 @@ def clone_adapter_for_model(
             raise TypeError("LightningAdapter requires a LightningModule model")
         return LightningAdapter(model)
     if isinstance(adapter, DiffusionAdapter):
-        return DiffusionAdapter(model)
+        return DiffusionAdapter(model, clip_grad_norm=adapter._clip_grad_norm)
     if isinstance(adapter, CustomStepAdapter):
         return CustomStepAdapter(
             model,

@@ -218,8 +218,8 @@ def training_model(
         train_result = train(
             adapter,
             dataloader,
-            optimizer,
-            lr_scheduler,
+            optimizer, # type: ignore
+            lr_scheduler, # type: ignore
             device=device,
             scaler=scaler,
             gradient_accumulate_every=arg_ml_setup.gradient_accumulate_every,

@@ -6,7 +6,7 @@ This is the next step after generating FGSM / PGD / CW examples:
 1. load saved adversarial images from a generator output folder
 2. pair each adversarial image with its clean ImageNet sample
 3. choose one teacher attack per source image
-4. save sharded tensors for later latent-perturbation training
+4. save clean/teacher-adv image pairs plus a manifest for later latent-perturbation training
 
 The script expects a generator-style ``manifest.jsonl`` so it can recover the
 source dataset index for each saved adversarial image.
@@ -161,7 +161,7 @@ def parse_args() -> argparse.Namespace:
         "--shard-size",
         type=int,
         default=256,
-        help="Number of selected pairs per saved shard.",
+        help="Deprecated legacy shard setting. Ignored because teacher-bank pairs are now saved as per-sample PNG files.",
     )
     parser.add_argument(
         "--device",
@@ -533,68 +533,71 @@ def choose_teacher(
     return min(scored_candidates, key=ranking_l2), "untargeted_fallback_min_l2"
 
 
-def flush_shard(
-    output_dir: Path,
-    shard_id: int,
-    shard_rows: list[dict[str, Any]],
-    selected_manifest_rows: list[dict[str, Any]],
-    shard_lookup_updates: list[tuple[int, Path, int]],
+def denormalize_to_pil(image: torch.Tensor) -> Image.Image:
+    mean = torch.tensor(IMAGENET_MEAN, dtype=torch.float32).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, dtype=torch.float32).view(3, 1, 1)
+    pixels = image.detach().cpu().to(dtype=torch.float32) * std + mean
+    pixels = pixels.clamp(0.0, 1.0)
+    array = (
+        pixels.mul(255.0)
+        .round()
+        .to(dtype=torch.uint8)
+        .permute(1, 2, 0)
+        .contiguous()
+        .numpy()
+    )
+    return Image.fromarray(array)
+
+
+def build_clean_bank_rel_path(split_name: str, source_label: int, source_index: int) -> Path:
+    return Path("clean_images") / split_name / f"class_{source_label:04d}" / f"source_{source_index:08d}.png"
+
+
+def build_teacher_adv_bank_rel_path(
+    split_name: str,
+    source_label: int,
+    source_index: int,
+    target_label: Optional[int],
+    attack_name: str,
 ) -> Path:
-    shards_dir = output_dir / "shards"
-    shards_dir.mkdir(parents=True, exist_ok=True)
-    shard_path = shards_dir / f"teacher_bank_{shard_id:05d}.pt"
+    stem = f"source_{source_index:08d}_attack_{attack_name}"
+    if target_label is not None:
+        stem = f"{stem}_target_{target_label:04d}"
+    return Path("teacher_adv_images") / split_name / f"class_{source_label:04d}" / f"{stem}.png"
 
-    payload = {
-        "clean_images": torch.stack([row["clean_image"] for row in shard_rows]),
-        "teacher_advs": torch.stack([row["teacher_adv"] for row in shard_rows]),
-        "deltas": torch.stack([row["delta"] for row in shard_rows]),
-        "source_labels": torch.tensor([row["source_label"] for row in shard_rows], dtype=torch.long),
-        "target_labels": torch.tensor(
-            [row["target_label"] if row["target_label"] is not None else -1 for row in shard_rows],
-            dtype=torch.long,
-        ),
-        "source_indices": torch.tensor([row["source_index"] for row in shard_rows], dtype=torch.long),
-        "pred_labels": torch.tensor([row["pred_label"] for row in shard_rows], dtype=torch.long),
-        "selected_attack_names": [row["selected_attack_name"] for row in shard_rows],
-        "source_paths": [row["source_path"] for row in shard_rows],
-        "adv_paths": [row["adv_path"] for row in shard_rows],
-        "splits": [row["split"] for row in shard_rows],
-        "selection_rules": [row["selection_rule"] for row in shard_rows],
-        "source_confidences": torch.tensor(
-            [row["source_confidence"] if row["source_confidence"] is not None else float("nan") for row in shard_rows],
-            dtype=torch.float32,
-        ),
-        "target_confidences": torch.tensor(
-            [row["target_confidence"] if row["target_confidence"] is not None else float("nan") for row in shard_rows],
-            dtype=torch.float32,
-        ),
-        "manifest_pixel_l2": torch.tensor(
-            [row["manifest_pixel_l2"] if row["manifest_pixel_l2"] is not None else float("nan") for row in shard_rows],
-            dtype=torch.float32,
-        ),
-        "manifest_pixel_linf": torch.tensor(
-            [row["manifest_pixel_linf"] if row["manifest_pixel_linf"] is not None else float("nan") for row in shard_rows],
-            dtype=torch.float32,
-        ),
-        "reload_pixel_l2": torch.tensor([row["reload_pixel_l2"] for row in shard_rows], dtype=torch.float32),
-        "reload_pixel_linf": torch.tensor([row["reload_pixel_linf"] for row in shard_rows], dtype=torch.float32),
-        "untargeted_success": torch.tensor([row["untargeted_success"] for row in shard_rows], dtype=torch.bool),
-        "targeted_success": torch.tensor(
-            [row["targeted_success"] if row["targeted_success"] is not None else False for row in shard_rows],
-            dtype=torch.bool,
-        ),
-        "targeted_success_known": torch.tensor(
-            [row["targeted_success"] is not None for row in shard_rows],
-            dtype=torch.bool,
-        ),
-    }
-    torch.save(payload, shard_path)
 
-    for row, (_, _, offset) in zip(selected_manifest_rows, shard_lookup_updates):
-        row["shard_path"] = str(shard_path)
-        row["shard_offset"] = offset
+def save_teacher_bank_images(
+    output_dir: Path,
+    clean_tensor: torch.Tensor,
+    teacher_adv_tensor: torch.Tensor,
+    split_name: str,
+    source_label: int,
+    source_index: int,
+    target_label: Optional[int],
+    attack_name: str,
+    saved_clean_rel_paths: set[str],
+) -> tuple[str, str]:
+    clean_rel_path = build_clean_bank_rel_path(split_name, source_label, source_index)
+    teacher_adv_rel_path = build_teacher_adv_bank_rel_path(
+        split_name,
+        source_label,
+        source_index,
+        target_label,
+        attack_name,
+    )
 
-    return shard_path
+    clean_abs_path = output_dir / clean_rel_path
+    teacher_adv_abs_path = output_dir / teacher_adv_rel_path
+    clean_key = clean_rel_path.as_posix()
+
+    if clean_key not in saved_clean_rel_paths:
+        clean_abs_path.parent.mkdir(parents=True, exist_ok=True)
+        denormalize_to_pil(clean_tensor).save(clean_abs_path, format="PNG")
+        saved_clean_rel_paths.add(clean_key)
+
+    teacher_adv_abs_path.parent.mkdir(parents=True, exist_ok=True)
+    denormalize_to_pil(teacher_adv_tensor).save(teacher_adv_abs_path, format="PNG")
+    return clean_key, teacher_adv_rel_path.as_posix()
 
 
 def main() -> None:
@@ -660,17 +663,14 @@ def main() -> None:
         "warnings": [],
     }
 
-    selected_manifest_rows: list[dict[str, Any]] = []
     selected_attack_counter: Counter[str] = Counter()
     selection_rule_counter: Counter[str] = Counter()
     warned_train_split = False
+    saved_clean_rel_paths: set[str] = set()
+    max_abs_delta = 0.0
 
     progress = ProgressTracker(len(group_items))
     progress.update(0, 0, "starting")
-
-    shard_rows: list[dict[str, Any]] = []
-    shard_lookup_updates: list[tuple[int, Path, int]] = []
-    shard_id = 0
     completed_groups = 0
 
     selected_manifest_path = output_dir / "selected_teacher_manifest.jsonl"
@@ -722,29 +722,18 @@ def main() -> None:
                 summary["targeted_success_count"] += int(selected.targeted_success)
 
             delta_tensor = selected.adv_tensor - clean_tensor
-            shard_row = {
-                "clean_image": clean_tensor.cpu(),
-                "teacher_adv": selected.adv_tensor.cpu(),
-                "delta": delta_tensor.cpu(),
-                "source_label": source_label,
-                "target_label": target_label,
-                "source_index": source_index,
-                "pred_label": selected.pred_label,
-                "selected_attack_name": selected.candidate.attack_name,
-                "source_path": selected.candidate.source_path,
-                "adv_path": str(selected.candidate.saved_path),
-                "split": split_name,
-                "selection_rule": selection_rule,
-                "source_confidence": selected.source_confidence,
-                "target_confidence": selected.target_confidence,
-                "manifest_pixel_l2": selected.candidate.manifest_pixel_l2,
-                "manifest_pixel_linf": selected.candidate.manifest_pixel_linf,
-                "reload_pixel_l2": selected.reload_pixel_l2,
-                "reload_pixel_linf": selected.reload_pixel_linf,
-                "untargeted_success": selected.untargeted_success,
-                "targeted_success": selected.targeted_success,
-            }
-            shard_rows.append(shard_row)
+            max_abs_delta = max(max_abs_delta, float(delta_tensor.abs().max().item()))
+            clean_bank_path, teacher_adv_bank_path = save_teacher_bank_images(
+                output_dir=output_dir,
+                clean_tensor=clean_tensor,
+                teacher_adv_tensor=selected.adv_tensor,
+                split_name=split_name,
+                source_label=source_label,
+                source_index=source_index,
+                target_label=target_label,
+                attack_name=selected.candidate.attack_name,
+                saved_clean_rel_paths=saved_clean_rel_paths,
+            )
 
             manifest_row = {
                 "split": split_name,
@@ -755,6 +744,8 @@ def main() -> None:
                 "selected_attack_name": selected.candidate.attack_name,
                 "candidate_attack_names": [row.candidate.attack_name for row in scored_candidates],
                 "selected_adv_path": str(selected.candidate.saved_path),
+                "clean_bank_path": clean_bank_path,
+                "teacher_adv_bank_path": teacher_adv_bank_path,
                 "selection_rule": selection_rule,
                 "pred_label": selected.pred_label,
                 "source_confidence": selected.source_confidence,
@@ -765,18 +756,9 @@ def main() -> None:
                 "manifest_pixel_linf": selected.candidate.manifest_pixel_linf,
                 "reload_pixel_l2": selected.reload_pixel_l2,
                 "reload_pixel_linf": selected.reload_pixel_linf,
+                "bank_format": "image_pairs_png",
             }
-            selected_manifest_rows.append(manifest_row)
-            shard_lookup_updates.append((shard_id, selected.candidate.saved_path, len(shard_rows) - 1))
-
-            if len(shard_rows) >= args.shard_size:
-                shard_path = flush_shard(output_dir, shard_id, shard_rows, selected_manifest_rows[-len(shard_rows):], shard_lookup_updates)
-                LOGGER.info("saved shard %s", shard_path)
-                for row in selected_manifest_rows[-len(shard_rows):]:
-                    selected_manifest_file.write(json.dumps(row) + "\n")
-                shard_rows = []
-                shard_lookup_updates = []
-                shard_id += 1
+            selected_manifest_file.write(json.dumps(manifest_row) + "\n")
 
             progress.update(completed_groups, summary["selected_count"], f"selected {selected.candidate.attack_name}")
             if args.log_every > 0 and completed_groups % args.log_every == 0:
@@ -788,15 +770,13 @@ def main() -> None:
                     summary["selected_count"],
                 )
 
-        if shard_rows:
-            shard_slice = selected_manifest_rows[-len(shard_rows):]
-            shard_path = flush_shard(output_dir, shard_id, shard_rows, shard_slice, shard_lookup_updates)
-            LOGGER.info("saved shard %s", shard_path)
-            for row in shard_slice:
-                selected_manifest_file.write(json.dumps(row) + "\n")
-
     summary["selected_attack_counts"] = dict(sorted(selected_attack_counter.items()))
     summary["selection_rule_counts"] = dict(sorted(selection_rule_counter.items()))
+    summary["bank_format"] = "image_pairs_png"
+    summary["image_format"] = "png"
+    summary["clean_image_count"] = len(saved_clean_rel_paths)
+    summary["teacher_adv_image_count"] = summary["selected_count"]
+    summary["normalized_delta_abs_max"] = max_abs_delta
     summary["untargeted_success_rate"] = (
         summary["untargeted_success_count"] / summary["selected_count"] if summary["selected_count"] else 0.0
     )

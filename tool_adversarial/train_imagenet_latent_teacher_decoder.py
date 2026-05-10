@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import os
+import random
 import ssl
 import sys
 import time
@@ -30,7 +31,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
-from torch.utils.data import DataLoader, Dataset
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
+from torchvision import transforms
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -57,8 +60,11 @@ class TeacherBankRecord:
     selected_adv_path: str
     selection_rule: str
     pred_label: int
-    shard_path: Path
-    shard_offset: int
+    clean_bank_path: Optional[Path] = None
+    teacher_adv_bank_path: Optional[Path] = None
+    shard_path: Optional[Path] = None
+    shard_offset: Optional[int] = None
+    latent_index: int = -1
 
 
 @dataclass
@@ -101,27 +107,38 @@ class TeacherBankDataset(Dataset):
         *,
         latent_index_offset: int = 0,
         max_open_shards: int = 2,
+        image_transform: Optional[transforms.Compose] = None,
     ) -> None:
         self.records = records
         self.latent_index_offset = latent_index_offset
         self.shard_cache = ShardCache(max_open_shards=max_open_shards)
+        self.image_transform = image_transform or build_teacher_bank_image_transform()
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, index: int):
         record = self.records[index]
-        payload = self.shard_cache.get(record.shard_path)
-        offset = record.shard_offset
+        if record.clean_bank_path is not None and record.teacher_adv_bank_path is not None:
+            clean_image = load_teacher_bank_image(record.clean_bank_path, self.image_transform)
+            teacher_adv = load_teacher_bank_image(record.teacher_adv_bank_path, self.image_transform)
+            source_label = record.source_label
+            target_label_raw = record.target_label if record.target_label is not None else -1
+            teacher_pred_label = record.pred_label
+        else:
+            if record.shard_path is None or record.shard_offset is None:
+                raise ValueError(f"teacher-bank record is missing both image paths and shard info: {record}")
+            payload = self.shard_cache.get(record.shard_path)
+            offset = record.shard_offset
 
-        clean_image = payload["clean_images"][offset]
-        teacher_adv = payload["teacher_advs"][offset]
-        source_label = int(payload["source_labels"][offset].item())
-        target_label_raw = int(payload["target_labels"][offset].item())
-        teacher_pred_label = int(payload["pred_labels"][offset].item())
+            clean_image = payload["clean_images"][offset].to(dtype=torch.float32)
+            teacher_adv = payload["teacher_advs"][offset].to(dtype=torch.float32)
+            source_label = int(payload["source_labels"][offset].item())
+            target_label_raw = int(payload["target_labels"][offset].item())
+            teacher_pred_label = int(payload["pred_labels"][offset].item())
 
         target_label = target_label_raw if target_label_raw >= 0 else -1
-        latent_index = index + self.latent_index_offset
+        latent_index = record.latent_index if record.latent_index >= 0 else index + self.latent_index_offset
         return (
             latent_index,
             clean_image,
@@ -130,6 +147,86 @@ class TeacherBankDataset(Dataset):
             target_label,
             teacher_pred_label,
         )
+
+
+class WorkerShardTeacherBankDataset(IterableDataset):
+    """Assign complete shard files to different workers to avoid overlap."""
+
+    def __init__(
+        self,
+        records: list[TeacherBankRecord],
+        *,
+        max_open_shards: int = 1,
+        seed: int = 7,
+        shuffle: bool = True,
+    ) -> None:
+        super().__init__()
+        self.records = records
+        self.max_open_shards = max_open_shards
+        self.seed = seed
+        self.shuffle = shuffle
+        self.epoch = 0
+        grouped: OrderedDict[Path, list[TeacherBankRecord]] = OrderedDict()
+        for record in records:
+            if record.shard_path is None:
+                raise ValueError("WorkerShardTeacherBankDataset only supports legacy shard-backed teacher banks")
+            grouped.setdefault(record.shard_path.resolve(), []).append(record)
+        self.records_by_shard = grouped
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self):
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+
+        rng = random.Random(self.seed + self.epoch)
+        shard_paths = list(self.records_by_shard.keys())
+        if self.shuffle:
+            rng.shuffle(shard_paths)
+
+        assigned_shards = shard_paths[worker_id::num_workers]
+        cache = ShardCache(max_open_shards=self.max_open_shards)
+
+        for shard_path in assigned_shards:
+            shard_records = list(self.records_by_shard[shard_path])
+            if self.shuffle:
+                rng.shuffle(shard_records)
+
+            payload = cache.get(shard_path)
+            for record in shard_records:
+                if record.shard_offset is None:
+                    raise ValueError(f"legacy shard-backed record is missing shard_offset: {record}")
+                offset = record.shard_offset
+                clean_image = payload["clean_images"][offset].to(dtype=torch.float32)
+                teacher_adv = payload["teacher_advs"][offset].to(dtype=torch.float32)
+                source_label = int(payload["source_labels"][offset].item())
+                target_label_raw = int(payload["target_labels"][offset].item())
+                teacher_pred_label = int(payload["pred_labels"][offset].item())
+                target_label = target_label_raw if target_label_raw >= 0 else -1
+                yield (
+                    record.latent_index,
+                    clean_image,
+                    teacher_adv,
+                    source_label,
+                    target_label,
+                    teacher_pred_label,
+                )
+
+
+def build_teacher_bank_image_transform() -> transforms.Compose:
+    return transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
+    )
+
+
+def load_teacher_bank_image(path: Path, image_transform: transforms.Compose) -> torch.Tensor:
+    with Image.open(path) as image:
+        return image_transform(image.convert("RGB"))
 
 
 class LatentGridDecoder(nn.Module):
@@ -272,7 +369,7 @@ def parse_args() -> argparse.Namespace:
         "--num-workers",
         type=int,
         default=0,
-        help="Dataloader workers.",
+        help="Training dataloader workers. Image-pair banks use standard sample-level loading; legacy shard banks assign full shards to different workers.",
     )
     parser.add_argument(
         "--lr-decoder",
@@ -322,7 +419,7 @@ def parse_args() -> argparse.Namespace:
         "--max-open-shards",
         type=int,
         default=2,
-        help="How many teacher-bank shard files to keep cached at once per process.",
+        help="How many legacy teacher-bank shard files to keep cached at once per process. Ignored for image-pair banks.",
     )
     parser.add_argument(
         "--device",
@@ -530,19 +627,32 @@ def resolve_teacher_bank_root(input_root: Path) -> Path:
     )
 
 
+def resolve_manifest_relative_path(value: Optional[str], manifest_root: Path) -> Optional[Path]:
+    if not value:
+        return None
+    candidate = Path(value)
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (manifest_root / candidate).resolve()
+
+
 def load_teacher_bank_records(manifest_path: Path) -> list[TeacherBankRecord]:
     records: list[TeacherBankRecord] = []
+    manifest_root = manifest_path.resolve().parent
     with manifest_path.open("r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
             if not line:
                 continue
             row = json.loads(line)
-            shard_path = row.get("shard_path")
+            clean_bank_path = resolve_manifest_relative_path(row.get("clean_bank_path"), manifest_root)
+            teacher_adv_bank_path = resolve_manifest_relative_path(row.get("teacher_adv_bank_path"), manifest_root)
+            shard_path = resolve_manifest_relative_path(row.get("shard_path"), manifest_root)
             shard_offset = row.get("shard_offset")
-            if not shard_path or shard_offset is None:
+            if (clean_bank_path is None or teacher_adv_bank_path is None) and (shard_path is None or shard_offset is None):
                 raise ValueError(
-                    f"manifest row is missing shard_path/shard_offset: {row}"
+                    "manifest row is missing teacher-bank storage pointers. "
+                    f"Expected clean_bank_path/teacher_adv_bank_path or shard_path/shard_offset: {row}"
                 )
             records.append(
                 TeacherBankRecord(
@@ -555,11 +665,25 @@ def load_teacher_bank_records(manifest_path: Path) -> list[TeacherBankRecord]:
                     selected_adv_path=str(row["selected_adv_path"]),
                     selection_rule=str(row["selection_rule"]),
                     pred_label=int(row["pred_label"]),
-                    shard_path=Path(shard_path).resolve(),
-                    shard_offset=int(shard_offset),
+                    clean_bank_path=clean_bank_path,
+                    teacher_adv_bank_path=teacher_adv_bank_path,
+                    shard_path=shard_path,
+                    shard_offset=int(shard_offset) if shard_offset is not None else None,
                 )
             )
     return records
+
+
+def infer_teacher_bank_storage_mode(records: list[TeacherBankRecord]) -> str:
+    has_images = any(record.clean_bank_path is not None and record.teacher_adv_bank_path is not None for record in records)
+    has_shards = any(record.shard_path is not None and record.shard_offset is not None for record in records)
+    if has_images and not has_shards:
+        return "images"
+    if has_shards and not has_images:
+        return "shards"
+    if has_images and has_shards:
+        return "mixed"
+    raise ValueError("teacher-bank manifest has no usable storage pointers")
 
 
 def split_records(
@@ -586,24 +710,64 @@ def split_records(
     return train_rows, val_rows, "random_holdout"
 
 
+def assign_latent_indices(records: list[TeacherBankRecord]) -> None:
+    for latent_index, record in enumerate(records):
+        record.latent_index = latent_index
+
+
+def load_teacher_bank_summary(teacher_bank_root: Path) -> dict[str, Any]:
+    summary_path = teacher_bank_root / "teacher_bank_summary.json"
+    if not summary_path.exists():
+        return {}
+    with summary_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def resolve_decoder_scale(
     decoder_scale_arg: str,
     train_records: list[TeacherBankRecord],
     max_open_shards: int,
+    image_transform: transforms.Compose,
+    teacher_bank_summary: dict[str, Any],
 ) -> float:
     if decoder_scale_arg != "auto":
         return float(decoder_scale_arg)
 
-    cache = ShardCache(max_open_shards=max_open_shards)
-    shard_to_offsets: dict[Path, list[int]] = {}
-    for record in train_records:
-        shard_to_offsets.setdefault(record.shard_path, []).append(record.shard_offset)
+    summary_max_abs = teacher_bank_summary.get("normalized_delta_abs_max")
+    if summary_max_abs is not None:
+        summary_max_abs = float(summary_max_abs)
+        if summary_max_abs > 0:
+            return summary_max_abs
 
-    max_abs = 0.0
-    for shard_path, offsets in shard_to_offsets.items():
-        payload = cache.get(shard_path)
-        deltas = payload["deltas"][offsets]
-        max_abs = max(max_abs, float(deltas.abs().max().item()))
+    storage_mode = infer_teacher_bank_storage_mode(train_records)
+    if storage_mode == "shards":
+        cache = ShardCache(max_open_shards=max_open_shards)
+        shard_to_offsets: dict[Path, list[int]] = {}
+        for record in train_records:
+            assert record.shard_path is not None
+            assert record.shard_offset is not None
+            shard_to_offsets.setdefault(record.shard_path, []).append(record.shard_offset)
+
+        max_abs = 0.0
+        for shard_path, offsets in shard_to_offsets.items():
+            payload = cache.get(shard_path)
+            deltas = payload["deltas"][offsets]
+            max_abs = max(max_abs, float(deltas.abs().max().item()))
+    else:
+        max_abs = 0.0
+        cache = ShardCache(max_open_shards=max_open_shards)
+        for record in train_records:
+            if record.clean_bank_path is not None and record.teacher_adv_bank_path is not None:
+                clean_image = load_teacher_bank_image(record.clean_bank_path, image_transform)
+                teacher_adv = load_teacher_bank_image(record.teacher_adv_bank_path, image_transform)
+            elif record.shard_path is not None and record.shard_offset is not None:
+                payload = cache.get(record.shard_path)
+                clean_image = payload["clean_images"][record.shard_offset].to(dtype=torch.float32)
+                teacher_adv = payload["teacher_advs"][record.shard_offset].to(dtype=torch.float32)
+            else:
+                raise ValueError(f"teacher-bank record is missing both image paths and shard info: {record}")
+            delta = teacher_adv - clean_image
+            max_abs = max(max_abs, float(delta.abs().max().item()))
 
     if max_abs <= 0:
         raise ValueError("could not infer a positive decoder scale from the teacher bank")
@@ -733,6 +897,7 @@ def train_decoder(
     classifier: nn.Module,
     decoder: LatentGridDecoder,
     latent_bank: PerSampleLatentBank,
+    stream_dataset: Optional[WorkerShardTeacherBankDataset],
     loader: DataLoader,
     low: torch.Tensor,
     high: torch.Tensor,
@@ -755,6 +920,8 @@ def train_decoder(
 
     for epoch in range(1, epochs + 1):
         epoch_start = time.time()
+        if stream_dataset is not None:
+            stream_dataset.set_epoch(epoch)
         decoder.train()
         latent_bank.train()
         sums: dict[str, float] = {}
@@ -987,10 +1154,13 @@ def main() -> None:
     )
     output_dir = Path(args.output_dir).resolve() if args.output_dir else teacher_bank_root / "latent_decoder"
     output_dir.mkdir(parents=True, exist_ok=True)
+    teacher_bank_summary = load_teacher_bank_summary(teacher_bank_root)
+    image_transform = build_teacher_bank_image_transform()
 
     all_records = load_teacher_bank_records(teacher_manifest_path)
     if not all_records:
         raise ValueError(f"no teacher-bank records found in {teacher_manifest_path}")
+    storage_mode = infer_teacher_bank_storage_mode(all_records)
 
     train_records, val_records, split_strategy = split_records(
         all_records,
@@ -999,8 +1169,15 @@ def main() -> None:
     )
     if not train_records:
         raise ValueError("no training records available after splitting")
+    assign_latent_indices(train_records)
 
-    decoder_scale = resolve_decoder_scale(args.decoder_scale, train_records, args.max_open_shards)
+    decoder_scale = resolve_decoder_scale(
+        args.decoder_scale,
+        train_records,
+        args.max_open_shards,
+        image_transform,
+        teacher_bank_summary,
+    )
     classifier, resolved_model_type, resolved_dataset_type = resolve_model(args, device)
     low, high = normalized_pixel_bounds(device)
     weights = LossWeights(
@@ -1017,16 +1194,31 @@ def main() -> None:
         train_records,
         latent_index_offset=0,
         max_open_shards=args.max_open_shards,
+        image_transform=image_transform,
     )
     val_dataset = TeacherBankDataset(
         val_records,
         latent_index_offset=0,
         max_open_shards=args.max_open_shards,
+        image_transform=image_transform,
     )
+    train_stream_dataset: Optional[WorkerShardTeacherBankDataset] = None
+    train_loader_shuffle = True
+    train_loader_dataset: Dataset | IterableDataset = train_dataset
+    if storage_mode == "shards":
+        train_stream_dataset = WorkerShardTeacherBankDataset(
+            train_records,
+            max_open_shards=1,
+            seed=args.seed,
+            shuffle=True,
+        )
+        train_loader_dataset = train_stream_dataset
+        train_loader_shuffle = False
+
     train_loader = DataLoader(
-        train_dataset,
+        train_loader_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=train_loader_shuffle,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
     )
@@ -1034,14 +1226,14 @@ def main() -> None:
         train_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=0,
         pin_memory=(device.type == "cuda"),
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=0,
         pin_memory=(device.type == "cuda"),
     )
 
@@ -1073,6 +1265,7 @@ def main() -> None:
         "classifier_model_type": resolved_model_type,
         "classifier_dataset_type": resolved_dataset_type,
         "device": str(device),
+        "teacher_bank_storage_mode": storage_mode,
         "split_strategy": split_strategy,
         "train_count": len(train_dataset),
         "val_count": len(val_dataset),
@@ -1085,6 +1278,7 @@ def main() -> None:
         classifier=classifier,
         decoder=decoder,
         latent_bank=latent_bank,
+        stream_dataset=train_stream_dataset,
         loader=train_loader,
         low=low,
         high=high,
@@ -1145,6 +1339,7 @@ def main() -> None:
         "classifier_model_type": resolved_model_type,
         "classifier_dataset_type": resolved_dataset_type,
         "device": str(device),
+        "teacher_bank_storage_mode": storage_mode,
         "split_strategy": split_strategy,
         "train_count": len(train_dataset),
         "val_count": len(val_dataset),

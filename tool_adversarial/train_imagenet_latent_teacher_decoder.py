@@ -18,11 +18,9 @@ import json
 import logging
 import math
 import os
-import random
 import ssl
 import sys
 import time
-from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -32,7 +30,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -60,10 +58,8 @@ class TeacherBankRecord:
     selected_adv_path: str
     selection_rule: str
     pred_label: int
-    clean_bank_path: Optional[Path] = None
-    teacher_adv_bank_path: Optional[Path] = None
-    shard_path: Optional[Path] = None
-    shard_offset: Optional[int] = None
+    clean_bank_path: Path
+    teacher_adv_bank_path: Path
     latent_index: int = -1
 
 
@@ -78,40 +74,10 @@ class LossWeights:
     latent: float
 
 
-class ShardCache:
-    """Small LRU cache for teacher-bank shard payloads."""
-
-    def __init__(self, max_open_shards: int = 2) -> None:
-        self.max_open_shards = max_open_shards
-        self._cache: OrderedDict[Path, dict[str, Any]] = OrderedDict()
-
-    def get(self, shard_path: Path) -> dict[str, Any]:
-        shard_path = shard_path.resolve()
-        payload = self._cache.get(shard_path)
-        if payload is not None:
-            self._cache.move_to_end(shard_path)
-            return payload
-
-        payload = torch.load(shard_path, map_location="cpu")
-        self._cache[shard_path] = payload
-        self._cache.move_to_end(shard_path)
-        while len(self._cache) > self.max_open_shards:
-            self._cache.popitem(last=False)
-        return payload
-
-
 class TeacherBankDataset(Dataset):
-    def __init__(
-        self,
-        records: list[TeacherBankRecord],
-        *,
-        latent_index_offset: int = 0,
-        max_open_shards: int = 2,
-        image_transform: Optional[transforms.Compose] = None,
-    ) -> None:
+    def __init__(self, records: list[TeacherBankRecord], *, latent_index_offset: int = 0, image_transform: Optional[transforms.Compose] = None) -> None:
         self.records = records
         self.latent_index_offset = latent_index_offset
-        self.shard_cache = ShardCache(max_open_shards=max_open_shards)
         self.image_transform = image_transform or build_teacher_bank_image_transform()
 
     def __len__(self) -> int:
@@ -119,24 +85,11 @@ class TeacherBankDataset(Dataset):
 
     def __getitem__(self, index: int):
         record = self.records[index]
-        if record.clean_bank_path is not None and record.teacher_adv_bank_path is not None:
-            clean_image = load_teacher_bank_image(record.clean_bank_path, self.image_transform)
-            teacher_adv = load_teacher_bank_image(record.teacher_adv_bank_path, self.image_transform)
-            source_label = record.source_label
-            target_label_raw = record.target_label if record.target_label is not None else -1
-            teacher_pred_label = record.pred_label
-        else:
-            if record.shard_path is None or record.shard_offset is None:
-                raise ValueError(f"teacher-bank record is missing both image paths and shard info: {record}")
-            payload = self.shard_cache.get(record.shard_path)
-            offset = record.shard_offset
-
-            clean_image = payload["clean_images"][offset].to(dtype=torch.float32)
-            teacher_adv = payload["teacher_advs"][offset].to(dtype=torch.float32)
-            source_label = int(payload["source_labels"][offset].item())
-            target_label_raw = int(payload["target_labels"][offset].item())
-            teacher_pred_label = int(payload["pred_labels"][offset].item())
-
+        clean_image = load_teacher_bank_image(record.clean_bank_path, self.image_transform)
+        teacher_adv = load_teacher_bank_image(record.teacher_adv_bank_path, self.image_transform)
+        source_label = record.source_label
+        target_label_raw = record.target_label if record.target_label is not None else -1
+        teacher_pred_label = record.pred_label
         target_label = target_label_raw if target_label_raw >= 0 else -1
         latent_index = record.latent_index if record.latent_index >= 0 else index + self.latent_index_offset
         return (
@@ -147,72 +100,6 @@ class TeacherBankDataset(Dataset):
             target_label,
             teacher_pred_label,
         )
-
-
-class WorkerShardTeacherBankDataset(IterableDataset):
-    """Assign complete shard files to different workers to avoid overlap."""
-
-    def __init__(
-        self,
-        records: list[TeacherBankRecord],
-        *,
-        max_open_shards: int = 1,
-        seed: int = 7,
-        shuffle: bool = True,
-    ) -> None:
-        super().__init__()
-        self.records = records
-        self.max_open_shards = max_open_shards
-        self.seed = seed
-        self.shuffle = shuffle
-        self.epoch = 0
-        grouped: OrderedDict[Path, list[TeacherBankRecord]] = OrderedDict()
-        for record in records:
-            if record.shard_path is None:
-                raise ValueError("WorkerShardTeacherBankDataset only supports legacy shard-backed teacher banks")
-            grouped.setdefault(record.shard_path.resolve(), []).append(record)
-        self.records_by_shard = grouped
-
-    def set_epoch(self, epoch: int) -> None:
-        self.epoch = epoch
-
-    def __iter__(self):
-        worker_info = get_worker_info()
-        worker_id = worker_info.id if worker_info is not None else 0
-        num_workers = worker_info.num_workers if worker_info is not None else 1
-
-        rng = random.Random(self.seed + self.epoch)
-        shard_paths = list(self.records_by_shard.keys())
-        if self.shuffle:
-            rng.shuffle(shard_paths)
-
-        assigned_shards = shard_paths[worker_id::num_workers]
-        cache = ShardCache(max_open_shards=self.max_open_shards)
-
-        for shard_path in assigned_shards:
-            shard_records = list(self.records_by_shard[shard_path])
-            if self.shuffle:
-                rng.shuffle(shard_records)
-
-            payload = cache.get(shard_path)
-            for record in shard_records:
-                if record.shard_offset is None:
-                    raise ValueError(f"legacy shard-backed record is missing shard_offset: {record}")
-                offset = record.shard_offset
-                clean_image = payload["clean_images"][offset].to(dtype=torch.float32)
-                teacher_adv = payload["teacher_advs"][offset].to(dtype=torch.float32)
-                source_label = int(payload["source_labels"][offset].item())
-                target_label_raw = int(payload["target_labels"][offset].item())
-                teacher_pred_label = int(payload["pred_labels"][offset].item())
-                target_label = target_label_raw if target_label_raw >= 0 else -1
-                yield (
-                    record.latent_index,
-                    clean_image,
-                    teacher_adv,
-                    source_label,
-                    target_label,
-                    teacher_pred_label,
-                )
 
 
 def build_teacher_bank_image_transform() -> transforms.Compose:
@@ -270,132 +157,27 @@ def parse_args() -> argparse.Namespace:
         description="Train a latent perturbation decoder from a teacher-bank dataset.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "input_root",
-        type=str,
-        help="Either the teacher_bank folder or the parent adversarial root that contains a teacher_bank subfolder.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=None,
-        help="Folder for checkpoints and reports. Defaults to <teacher_bank_root>/latent_decoder.",
-    )
-    parser.add_argument(
-        "--teacher-manifest-path",
-        type=str,
-        default=None,
-        help="Optional path to selected_teacher_manifest.jsonl. If omitted, it is discovered from the input root.",
-    )
-    parser.add_argument(
-        "--model-type",
-        type=str,
-        default=None,
-        help="LLR2 model type name. If omitted, it will be inferred from --checkpoint when possible.",
-    )
-    parser.add_argument(
-        "--dataset-type",
-        type=str,
-        default="imagenet1k",
-        choices=SUPPORTED_DATASETS,
-        help="ImageNet dataset variant used to rebuild the classifier architecture.",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=None,
-        help="Optional LLR2 .model.pt classifier checkpoint used for the original attacks.",
-    )
-    parser.add_argument(
-        "--use-torchvision-pretrained",
-        action="store_true",
-        help="Use torchvision ImageNet pretrained weights instead of an LLR2 checkpoint.",
-    )
-    parser.add_argument(
-        "--preset",
-        type=int,
-        default=0,
-        help="LLR2 ImageNet preset used when rebuilding the classifier architecture.",
-    )
-    parser.add_argument(
-        "--holdout-fraction",
-        type=float,
-        default=0.1,
-        help="Validation fraction used only when the teacher-bank manifest does not contain an explicit train split.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=7,
-        help="Random seed for data splitting and initialization.",
-    )
-    parser.add_argument(
-        "--grid-size",
-        type=int,
-        default=20,
-        help="Latent grid size.",
-    )
-    parser.add_argument(
-        "--latent-channels",
-        type=int,
-        default=3,
-        help="Number of channels in the learned latent grid.",
-    )
-    parser.add_argument(
-        "--hidden-channels",
-        type=int,
-        default=24,
-        help="Hidden channels inside the shared latent decoder.",
-    )
-    parser.add_argument(
-        "--decoder-scale",
-        type=str,
-        default="auto",
-        help="Scale used for decoder output in normalized space. Use 'auto' to infer it from the training deltas.",
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=10,
-        help="Training epochs.",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=32,
-        help="Training batch size.",
-    )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=0,
-        help="Training dataloader workers. Image-pair banks use standard sample-level loading; legacy shard banks assign full shards to different workers.",
-    )
-    parser.add_argument(
-        "--lr-decoder",
-        type=float,
-        default=1e-3,
-        help="Learning rate for the shared decoder.",
-    )
-    parser.add_argument(
-        "--lr-latent",
-        type=float,
-        default=8e-2,
-        help="Learning rate for the train-set latent bank.",
-    )
-    parser.add_argument(
-        "--weight-decay",
-        type=float,
-        default=0.0,
-        help="Weight decay for both optimizer parameter groups.",
-    )
-    parser.add_argument(
-        "--supervision-mode",
-        type=str,
-        default="target_if_available_else_teacher_pred",
-        choices=("teacher_pred", "target_if_available_else_teacher_pred"),
-        help="How to choose class-label supervision for the attack-alignment loss.",
-    )
+    parser.add_argument("input_root", type=str, help="Either the teacher_bank folder or the parent adversarial root that contains a teacher_bank subfolder.")
+    parser.add_argument("--output-dir", type=str, default=None, help="Folder for checkpoints and reports. Defaults to <teacher_bank_root>/latent_decoder.")
+    parser.add_argument("--teacher-manifest-path", type=str, default=None, help="Optional path to selected_teacher_manifest.jsonl. If omitted, it is discovered from the input root.")
+    parser.add_argument("--model-type", type=str, default=None, help="LLR2 model type name. If omitted, it will be inferred from --checkpoint when possible.")
+    parser.add_argument("--dataset-type", type=str, default="imagenet1k", choices=SUPPORTED_DATASETS, help="ImageNet dataset variant used to rebuild the classifier architecture.")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Optional LLR2 .model.pt classifier checkpoint used for the original attacks.")
+    parser.add_argument("--use-torchvision-pretrained", action="store_true", help="Use torchvision ImageNet pretrained weights instead of an LLR2 checkpoint.")
+    parser.add_argument("--preset", type=int, default=0, help="LLR2 ImageNet preset used when rebuilding the classifier architecture.")
+    parser.add_argument("--holdout-fraction", type=float, default=0.1, help="Validation fraction used only when the teacher-bank manifest does not contain an explicit train split.")
+    parser.add_argument("--seed", type=int, default=7, help="Random seed for data splitting and initialization.")
+    parser.add_argument("--grid-size", type=int, default=20, help="Latent grid size.")
+    parser.add_argument("--latent-channels", type=int, default=3, help="Number of channels in the learned latent grid.")
+    parser.add_argument("--hidden-channels", type=int, default=24, help="Hidden channels inside the shared latent decoder.")
+    parser.add_argument("--decoder-scale", type=str, default="auto", help="Scale used for decoder output in normalized space. Use 'auto' to infer it from the training deltas.")
+    parser.add_argument("--epochs", type=int, default=10, help="Training epochs.")
+    parser.add_argument("--batch-size", type=int, default=32, help="Training batch size.")
+    parser.add_argument("--num-workers", type=int, default=8, help="Training dataloader workers for the image-pair teacher bank.")
+    parser.add_argument("--lr-decoder", type=float, default=1e-3, help="Learning rate for the shared decoder.")
+    parser.add_argument("--lr-latent", type=float, default=8e-2, help="Learning rate for the train-set latent bank.")
+    parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay for both optimizer parameter groups.")
+    parser.add_argument("--supervision-mode", type=str, default="target_if_available_else_teacher_pred", choices=("teacher_pred", "target_if_available_else_teacher_pred"), help="How to choose class-label supervision for the attack-alignment loss.")
     parser.add_argument("--lambda-recon", type=float, default=8.0)
     parser.add_argument("--lambda-logit", type=float, default=1.0)
     parser.add_argument("--lambda-margin", type=float, default=0.5)
@@ -403,36 +185,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-l2", type=float, default=30.0)
     parser.add_argument("--lambda-tv", type=float, default=0.8)
     parser.add_argument("--lambda-latent", type=float, default=1e-3)
-    parser.add_argument(
-        "--fit-val-steps",
-        type=int,
-        default=0,
-        help="If > 0, fit held-out validation latents after training for this many steps per batch.",
-    )
-    parser.add_argument(
-        "--fit-val-lr",
-        type=float,
-        default=0.12,
-        help="Learning rate for held-out validation latent fitting.",
-    )
-    parser.add_argument(
-        "--max-open-shards",
-        type=int,
-        default=2,
-        help="How many legacy teacher-bank shard files to keep cached at once per process. Ignored for image-pair banks.",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        help="Computation device: auto, cuda, cpu, or cuda:0 style values.",
-    )
-    parser.add_argument(
-        "--log-every",
-        type=int,
-        default=50,
-        help="Emit a batch-progress log every N train batches. Use 0 to disable batch logs.",
-    )
+    parser.add_argument("--fit-val-steps", type=int, default=0, help="If > 0, fit held-out validation latents after training for this many steps per batch.")
+    parser.add_argument("--fit-val-lr", type=float, default=0.12, help="Learning rate for held-out validation latent fitting.")
+    parser.add_argument("--device", type=str, default="auto", help="Computation device: auto, cuda, cpu, or cuda:0 style values.")
+    parser.add_argument("--log-every", type=int, default=50, help="Emit a batch-progress log every N train batches. Use 0 to disable batch logs.")
     return parser.parse_args()
 
 
@@ -467,8 +223,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--fit-val-steps cannot be negative")
     if args.fit_val_lr <= 0:
         raise ValueError("--fit-val-lr must be positive")
-    if args.max_open_shards <= 0:
-        raise ValueError("--max-open-shards must be positive")
     if args.log_every < 0:
         raise ValueError("--log-every cannot be negative")
 
@@ -647,12 +401,10 @@ def load_teacher_bank_records(manifest_path: Path) -> list[TeacherBankRecord]:
             row = json.loads(line)
             clean_bank_path = resolve_manifest_relative_path(row.get("clean_bank_path"), manifest_root)
             teacher_adv_bank_path = resolve_manifest_relative_path(row.get("teacher_adv_bank_path"), manifest_root)
-            shard_path = resolve_manifest_relative_path(row.get("shard_path"), manifest_root)
-            shard_offset = row.get("shard_offset")
-            if (clean_bank_path is None or teacher_adv_bank_path is None) and (shard_path is None or shard_offset is None):
+            if clean_bank_path is None or teacher_adv_bank_path is None:
                 raise ValueError(
-                    "manifest row is missing teacher-bank storage pointers. "
-                    f"Expected clean_bank_path/teacher_adv_bank_path or shard_path/shard_offset: {row}"
+                    "manifest row is missing clean_bank_path or teacher_adv_bank_path. "
+                    f"Expected an image-pair teacher bank row: {row}"
                 )
             records.append(
                 TeacherBankRecord(
@@ -667,23 +419,9 @@ def load_teacher_bank_records(manifest_path: Path) -> list[TeacherBankRecord]:
                     pred_label=int(row["pred_label"]),
                     clean_bank_path=clean_bank_path,
                     teacher_adv_bank_path=teacher_adv_bank_path,
-                    shard_path=shard_path,
-                    shard_offset=int(shard_offset) if shard_offset is not None else None,
                 )
             )
     return records
-
-
-def infer_teacher_bank_storage_mode(records: list[TeacherBankRecord]) -> str:
-    has_images = any(record.clean_bank_path is not None and record.teacher_adv_bank_path is not None for record in records)
-    has_shards = any(record.shard_path is not None and record.shard_offset is not None for record in records)
-    if has_images and not has_shards:
-        return "images"
-    if has_shards and not has_images:
-        return "shards"
-    if has_images and has_shards:
-        return "mixed"
-    raise ValueError("teacher-bank manifest has no usable storage pointers")
 
 
 def split_records(
@@ -726,7 +464,6 @@ def load_teacher_bank_summary(teacher_bank_root: Path) -> dict[str, Any]:
 def resolve_decoder_scale(
     decoder_scale_arg: str,
     train_records: list[TeacherBankRecord],
-    max_open_shards: int,
     image_transform: transforms.Compose,
     teacher_bank_summary: dict[str, Any],
 ) -> float:
@@ -739,35 +476,12 @@ def resolve_decoder_scale(
         if summary_max_abs > 0:
             return summary_max_abs
 
-    storage_mode = infer_teacher_bank_storage_mode(train_records)
-    if storage_mode == "shards":
-        cache = ShardCache(max_open_shards=max_open_shards)
-        shard_to_offsets: dict[Path, list[int]] = {}
-        for record in train_records:
-            assert record.shard_path is not None
-            assert record.shard_offset is not None
-            shard_to_offsets.setdefault(record.shard_path, []).append(record.shard_offset)
-
-        max_abs = 0.0
-        for shard_path, offsets in shard_to_offsets.items():
-            payload = cache.get(shard_path)
-            deltas = payload["deltas"][offsets]
-            max_abs = max(max_abs, float(deltas.abs().max().item()))
-    else:
-        max_abs = 0.0
-        cache = ShardCache(max_open_shards=max_open_shards)
-        for record in train_records:
-            if record.clean_bank_path is not None and record.teacher_adv_bank_path is not None:
-                clean_image = load_teacher_bank_image(record.clean_bank_path, image_transform)
-                teacher_adv = load_teacher_bank_image(record.teacher_adv_bank_path, image_transform)
-            elif record.shard_path is not None and record.shard_offset is not None:
-                payload = cache.get(record.shard_path)
-                clean_image = payload["clean_images"][record.shard_offset].to(dtype=torch.float32)
-                teacher_adv = payload["teacher_advs"][record.shard_offset].to(dtype=torch.float32)
-            else:
-                raise ValueError(f"teacher-bank record is missing both image paths and shard info: {record}")
-            delta = teacher_adv - clean_image
-            max_abs = max(max_abs, float(delta.abs().max().item()))
+    max_abs = 0.0
+    for record in train_records:
+        clean_image = load_teacher_bank_image(record.clean_bank_path, image_transform)
+        teacher_adv = load_teacher_bank_image(record.teacher_adv_bank_path, image_transform)
+        delta = teacher_adv - clean_image
+        max_abs = max(max_abs, float(delta.abs().max().item()))
 
     if max_abs <= 0:
         raise ValueError("could not infer a positive decoder scale from the teacher bank")
@@ -862,6 +576,13 @@ def distillation_losses(
             "l2_loss": float(l2_loss.item()),
             "tv_loss": float(tv_loss.item()),
             "latent_loss": float(latent_loss.item()),
+            "recon_term": float((weights.recon * recon_loss).item()),
+            "logit_term": float((weights.logit * logit_loss).item()),
+            "margin_term": float((weights.margin * margin_loss).item()),
+            "attack_term": float((weights.attack * attack_loss).item()),
+            "l2_term": float((weights.l2 * l2_loss).item()),
+            "tv_term": float((weights.tv * tv_loss).item()),
+            "latent_term": float((weights.latent * latent_loss).item()),
             "delta_rms": float(decoded_delta.pow(2).mean().sqrt().item()),
             "teacher_match_rate": float((preds == teacher_pred_labels).float().mean().item()),
             "source_leave_rate": float((preds != source_labels).float().mean().item()),
@@ -893,11 +614,23 @@ def finalize_metric_sums(running_sums: dict[str, float], total: int) -> dict[str
     return {key: value / total for key, value in running_sums.items()}
 
 
+def format_loss_report(metrics: dict[str, float]) -> str:
+    return (
+        f"loss={metrics.get('loss', float('nan')):.4f} "
+        f"recon_term={metrics.get('recon_term', float('nan')):.4f} "
+        f"logit_term={metrics.get('logit_term', float('nan')):.4f} "
+        f"margin_term={metrics.get('margin_term', float('nan')):.4f} "
+        f"attack_term={metrics.get('attack_term', float('nan')):.4f} "
+        f"l2_term={metrics.get('l2_term', float('nan')):.4f} "
+        f"tv_term={metrics.get('tv_term', float('nan')):.4f} "
+        f"latent_term={metrics.get('latent_term', float('nan')):.4f}"
+    )
+
+
 def train_decoder(
     classifier: nn.Module,
     decoder: LatentGridDecoder,
     latent_bank: PerSampleLatentBank,
-    stream_dataset: Optional[WorkerShardTeacherBankDataset],
     loader: DataLoader,
     low: torch.Tensor,
     high: torch.Tensor,
@@ -916,12 +649,12 @@ def train_decoder(
             {"params": latent_bank.parameters(), "lr": lr_latent, "weight_decay": weight_decay},
         ]
     )
+    total_steps = max(1, epochs * len(loader))
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
     history: list[dict[str, float]] = []
 
     for epoch in range(1, epochs + 1):
         epoch_start = time.time()
-        if stream_dataset is not None:
-            stream_dataset.set_epoch(epoch)
         decoder.train()
         latent_bank.train()
         sums: dict[str, float] = {}
@@ -948,6 +681,7 @@ def train_decoder(
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
             batch_size = int(images.size(0))
             total += batch_size
@@ -955,26 +689,34 @@ def train_decoder(
 
             if log_every > 0 and batch_index % log_every == 0:
                 LOGGER.info(
-                    "epoch %d batch %d: loss=%.4f recon=%.4f leave=%.3f teacher_match=%.3f",
+                    "epoch %d batch %d: %s leave=%.3f teacher_match=%.3f decoder_lr=%.6g latent_lr=%.6g",
                     epoch,
                     batch_index,
-                    metrics["loss"],
-                    metrics["recon_loss"],
+                    format_loss_report(metrics),
                     metrics["source_leave_rate"],
                     metrics["teacher_match_rate"],
+                    optimizer.param_groups[0]["lr"],
+                    optimizer.param_groups[1]["lr"],
                 )
 
-        row = {"epoch": epoch, **finalize_metric_sums(sums, total), "epoch_seconds": time.time() - epoch_start}
+        row = {
+            "epoch": epoch,
+            **finalize_metric_sums(sums, total),
+            "epoch_seconds": time.time() - epoch_start,
+            "decoder_lr": optimizer.param_groups[0]["lr"],
+            "latent_lr": optimizer.param_groups[1]["lr"],
+        }
         history.append(row)
         LOGGER.info(
-            "epoch %d/%d finished in %s | loss=%.4f recon=%.4f leave=%.3f teacher_match=%.3f",
+            "epoch %d/%d finished in %s | %s leave=%.3f teacher_match=%.3f decoder_lr=%.6g latent_lr=%.6g",
             epoch,
             epochs,
             format_duration(row["epoch_seconds"]),
-            row["loss"],
-            row["recon_loss"],
+            format_loss_report(row),
             row["source_leave_rate"],
             row["teacher_match_rate"],
+            row["decoder_lr"],
+            row["latent_lr"],
         )
     return history
 
@@ -1094,10 +836,9 @@ def fit_latents_for_loader(
         total += batch_size
         aggregate_metric_sums(sums, metrics, batch_size)
         LOGGER.info(
-            "val-fit batch %d: loss=%.4f recon=%.4f leave=%.3f teacher_match=%.3f",
+            "val-fit batch %d: %s leave=%.3f teacher_match=%.3f",
             batch_index,
-            metrics["loss"],
-            metrics["recon_loss"],
+            format_loss_report(metrics),
             metrics["source_leave_rate"],
             metrics["teacher_match_rate"],
         )
@@ -1160,7 +901,6 @@ def main() -> None:
     all_records = load_teacher_bank_records(teacher_manifest_path)
     if not all_records:
         raise ValueError(f"no teacher-bank records found in {teacher_manifest_path}")
-    storage_mode = infer_teacher_bank_storage_mode(all_records)
 
     train_records, val_records, split_strategy = split_records(
         all_records,
@@ -1174,7 +914,6 @@ def main() -> None:
     decoder_scale = resolve_decoder_scale(
         args.decoder_scale,
         train_records,
-        args.max_open_shards,
         image_transform,
         teacher_bank_summary,
     )
@@ -1193,32 +932,17 @@ def main() -> None:
     train_dataset = TeacherBankDataset(
         train_records,
         latent_index_offset=0,
-        max_open_shards=args.max_open_shards,
         image_transform=image_transform,
     )
     val_dataset = TeacherBankDataset(
         val_records,
         latent_index_offset=0,
-        max_open_shards=args.max_open_shards,
         image_transform=image_transform,
     )
-    train_stream_dataset: Optional[WorkerShardTeacherBankDataset] = None
-    train_loader_shuffle = True
-    train_loader_dataset: Dataset | IterableDataset = train_dataset
-    if storage_mode == "shards":
-        train_stream_dataset = WorkerShardTeacherBankDataset(
-            train_records,
-            max_open_shards=1,
-            seed=args.seed,
-            shuffle=True,
-        )
-        train_loader_dataset = train_stream_dataset
-        train_loader_shuffle = False
-
     train_loader = DataLoader(
-        train_loader_dataset,
+        train_dataset,
         batch_size=args.batch_size,
-        shuffle=train_loader_shuffle,
+        shuffle=True,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
     )
@@ -1265,11 +989,12 @@ def main() -> None:
         "classifier_model_type": resolved_model_type,
         "classifier_dataset_type": resolved_dataset_type,
         "device": str(device),
-        "teacher_bank_storage_mode": storage_mode,
+        "teacher_bank_storage_mode": "image_pairs_png",
         "split_strategy": split_strategy,
         "train_count": len(train_dataset),
         "val_count": len(val_dataset),
         "decoder_scale": decoder_scale,
+        "scheduler": {"name": "CosineAnnealingLR", "t_max_steps": max(1, args.epochs * len(train_loader)), "eta_min": 0.0},
         "config": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
     }
     write_json(output_dir / "train_config.json", run_config)
@@ -1278,7 +1003,6 @@ def main() -> None:
         classifier=classifier,
         decoder=decoder,
         latent_bank=latent_bank,
-        stream_dataset=train_stream_dataset,
         loader=train_loader,
         low=low,
         high=high,
@@ -1339,11 +1063,12 @@ def main() -> None:
         "classifier_model_type": resolved_model_type,
         "classifier_dataset_type": resolved_dataset_type,
         "device": str(device),
-        "teacher_bank_storage_mode": storage_mode,
+        "teacher_bank_storage_mode": "image_pairs_png",
         "split_strategy": split_strategy,
         "train_count": len(train_dataset),
         "val_count": len(val_dataset),
         "decoder_scale": decoder_scale,
+        "loss_weights": vars(weights),
         "train_history": train_history,
         "final_train_metrics": final_train_metrics,
         "val_fit_metrics": val_fit_metrics,
@@ -1360,17 +1085,15 @@ def main() -> None:
     LOGGER.info("checkpoint written to %s", checkpoint_path)
     LOGGER.info("report written to %s", output_dir / "latent_teacher_decoder_report.json")
     LOGGER.info(
-        "final train loss=%.4f recon=%.4f leave=%.3f teacher_match=%.3f",
-        final_train_metrics.get("loss", float("nan")),
-        final_train_metrics.get("recon_loss", float("nan")),
+        "final train %s leave=%.3f teacher_match=%.3f",
+        format_loss_report(final_train_metrics),
         final_train_metrics.get("source_leave_rate", float("nan")),
         final_train_metrics.get("teacher_match_rate", float("nan")),
     )
     if val_fit_metrics:
         LOGGER.info(
-            "val-fit loss=%.4f recon=%.4f leave=%.3f teacher_match=%.3f",
-            val_fit_metrics.get("loss", float("nan")),
-            val_fit_metrics.get("recon_loss", float("nan")),
+            "val-fit %s leave=%.3f teacher_match=%.3f",
+            format_loss_report(val_fit_metrics),
             val_fit_metrics.get("source_leave_rate", float("nan")),
             val_fit_metrics.get("teacher_match_rate", float("nan")),
         )

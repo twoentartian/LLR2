@@ -31,7 +31,6 @@ import logging
 import math
 import os
 import re
-import ssl
 import sys
 import time
 from dataclasses import dataclass
@@ -39,7 +38,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 import torch
-import torchvision.models as models
 from PIL import Image
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
@@ -49,6 +47,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from py_src.ml_setup.factory import get_ml_setup_from_config
 from py_src.ml_setup_dataset import DatasetType
+from py_src.ml_setup_model.pretrained_models import create_torchvision_model
 from py_src.model_opti_save_load import load_model_state_file
 
 
@@ -400,46 +399,6 @@ def build_transform(args: argparse.Namespace):
         ]
     )
     return transforms.Compose(steps)
-
-
-def create_torchvision_model(model_type: str) -> nn.Module:
-    ssl._create_default_https_context = ssl._create_unverified_context
-
-    builders = {
-        "resnet18_bn": lambda: models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1),
-        "resnet34": lambda: models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1),
-        "resnet50": lambda: models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2),
-        "vgg11_bn": lambda: models.vgg11_bn(weights=models.VGG11_BN_Weights.IMAGENET1K_V1),
-        "squeezenet1_1": lambda: models.squeezenet1_1(weights=models.SqueezeNet1_1_Weights.IMAGENET1K_V1),
-        "shufflenet_v2_x2_0": lambda: models.shufflenet_v2_x2_0(weights=models.ShuffleNet_V2_X2_0_Weights.IMAGENET1K_V1),
-        "mobilenet_v3_large": lambda: models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.IMAGENET1K_V2),
-        "efficientnet_v2_s": lambda: models.efficientnet_v2_s(weights=models.EfficientNet_V2_S_Weights.IMAGENET1K_V1),
-        "efficientnet_b1": lambda: models.efficientnet_b1(weights=models.EfficientNet_B1_Weights.IMAGENET1K_V2),
-        "mnasnet1_0": lambda: models.mnasnet1_0(weights=models.MNASNet1_0_Weights.IMAGENET1K_V1),
-        "mnasnet0_5": lambda: models.mnasnet0_5(weights=models.MNASNet0_5_Weights.IMAGENET1K_V1),
-        "densenet121": lambda: models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1),
-        "regnet_y_400mf": lambda: models.regnet_y_400mf(weights=models.RegNet_Y_400MF_Weights.IMAGENET1K_V2),
-        "convnext_tiny": lambda: models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1),
-        "alexnet": lambda: models.alexnet(weights=models.AlexNet_Weights.IMAGENET1K_V1),
-        "resnext50_32x4d": lambda: models.resnext50_32x4d(weights=models.ResNeXt50_32X4D_Weights.IMAGENET1K_V2),
-        "vit_b_32": lambda: models.vit_b_32(weights=models.ViT_B_32_Weights.IMAGENET1K_V1),
-        "wide_resnet50_2": lambda: models.wide_resnet50_2(weights=models.Wide_ResNet50_2_Weights.IMAGENET1K_V2),
-    }
-
-    if model_type == "cct_14_7x2_224":
-        import py_src.third_party.compact_transformers.src.cct as cct
-
-        return cct.cct_14_7x2_224(pretrained=True, progress=False)
-
-    builder = builders.get(model_type)
-    if builder is None:
-        supported = ", ".join(sorted(builders))
-        raise ValueError(
-            f"torchvision pretrained loading is not configured for model type {model_type!r}. "
-            f"Supported values: {supported}, cct_14_7x2_224"
-        )
-    return builder()
-
 
 def resolve_model(
     args: argparse.Namespace,

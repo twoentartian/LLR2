@@ -112,7 +112,7 @@ def build_teacher_bank_image_transform() -> transforms.Compose:
 
 def load_teacher_bank_image(path: Path, image_transform: transforms.Compose) -> torch.Tensor:
     with Image.open(path) as image:
-        return image_transform(image.convert("RGB"))
+        return image_transform(image.convert("RGB")) # type: ignore
 
 
 class LatentGridDecoder(nn.Module):

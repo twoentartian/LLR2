@@ -75,7 +75,7 @@ class IndexedDataset(Dataset):
         self.base_dataset = base_dataset
 
     def __len__(self) -> int:
-        return len(self.base_dataset)
+        return len(self.base_dataset) # type: ignore
 
     def __getitem__(self, index: int):
         image, label = self.base_dataset[index]
@@ -83,183 +83,36 @@ class IndexedDataset(Dataset):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Generate adversarial examples for ImageNet datasets and save them to disk.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "--model-type",
-        type=str,
-        default=None,
-        help="LLR2 model type name (for example: resnet50, resnet18_bn, vit_b_32). "
-             "If omitted, it will be inferred from --checkpoint when possible.",
-    )
-    parser.add_argument(
-        "--dataset-type",
-        type=str,
-        default="imagenet1k",
-        choices=SUPPORTED_DATASETS,
-        help="ImageNet dataset variant to attack.",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=None,
-        help="Optional LLR2 .model.pt checkpoint. If provided, the state dict is loaded into an LLR2 model.",
-    )
-    parser.add_argument(
-        "--use-torchvision-pretrained",
-        action="store_true",
-        help="Use torchvision's DEFAULT ImageNet pretrained weights instead of an LLR2 checkpoint.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        required=True,
-        help="Folder where adversarial images, manifests, and summaries will be saved.",
-    )
-    parser.add_argument(
-        "--attacks",
-        nargs="+",
-        default=list(SUPPORTED_ATTACKS),
-        choices=SUPPORTED_ATTACKS,
-        help="Attack methods to generate.",
-    )
-    parser.add_argument(
-        "--split",
-        type=str,
-        default="val",
-        choices=("train", "val"),
-        help="Dataset split to process.",
-    )
-    parser.add_argument(
-        "--preset",
-        type=int,
-        default=0,
-        help="LLR2 ImageNet preset. In this repo, preset=1 uses the classic 256->224 eval recipe, "
-             "while preset=0/2 uses the recipe-v2 eval sizes.",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=16,
-        help="Batch size used for attack generation.",
-    )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=4,
-        help="Dataloader workers.",
-    )
-    parser.add_argument(
-        "--num-samples",
-        type=int,
-        default=None,
-        help="Optional limit on the number of samples to process from the selected split.",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        help="Computation device: auto, cuda, cpu, or cuda:0 style values.",
-    )
-    parser.add_argument(
-        "--use-dali",
-        action="store_true",
-        help="Use the DALI-backed ImageNet loader when supported by your environment.",
-    )
-    parser.add_argument(
-        "--dali-device-id",
-        type=int,
-        default=0,
-        help="GPU device id for the DALI pipeline.",
-    )
-    parser.add_argument(
-        "--attack-all-samples",
-        action="store_true",
-        help="Attack every sample. By default, only cleanly classified samples are attacked.",
-    )
-    parser.add_argument(
-        "--targeted",
-        action="store_true",
-        help="Generate targeted attacks instead of untargeted attacks.",
-    )
-    parser.add_argument(
-        "--target-mode",
-        type=str,
-        default="random",
-        choices=("random", "least_likely", "fixed"),
-        help="How to choose target labels when --targeted is enabled.",
-    )
-    parser.add_argument(
-        "--fixed-target-label",
-        type=int,
-        default=None,
-        help="Required when using --targeted --target-mode fixed.",
-    )
-    parser.add_argument(
-        "--save-originals",
-        action="store_true",
-        help="Also save the corresponding clean images.",
-    )
-    parser.add_argument(
-        "--save-successful-only",
-        action="store_true",
-        help="Only write adversarial images for successful attacks.",
-    )
-    parser.add_argument(
-        "--epsilon",
-        type=float,
-        default=8.0 / 255.0,
-        help="FGSM / PGD Linf budget in pixel space [0, 1].",
-    )
-    parser.add_argument(
-        "--pgd-alpha",
-        type=float,
-        default=2.0 / 255.0,
-        help="PGD step size in pixel space [0, 1].",
-    )
-    parser.add_argument(
-        "--pgd-steps",
-        type=int,
-        default=10,
-        help="Number of PGD steps.",
-    )
-    parser.add_argument(
-        "--no-pgd-random-start",
-        action="store_true",
-        help="Disable the random PGD initialization inside the epsilon ball.",
-    )
-    parser.add_argument(
-        "--cw-steps",
-        type=int,
-        default=200,
-        help="Number of optimization steps for CW.",
-    )
-    parser.add_argument(
-        "--cw-lr",
-        type=float,
-        default=0.01,
-        help="Learning rate for CW optimization.",
-    )
-    parser.add_argument(
-        "--cw-c-values",
-        type=str,
-        default="0.01,0.1,1.0,10.0",
-        help="Comma-separated tradeoff values tried by CW.",
-    )
-    parser.add_argument(
-        "--cw-kappa",
-        type=float,
-        default=0.0,
-        help="CW confidence margin.",
-    )
-    parser.add_argument(
-        "--log-every",
-        type=int,
-        default=10,
-        help="Log progress every N processed batches.",
-    )
+    parser = argparse.ArgumentParser(description="Generate adversarial examples for ImageNet datasets and save them to disk.",formatter_class=argparse.ArgumentDefaultsHelpFormatter,)
+    parser.add_argument("--model-type",type=str,default=None,help="LLR2 model type name (for example: resnet50, resnet18_bn, vit_b_32). ""If omitted, it will be inferred from --checkpoint when possible.",)
+    parser.add_argument("--dataset-type",type=str,default="imagenet1k",choices=SUPPORTED_DATASETS,help="ImageNet dataset variant to attack.",)
+    parser.add_argument("--checkpoint",type=str,default=None,help="Optional LLR2 .model.pt checkpoint. If provided, the state dict is loaded into an LLR2 model.",)
+    parser.add_argument("--use-torchvision-pretrained",action="store_true",help="Use torchvision's DEFAULT ImageNet pretrained weights instead of an LLR2 checkpoint.",)
+    parser.add_argument("--output-dir",type=str,required=True,help="Folder where adversarial images, manifests, and summaries will be saved.",)
+    parser.add_argument("--attacks",nargs="+",default=list(SUPPORTED_ATTACKS),choices=SUPPORTED_ATTACKS,help="Attack methods to generate.",)
+    parser.add_argument("--split",type=str,default="val",choices=("train", "val"),help="Dataset split to process.",)
+    parser.add_argument("--preset",type=int,default=0,help="LLR2 ImageNet preset. In this repo, preset=1 uses the classic 256->224 eval recipe, while preset=0/2 uses the recipe-v2 eval sizes.",)
+    parser.add_argument("--batch-size",type=int,default=16,help="Batch size used for attack generation.",)
+    parser.add_argument("--num-workers",type=int,default=4,help="Dataloader workers.",)
+    parser.add_argument("--num-samples",type=int,default=None,help="Optional limit on the number of samples to process from the selected split.",)
+    parser.add_argument("--device",type=str,default="auto",help="Computation device: auto, cuda, cpu, or cuda:0 style values.",)
+    parser.add_argument("--use-dali",action="store_true",help="Use the DALI-backed ImageNet loader when supported by your environment.",)
+    parser.add_argument("--dali-device-id",type=int,default=0,help="GPU device id for the DALI pipeline.",)
+    parser.add_argument("--attack-all-samples",action="store_true",help="Attack every sample. By default, only cleanly classified samples are attacked.",)
+    parser.add_argument("--targeted",action="store_true",help="Generate targeted attacks instead of untargeted attacks.",)
+    parser.add_argument("--target-mode",type=str,default="random",choices=("random", "least_likely", "fixed"),help="How to choose target labels when --targeted is enabled.",)
+    parser.add_argument("--fixed-target-label",type=int,default=None,help="Required when using --targeted --target-mode fixed.",)
+    parser.add_argument("--save-originals",action="store_true",help="Also save the corresponding clean images.",)
+    parser.add_argument("--save-successful-only",action="store_true",help="Only write adversarial images for successful attacks.",)
+    parser.add_argument("--epsilon",type=float,default=8.0 / 255.0,help="FGSM / PGD Linf budget in pixel space [0, 1].",)
+    parser.add_argument("--pgd-alpha",type=float,default=2.0 / 255.0,help="PGD step size in pixel space [0, 1].",)
+    parser.add_argument("--pgd-steps",type=int,default=10,help="Number of PGD steps.",)
+    parser.add_argument("--no-pgd-random-start",action="store_true",help="Disable the random PGD initialization inside the epsilon ball.",)
+    parser.add_argument("--cw-steps",type=int,default=200,help="Number of optimization steps for CW.",)
+    parser.add_argument("--cw-lr",type=float,default=0.01,help="Learning rate for CW optimization.",)
+    parser.add_argument("--cw-c-values",type=str,default="0.01,0.1,1.0,10.0",help="Comma-separated tradeoff values tried by CW.",)
+    parser.add_argument("--cw-kappa",type=float,default=0.0,help="CW confidence margin.",)
+    parser.add_argument("--log-every",type=int,default=10,help="Log progress every N processed batches.",)
     return parser.parse_args()
 
 
@@ -498,6 +351,7 @@ def fgsm_attack(
     x = x0.clone().detach().requires_grad_(True)
     logits = forward_logits(model, x)
     loss_labels = target_labels if targeted else labels
+    assert loss_labels is not None
     loss = F.cross_entropy(logits, loss_labels)
     if targeted:
         loss = -loss
@@ -539,6 +393,7 @@ def pgd_attack(
         adv = adv.detach().requires_grad_(True)
         logits = forward_logits(model, adv)
         loss_labels = target_labels if targeted else labels
+        assert loss_labels is not None
         loss = F.cross_entropy(logits, loss_labels)
         if targeted:
             loss = -loss

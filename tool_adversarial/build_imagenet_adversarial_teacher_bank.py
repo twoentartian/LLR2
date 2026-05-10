@@ -1,0 +1,825 @@
+#!/usr/bin/env python3
+"""Build a training-ready teacher bank from saved ImageNet adversarial images.
+
+This is the next step after generating FGSM / PGD / CW examples:
+
+1. load saved adversarial images from a generator output folder
+2. pair each adversarial image with its clean ImageNet sample
+3. choose one teacher attack per source image
+4. save sharded tensors for later latent-perturbation training
+
+The script expects a generator-style ``manifest.jsonl`` so it can recover the
+source dataset index for each saved adversarial image.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import math
+import os
+import re
+import ssl
+import sys
+import time
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional
+
+import torch
+import torchvision.models as models
+from PIL import Image
+from torch import nn
+from torchvision import transforms
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from py_src.ml_setup.factory import get_ml_setup_from_config
+from py_src.ml_setup_dataset import DatasetType
+from py_src.model_opti_save_load import load_model_state_file
+
+
+LOGGER = logging.getLogger("build_imagenet_adversarial_teacher_bank")
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+SUPPORTED_DATASETS = ("imagenet1k", "imagenet100", "imagenet10")
+SUPPORTED_ATTACKS = ("fgsm", "pgd", "cw")
+TARGET_PATTERN = re.compile(r"_target_(\d+)(?=\.[^.]+$)")
+
+
+@dataclass
+class AttackCandidate:
+    attack_name: str
+    saved_path: Path
+    split: str
+    source_index: int
+    source_label: int
+    target_label: Optional[int]
+    source_path: Optional[str]
+    manifest_pixel_l2: Optional[float]
+    manifest_pixel_linf: Optional[float]
+    manifest_adv_pred: Optional[int]
+
+
+@dataclass
+class ScoredCandidate:
+    candidate: AttackCandidate
+    adv_tensor: torch.Tensor
+    pred_label: int
+    top1_confidence: float
+    source_confidence: Optional[float]
+    target_confidence: Optional[float]
+    untargeted_success: bool
+    targeted_success: Optional[bool]
+    reload_pixel_l2: float
+    reload_pixel_linf: float
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build a clean/adversarial teacher bank from saved ImageNet attacks.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "adversarial_root",
+        type=str,
+        help="Folder containing the generated adversarial examples.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Folder where teacher-bank shards and metadata will be saved. Defaults to <adversarial_root>/teacher_bank.",
+    )
+    parser.add_argument(
+        "--manifest-path",
+        type=str,
+        default=None,
+        help="Optional path to manifest.jsonl. If omitted, the script searches near the adversarial root.",
+    )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default=None,
+        help="LLR2 model type name. If omitted, it will be inferred from --checkpoint when possible.",
+    )
+    parser.add_argument(
+        "--dataset-type",
+        type=str,
+        default="imagenet1k",
+        choices=SUPPORTED_DATASETS,
+        help="ImageNet dataset variant to use when rebuilding the clean images.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Optional LLR2 .model.pt checkpoint to use for rescoring the saved adversarial images.",
+    )
+    parser.add_argument(
+        "--use-torchvision-pretrained",
+        action="store_true",
+        help="Use torchvision ImageNet pretrained weights instead of an LLR2 checkpoint.",
+    )
+    parser.add_argument(
+        "--preset",
+        type=int,
+        default=0,
+        help="LLR2 ImageNet preset used when rebuilding clean samples.",
+    )
+    parser.add_argument(
+        "--selection-mode",
+        type=str,
+        default="auto",
+        choices=("auto", "untargeted", "targeted"),
+        help="How to choose the winning teacher when multiple attacks exist for one source image.",
+    )
+    parser.add_argument(
+        "--include-attacks",
+        nargs="*",
+        default=list(SUPPORTED_ATTACKS),
+        choices=SUPPORTED_ATTACKS,
+        help="Attack folders to consider from the adversarial root.",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default=None,
+        choices=("train", "val"),
+        help="Optional split filter. If omitted, all manifest rows under the root are considered.",
+    )
+    parser.add_argument(
+        "--max-groups",
+        type=int,
+        default=None,
+        help="Optional limit on the number of source-image groups to process after grouping.",
+    )
+    parser.add_argument(
+        "--shard-size",
+        type=int,
+        default=256,
+        help="Number of selected pairs per saved shard.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Computation device: auto, cuda, cpu, or cuda:0 style values.",
+    )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=25,
+        help="Emit an INFO log every N processed groups. Use 0 to disable periodic logs.",
+    )
+    return parser.parse_args()
+
+
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.use_torchvision_pretrained and args.checkpoint:
+        raise ValueError("choose either --checkpoint or --use-torchvision-pretrained, not both")
+    if not args.checkpoint and not args.use_torchvision_pretrained:
+        raise ValueError("provide either --checkpoint or --use-torchvision-pretrained")
+    if args.shard_size <= 0:
+        raise ValueError("--shard-size must be positive")
+    if args.max_groups is not None and args.max_groups <= 0:
+        raise ValueError("--max-groups must be positive")
+    if args.log_every < 0:
+        raise ValueError("--log-every cannot be negative")
+
+
+def resolve_device(device_name: str) -> torch.device:
+    if device_name == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("cpu")
+    return torch.device(device_name)
+
+
+def format_duration(seconds: Optional[float]) -> str:
+    if seconds is None or not math.isfinite(seconds):
+        return "--:--:--"
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+class ProgressTracker:
+    def __init__(self, total_groups: int) -> None:
+        self.total_groups = total_groups
+        self.start_time = time.time()
+        self.last_line_length = 0
+
+    def clear(self) -> None:
+        if self.last_line_length == 0:
+            return
+        sys.stderr.write("\r" + (" " * self.last_line_length) + "\r")
+        sys.stderr.flush()
+        self.last_line_length = 0
+
+    def update(self, completed_groups: int, selected_count: int, stage: str) -> None:
+        elapsed = time.time() - self.start_time
+        rate = completed_groups / elapsed if elapsed > 0 and completed_groups > 0 else 0.0
+        remaining = max(self.total_groups - completed_groups, 0)
+        eta = remaining / rate if rate > 0 else None
+        percent = 100.0 * completed_groups / self.total_groups if self.total_groups > 0 else 100.0
+        line = (
+            f"[progress] {percent:5.1f}% | groups {completed_groups}/{self.total_groups} | "
+            f"selected {selected_count} | elapsed {format_duration(elapsed)} | "
+            f"eta {format_duration(eta)} | {stage}"
+        )
+        padding = max(self.last_line_length - len(line), 0)
+        sys.stderr.write("\r" + line + (" " * padding))
+        sys.stderr.flush()
+        self.last_line_length = len(line)
+
+    def finish(self, completed_groups: int, selected_count: int, stage: str) -> None:
+        self.update(completed_groups, selected_count, stage)
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+        self.last_line_length = 0
+
+
+def path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def find_default_manifest(adversarial_root: Path) -> Optional[Path]:
+    for parent in [adversarial_root, *list(adversarial_root.parents)[:3]]:
+        candidate = parent / "manifest.jsonl"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def infer_target_label_from_name(file_name: str) -> Optional[int]:
+    match = TARGET_PATTERN.search(file_name)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def load_manifest_candidates(
+    manifest_path: Path,
+    adversarial_root: Path,
+    include_attacks: set[str],
+    split_filter: Optional[str],
+) -> list[AttackCandidate]:
+    candidates: list[AttackCandidate] = []
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            saved_path_value = row.get("saved_path")
+            source_index = row.get("source_index")
+            source_label = row.get("label")
+            attack_name = row.get("attack")
+            split = row.get("split")
+            if not saved_path_value or source_index is None or source_label is None or not attack_name or not split:
+                continue
+
+            saved_path = Path(saved_path_value).resolve()
+            if not saved_path.exists():
+                continue
+            if not path_is_within(saved_path, adversarial_root):
+                continue
+            if attack_name not in include_attacks:
+                continue
+            if split_filter is not None and split != split_filter:
+                continue
+
+            target_label = row.get("target_label")
+            if target_label is None:
+                target_label = infer_target_label_from_name(saved_path.name)
+
+            candidates.append(
+                AttackCandidate(
+                    attack_name=str(attack_name),
+                    saved_path=saved_path,
+                    split=str(split),
+                    source_index=int(source_index),
+                    source_label=int(source_label),
+                    target_label=int(target_label) if target_label is not None else None,
+                    source_path=row.get("source_path"),
+                    manifest_pixel_l2=float(row["pixel_l2"]) if row.get("pixel_l2") is not None else None,
+                    manifest_pixel_linf=float(row["pixel_linf"]) if row.get("pixel_linf") is not None else None,
+                    manifest_adv_pred=int(row["adv_pred"]) if row.get("adv_pred") is not None else None,
+                )
+            )
+    return candidates
+
+
+def build_adv_transform() -> transforms.Compose:
+    return transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
+    )
+
+
+def denormalize_images(images: torch.Tensor) -> torch.Tensor:
+    mean = torch.tensor(IMAGENET_MEAN, device=images.device, dtype=torch.float32).view(1, 3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, device=images.device, dtype=torch.float32).view(1, 3, 1, 1)
+    return images * std + mean
+
+
+def forward_logits(model: nn.Module, inputs: torch.Tensor) -> torch.Tensor:
+    outputs = model(inputs)
+    if isinstance(outputs, (tuple, list)):
+        outputs = outputs[0]
+    if not torch.is_tensor(outputs):
+        raise TypeError(f"model forward returned unsupported type: {type(outputs)!r}")
+    return outputs
+
+
+def create_torchvision_model(model_type: str) -> nn.Module:
+    ssl._create_default_https_context = ssl._create_unverified_context
+
+    builders = {
+        "resnet18_bn": lambda: models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1),
+        "resnet34": lambda: models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1),
+        "resnet50": lambda: models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2),
+        "vgg11_bn": lambda: models.vgg11_bn(weights=models.VGG11_BN_Weights.IMAGENET1K_V1),
+        "squeezenet1_1": lambda: models.squeezenet1_1(weights=models.SqueezeNet1_1_Weights.IMAGENET1K_V1),
+        "shufflenet_v2_x2_0": lambda: models.shufflenet_v2_x2_0(weights=models.ShuffleNet_V2_X2_0_Weights.IMAGENET1K_V1),
+        "mobilenet_v3_large": lambda: models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.IMAGENET1K_V2),
+        "efficientnet_v2_s": lambda: models.efficientnet_v2_s(weights=models.EfficientNet_V2_S_Weights.IMAGENET1K_V1),
+        "efficientnet_b1": lambda: models.efficientnet_b1(weights=models.EfficientNet_B1_Weights.IMAGENET1K_V2),
+        "mnasnet1_0": lambda: models.mnasnet1_0(weights=models.MNASNet1_0_Weights.IMAGENET1K_V1),
+        "mnasnet0_5": lambda: models.mnasnet0_5(weights=models.MNASNet0_5_Weights.IMAGENET1K_V1),
+        "densenet121": lambda: models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1),
+        "regnet_y_400mf": lambda: models.regnet_y_400mf(weights=models.RegNet_Y_400MF_Weights.IMAGENET1K_V2),
+        "convnext_tiny": lambda: models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1),
+        "alexnet": lambda: models.alexnet(weights=models.AlexNet_Weights.IMAGENET1K_V1),
+        "resnext50_32x4d": lambda: models.resnext50_32x4d(weights=models.ResNeXt50_32X4D_Weights.IMAGENET1K_V2),
+        "vit_b_32": lambda: models.vit_b_32(weights=models.ViT_B_32_Weights.IMAGENET1K_V1),
+        "wide_resnet50_2": lambda: models.wide_resnet50_2(weights=models.Wide_ResNet50_2_Weights.IMAGENET1K_V2),
+    }
+
+    if model_type == "cct_14_7x2_224":
+        import py_src.third_party.compact_transformers.src.cct as cct
+
+        return cct.cct_14_7x2_224(pretrained=True, progress=False)
+
+    builder = builders.get(model_type)
+    if builder is None:
+        supported = ", ".join(sorted(builders))
+        raise ValueError(
+            f"torchvision pretrained loading is not configured for model type {model_type!r}. "
+            f"Supported values: {supported}, cct_14_7x2_224"
+        )
+    return builder()
+
+
+def resolve_model_and_setup(
+    args: argparse.Namespace,
+    device: torch.device,
+) -> tuple[nn.Module, Any, str, str]:
+    checkpoint_model_type = None
+    checkpoint_dataset_type = None
+    state_dict = None
+
+    if args.checkpoint:
+        state_dict, checkpoint_model_type, checkpoint_dataset_type = load_model_state_file(args.checkpoint)
+
+    resolved_model_type = args.model_type or checkpoint_model_type
+    if resolved_model_type is None:
+        raise ValueError("unable to infer model type; pass --model-type or use a checkpoint that stores model_name")
+
+    resolved_dataset_type = args.dataset_type
+    if checkpoint_dataset_type is not None and checkpoint_dataset_type != resolved_dataset_type:
+        raise ValueError(
+            f"checkpoint dataset type {checkpoint_dataset_type!r} does not match --dataset-type "
+            f"{resolved_dataset_type!r}"
+        )
+
+    ml_setup = get_ml_setup_from_config(
+        resolved_model_type,
+        resolved_dataset_type,
+        preset=args.preset,
+        device=device,
+    )
+
+    if args.use_torchvision_pretrained:
+        if resolved_dataset_type != DatasetType.imagenet1k.name:
+            raise ValueError("--use-torchvision-pretrained currently expects --dataset-type imagenet1k")
+        model = create_torchvision_model(resolved_model_type)
+    else:
+        model = ml_setup.model
+        assert state_dict is not None
+        incompatible = model.load_state_dict(state_dict, strict=True)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            raise RuntimeError(
+                f"failed to load checkpoint cleanly. missing={incompatible.missing_keys}, "
+                f"unexpected={incompatible.unexpected_keys}"
+            )
+
+    model = model.to(device)
+    model.eval()
+    return model, ml_setup, resolved_model_type, resolved_dataset_type
+
+
+def build_group_key(candidate: AttackCandidate) -> tuple[str, int, Optional[int]]:
+    return candidate.split, candidate.source_index, candidate.target_label
+
+
+def load_adv_tensor(path: Path, transform: transforms.Compose) -> torch.Tensor:
+    with Image.open(path) as image:
+        image = image.convert("RGB")
+        return transform(image)
+
+
+def score_candidates(
+    model: nn.Module,
+    clean_tensor: torch.Tensor,
+    candidates: list[AttackCandidate],
+    transform: transforms.Compose,
+    source_label: int,
+    device: torch.device,
+) -> list[ScoredCandidate]:
+    adv_tensors = [load_adv_tensor(candidate.saved_path, transform) for candidate in candidates]
+    adv_batch = torch.stack(adv_tensors).to(device)
+    clean_batch = clean_tensor.unsqueeze(0).repeat(len(candidates), 1, 1, 1).to(device)
+
+    with torch.no_grad():
+        logits = forward_logits(model, adv_batch)
+        probs = logits.softmax(dim=1)
+        pred_confidences, pred_labels = probs.max(dim=1)
+
+    clean_pixels = denormalize_images(clean_batch).clamp(0.0, 1.0)
+    adv_pixels = denormalize_images(adv_batch).clamp(0.0, 1.0)
+    deltas = adv_pixels - clean_pixels
+    l2_values = deltas.reshape(deltas.size(0), -1).norm(p=2, dim=1)
+    linf_values = deltas.abs().reshape(deltas.size(0), -1).max(dim=1).values
+
+    scored: list[ScoredCandidate] = []
+    for idx, candidate in enumerate(candidates):
+        pred_label = int(pred_labels[idx].item())
+        target_confidence = None
+        targeted_success = None
+        if candidate.target_label is not None and candidate.target_label < probs.size(1):
+            target_confidence = float(probs[idx, candidate.target_label].item())
+            targeted_success = pred_label == candidate.target_label
+
+        scored.append(
+            ScoredCandidate(
+                candidate=candidate,
+                adv_tensor=adv_tensors[idx],
+                pred_label=pred_label,
+                top1_confidence=float(pred_confidences[idx].item()),
+                source_confidence=float(probs[idx, source_label].item()),
+                target_confidence=target_confidence,
+                untargeted_success=pred_label != source_label,
+                targeted_success=targeted_success,
+                reload_pixel_l2=float(l2_values[idx].item()),
+                reload_pixel_linf=float(linf_values[idx].item()),
+            )
+        )
+    return scored
+
+
+def ranking_l2(row: ScoredCandidate) -> float:
+    if row.candidate.manifest_pixel_l2 is not None:
+        return row.candidate.manifest_pixel_l2
+    return row.reload_pixel_l2
+
+
+def choose_teacher(
+    scored_candidates: list[ScoredCandidate],
+    selection_mode: str,
+) -> tuple[ScoredCandidate, str]:
+    target_label = scored_candidates[0].candidate.target_label
+    mode = selection_mode
+    if mode == "auto":
+        mode = "targeted" if target_label is not None else "untargeted"
+
+    if mode == "targeted":
+        successful = [row for row in scored_candidates if row.targeted_success]
+        if successful:
+            return min(successful, key=ranking_l2), "targeted_success_min_l2"
+        ranked = [
+            row for row in scored_candidates
+            if row.target_confidence is not None
+        ]
+        if ranked:
+            return max(ranked, key=lambda row: (row.target_confidence, -ranking_l2(row))), "targeted_max_target_confidence"
+        return min(scored_candidates, key=ranking_l2), "targeted_fallback_min_l2"
+
+    successful = [row for row in scored_candidates if row.untargeted_success]
+    if successful:
+        return min(successful, key=ranking_l2), "untargeted_success_min_l2"
+    ranked = [row for row in scored_candidates if row.source_confidence is not None]
+    if ranked:
+        return min(ranked, key=lambda row: (row.source_confidence, ranking_l2(row))), "untargeted_min_source_confidence"
+    return min(scored_candidates, key=ranking_l2), "untargeted_fallback_min_l2"
+
+
+def flush_shard(
+    output_dir: Path,
+    shard_id: int,
+    shard_rows: list[dict[str, Any]],
+    selected_manifest_rows: list[dict[str, Any]],
+    shard_lookup_updates: list[tuple[int, Path, int]],
+) -> Path:
+    shards_dir = output_dir / "shards"
+    shards_dir.mkdir(parents=True, exist_ok=True)
+    shard_path = shards_dir / f"teacher_bank_{shard_id:05d}.pt"
+
+    payload = {
+        "clean_images": torch.stack([row["clean_image"] for row in shard_rows]),
+        "teacher_advs": torch.stack([row["teacher_adv"] for row in shard_rows]),
+        "deltas": torch.stack([row["delta"] for row in shard_rows]),
+        "source_labels": torch.tensor([row["source_label"] for row in shard_rows], dtype=torch.long),
+        "target_labels": torch.tensor(
+            [row["target_label"] if row["target_label"] is not None else -1 for row in shard_rows],
+            dtype=torch.long,
+        ),
+        "source_indices": torch.tensor([row["source_index"] for row in shard_rows], dtype=torch.long),
+        "pred_labels": torch.tensor([row["pred_label"] for row in shard_rows], dtype=torch.long),
+        "selected_attack_names": [row["selected_attack_name"] for row in shard_rows],
+        "source_paths": [row["source_path"] for row in shard_rows],
+        "adv_paths": [row["adv_path"] for row in shard_rows],
+        "splits": [row["split"] for row in shard_rows],
+        "selection_rules": [row["selection_rule"] for row in shard_rows],
+        "source_confidences": torch.tensor(
+            [row["source_confidence"] if row["source_confidence"] is not None else float("nan") for row in shard_rows],
+            dtype=torch.float32,
+        ),
+        "target_confidences": torch.tensor(
+            [row["target_confidence"] if row["target_confidence"] is not None else float("nan") for row in shard_rows],
+            dtype=torch.float32,
+        ),
+        "manifest_pixel_l2": torch.tensor(
+            [row["manifest_pixel_l2"] if row["manifest_pixel_l2"] is not None else float("nan") for row in shard_rows],
+            dtype=torch.float32,
+        ),
+        "manifest_pixel_linf": torch.tensor(
+            [row["manifest_pixel_linf"] if row["manifest_pixel_linf"] is not None else float("nan") for row in shard_rows],
+            dtype=torch.float32,
+        ),
+        "reload_pixel_l2": torch.tensor([row["reload_pixel_l2"] for row in shard_rows], dtype=torch.float32),
+        "reload_pixel_linf": torch.tensor([row["reload_pixel_linf"] for row in shard_rows], dtype=torch.float32),
+        "untargeted_success": torch.tensor([row["untargeted_success"] for row in shard_rows], dtype=torch.bool),
+        "targeted_success": torch.tensor(
+            [row["targeted_success"] if row["targeted_success"] is not None else False for row in shard_rows],
+            dtype=torch.bool,
+        ),
+        "targeted_success_known": torch.tensor(
+            [row["targeted_success"] is not None for row in shard_rows],
+            dtype=torch.bool,
+        ),
+    }
+    torch.save(payload, shard_path)
+
+    for row, (_, _, offset) in zip(selected_manifest_rows, shard_lookup_updates):
+        row["shard_path"] = str(shard_path)
+        row["shard_offset"] = offset
+
+    return shard_path
+
+
+def main() -> None:
+    setup_logging()
+    args = parse_args()
+    validate_args(args)
+
+    adversarial_root = Path(args.adversarial_root).resolve()
+    if not adversarial_root.exists():
+        raise FileNotFoundError(f"adversarial root does not exist: {adversarial_root}")
+    if not adversarial_root.is_dir():
+        raise NotADirectoryError(f"adversarial root is not a folder: {adversarial_root}")
+
+    manifest_path = Path(args.manifest_path).resolve() if args.manifest_path else find_default_manifest(adversarial_root)
+    if manifest_path is None or not manifest_path.exists():
+        raise FileNotFoundError(
+            "could not find manifest.jsonl. This step requires the generator manifest so it can map "
+            "saved adversarial images back to their clean ImageNet samples."
+        )
+
+    output_dir = Path(args.output_dir).resolve() if args.output_dir else adversarial_root / "teacher_bank"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = resolve_device(args.device)
+
+    model, ml_setup, resolved_model_type, resolved_dataset_type = resolve_model_and_setup(args, device)
+    adv_transform = build_adv_transform()
+    include_attacks = set(args.include_attacks)
+
+    manifest_candidates = load_manifest_candidates(manifest_path, adversarial_root, include_attacks, args.split)
+    if not manifest_candidates:
+        raise ValueError("no manifest rows matched the requested adversarial root / filters")
+
+    grouped_candidates: dict[tuple[str, int, Optional[int]], list[AttackCandidate]] = defaultdict(list)
+    for candidate in manifest_candidates:
+        grouped_candidates[build_group_key(candidate)].append(candidate)
+
+    group_items = sorted(grouped_candidates.items(), key=lambda item: item[0])
+    if args.max_groups is not None:
+        group_items = group_items[:args.max_groups]
+    if not group_items:
+        raise ValueError("no groups remained after filtering")
+
+    train_dataset = ml_setup.training_data
+    val_dataset = ml_setup.testing_data
+
+    summary: dict[str, Any] = {
+        "adversarial_root": str(adversarial_root),
+        "output_dir": str(output_dir),
+        "manifest_path": str(manifest_path),
+        "model_type": resolved_model_type,
+        "dataset_type": resolved_dataset_type,
+        "selection_mode": args.selection_mode,
+        "include_attacks": sorted(include_attacks),
+        "split_filter": args.split,
+        "group_count": len(group_items),
+        "selected_count": 0,
+        "selected_attack_counts": {},
+        "selection_rule_counts": {},
+        "target_label_known_groups": 0,
+        "untargeted_success_count": 0,
+        "targeted_success_count": 0,
+        "targeted_success_known_count": 0,
+        "warnings": [],
+    }
+
+    selected_manifest_rows: list[dict[str, Any]] = []
+    selected_attack_counter: Counter[str] = Counter()
+    selection_rule_counter: Counter[str] = Counter()
+    warned_train_split = False
+
+    progress = ProgressTracker(len(group_items))
+    progress.update(0, 0, "starting")
+
+    shard_rows: list[dict[str, Any]] = []
+    shard_lookup_updates: list[tuple[int, Path, int]] = []
+    shard_id = 0
+    completed_groups = 0
+
+    selected_manifest_path = output_dir / "selected_teacher_manifest.jsonl"
+    with selected_manifest_path.open("w", encoding="utf-8") as selected_manifest_file:
+        for group_key, candidates in group_items:
+            split_name, source_index, target_label = group_key
+            completed_groups += 1
+            progress.update(completed_groups - 1, summary["selected_count"], f"scoring source {source_index}")
+
+            if split_name == "train" and not warned_train_split:
+                warning = (
+                    "manifest rows come from the train split. If the original adversarial images were generated "
+                    "with stochastic train-time augmentation, the clean tensors rebuilt from the dataset index "
+                    "may not exactly match the original attack input. Val split is safer for this step."
+                )
+                LOGGER.warning(warning)
+                summary["warnings"].append(warning)
+                warned_train_split = True
+
+            split_dataset = train_dataset if split_name == "train" else val_dataset
+            clean_tensor, dataset_label = split_dataset[source_index]
+            source_label = int(dataset_label)
+            if source_label != candidates[0].source_label:
+                warning = (
+                    f"manifest label mismatch at split={split_name} index={source_index}: "
+                    f"manifest={candidates[0].source_label} dataset={source_label}"
+                )
+                LOGGER.warning(warning)
+                summary["warnings"].append(warning)
+
+            scored_candidates = score_candidates(
+                model=model,
+                clean_tensor=clean_tensor,
+                candidates=candidates,
+                transform=adv_transform,
+                source_label=source_label,
+                device=device,
+            )
+            selected, selection_rule = choose_teacher(scored_candidates, args.selection_mode)
+
+            selected_attack_counter[selected.candidate.attack_name] += 1
+            selection_rule_counter[selection_rule] += 1
+            summary["selected_count"] += 1
+            summary["untargeted_success_count"] += int(selected.untargeted_success)
+            if target_label is not None:
+                summary["target_label_known_groups"] += 1
+            if selected.targeted_success is not None:
+                summary["targeted_success_known_count"] += 1
+                summary["targeted_success_count"] += int(selected.targeted_success)
+
+            delta_tensor = selected.adv_tensor - clean_tensor
+            shard_row = {
+                "clean_image": clean_tensor.cpu(),
+                "teacher_adv": selected.adv_tensor.cpu(),
+                "delta": delta_tensor.cpu(),
+                "source_label": source_label,
+                "target_label": target_label,
+                "source_index": source_index,
+                "pred_label": selected.pred_label,
+                "selected_attack_name": selected.candidate.attack_name,
+                "source_path": selected.candidate.source_path,
+                "adv_path": str(selected.candidate.saved_path),
+                "split": split_name,
+                "selection_rule": selection_rule,
+                "source_confidence": selected.source_confidence,
+                "target_confidence": selected.target_confidence,
+                "manifest_pixel_l2": selected.candidate.manifest_pixel_l2,
+                "manifest_pixel_linf": selected.candidate.manifest_pixel_linf,
+                "reload_pixel_l2": selected.reload_pixel_l2,
+                "reload_pixel_linf": selected.reload_pixel_linf,
+                "untargeted_success": selected.untargeted_success,
+                "targeted_success": selected.targeted_success,
+            }
+            shard_rows.append(shard_row)
+
+            manifest_row = {
+                "split": split_name,
+                "source_index": source_index,
+                "source_label": source_label,
+                "target_label": target_label,
+                "source_path": selected.candidate.source_path,
+                "selected_attack_name": selected.candidate.attack_name,
+                "candidate_attack_names": [row.candidate.attack_name for row in scored_candidates],
+                "selected_adv_path": str(selected.candidate.saved_path),
+                "selection_rule": selection_rule,
+                "pred_label": selected.pred_label,
+                "source_confidence": selected.source_confidence,
+                "target_confidence": selected.target_confidence,
+                "untargeted_success": selected.untargeted_success,
+                "targeted_success": selected.targeted_success,
+                "manifest_pixel_l2": selected.candidate.manifest_pixel_l2,
+                "manifest_pixel_linf": selected.candidate.manifest_pixel_linf,
+                "reload_pixel_l2": selected.reload_pixel_l2,
+                "reload_pixel_linf": selected.reload_pixel_linf,
+            }
+            selected_manifest_rows.append(manifest_row)
+            shard_lookup_updates.append((shard_id, selected.candidate.saved_path, len(shard_rows) - 1))
+
+            if len(shard_rows) >= args.shard_size:
+                shard_path = flush_shard(output_dir, shard_id, shard_rows, selected_manifest_rows[-len(shard_rows):], shard_lookup_updates)
+                LOGGER.info("saved shard %s", shard_path)
+                for row in selected_manifest_rows[-len(shard_rows):]:
+                    selected_manifest_file.write(json.dumps(row) + "\n")
+                shard_rows = []
+                shard_lookup_updates = []
+                shard_id += 1
+
+            progress.update(completed_groups, summary["selected_count"], f"selected {selected.candidate.attack_name}")
+            if args.log_every > 0 and completed_groups % args.log_every == 0:
+                progress.clear()
+                LOGGER.info(
+                    "processed %d / %d groups, selected=%d",
+                    completed_groups,
+                    len(group_items),
+                    summary["selected_count"],
+                )
+
+        if shard_rows:
+            shard_slice = selected_manifest_rows[-len(shard_rows):]
+            shard_path = flush_shard(output_dir, shard_id, shard_rows, shard_slice, shard_lookup_updates)
+            LOGGER.info("saved shard %s", shard_path)
+            for row in shard_slice:
+                selected_manifest_file.write(json.dumps(row) + "\n")
+
+    summary["selected_attack_counts"] = dict(sorted(selected_attack_counter.items()))
+    summary["selection_rule_counts"] = dict(sorted(selection_rule_counter.items()))
+    summary["untargeted_success_rate"] = (
+        summary["untargeted_success_count"] / summary["selected_count"] if summary["selected_count"] else 0.0
+    )
+    summary["targeted_success_rate"] = (
+        summary["targeted_success_count"] / summary["targeted_success_known_count"]
+        if summary["targeted_success_known_count"]
+        else None
+    )
+    summary["generated_at_unix"] = time.time()
+
+    summary_path = output_dir / "teacher_bank_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    progress.finish(completed_groups, summary["selected_count"], "finished")
+
+    LOGGER.info("teacher bank manifest written to %s", selected_manifest_path)
+    LOGGER.info("teacher bank summary written to %s", summary_path)
+    LOGGER.info(
+        "selected=%d untargeted_success_rate=%.4f targeted_success_rate=%s",
+        summary["selected_count"],
+        summary["untargeted_success_rate"],
+        f"{summary['targeted_success_rate']:.4f}" if summary["targeted_success_rate"] is not None else "n/a",
+    )
+
+
+if __name__ == "__main__":
+    main()

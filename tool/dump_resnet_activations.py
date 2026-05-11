@@ -278,6 +278,7 @@ def _write_run_metadata(
         "torchvision_pretrained_variant": effective_torchvision_pretrained_variant,
         "imagenet_preset": args.imagenet_preset,
         "num_workers": args.num_workers,
+        "max_samples": args.max_samples_per_split,
         "max_samples_per_split": args.max_samples_per_split,
         "overwrite": args.overwrite,
         "train_size": len(train_dataset), # type: ignore
@@ -340,10 +341,12 @@ def get_args_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--num-workers", type=int, default=0, help="number of dataloader workers")
     parser.add_argument(
+        "--max-samples",
         "--max-samples-per-split",
+        dest="max_samples_per_split",
         type=int,
         default=None,
-        help="optional debug cap applied independently to train and val",
+        help="process only the first N samples in each split",
     )
     parser.add_argument(
         "--overwrite",

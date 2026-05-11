@@ -10,3 +10,5 @@ info.json
 arguments.txt
 *????-??-??_??-??-??*/
 .vscode/settings.json
+imagenet1k_adversarial
+imagenet1k_latent_adversarial

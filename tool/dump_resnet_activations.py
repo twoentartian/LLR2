@@ -365,6 +365,7 @@ def main(args: argparse.Namespace) -> None:
     output_dir = Path(os.path.expanduser(args.output_dir)).resolve()
     device = torch.device(args.device)
     effective_torchvision_variant = args.torchvision_pretrained_variant if args.weights_path is None else "none"
+    using_random_init = args.weights_path is None and effective_torchvision_variant == "none"
 
     model, train_dataset, val_dataset = _build_workload(
         workload=args.workload,
@@ -374,6 +375,8 @@ def main(args: argparse.Namespace) -> None:
     if args.weights_path is not None:
         state_dict = _load_state_dict_from_path(os.path.expanduser(args.weights_path))
         model.load_state_dict(state_dict, strict=args.strict_load)
+    elif using_random_init:
+        print(f"Using randomly initialized weights for {args.workload}.")
 
     model.eval()
     model.to(device)

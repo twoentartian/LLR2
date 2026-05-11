@@ -18,7 +18,6 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from py_src.ml_setup.resnet import resnet18_cifar10, resnet50_imagenet1k
-from py_src.ml_setup_model import create_torchvision_model
 from py_src.model_opti_save_load import load_model_state_file
 
 
@@ -108,36 +107,15 @@ def _load_state_dict_from_path(path: str) -> dict[str, Any]:
         raise ValueError(f"could not extract a state_dict from {path}")
 
 
-def _resolve_torchvision_variant(workload: str, requested_variant: str) -> str | None:
+def _build_workload(workload: str) -> tuple[nn.Module, Dataset, Dataset]:
     if workload == "resnet18_cifar10":
-        if requested_variant not in ("auto", "none"):
-            raise ValueError("torchvision pretrained weights are not supported for resnet18_cifar10")
-        return None
-    if requested_variant == "auto":
-        return "default"
-    if requested_variant == "none":
-        return None
-    return requested_variant
-
-
-def _build_workload(
-    workload: str,
-    imagenet_preset: int,
-    torchvision_variant: str,
-) -> tuple[nn.Module, Dataset, Dataset]:
-    if workload == "resnet18_cifar10":
-        _resolve_torchvision_variant(workload, torchvision_variant)
         setup = resnet18_cifar10()
         model = setup.model
         train_dataset = setup.training_data
         val_dataset = setup.testing_data
     elif workload == "resnet50_imagenet1k":
-        setup = resnet50_imagenet1k(preset=imagenet_preset)
-        resolved_variant = _resolve_torchvision_variant(workload, torchvision_variant)
-        if resolved_variant is None:
-            model = setup.model
-        else:
-            model = create_torchvision_model("resnet50", resolved_variant)
+        setup = resnet50_imagenet1k()
+        model = setup.model
         train_dataset = setup.training_data
         val_dataset = setup.testing_data
     else:
@@ -265,7 +243,6 @@ def _write_run_metadata(
     output_dir: Path,
     *,
     args: argparse.Namespace,
-    effective_torchvision_pretrained_variant: str,
     train_dataset: Dataset,
     val_dataset: Dataset,
     recorder: ActivationRecorder,
@@ -275,8 +252,6 @@ def _write_run_metadata(
         "workload": args.workload,
         "device": str(device),
         "weights_path": args.weights_path,
-        "torchvision_pretrained_variant": effective_torchvision_pretrained_variant,
-        "imagenet_preset": args.imagenet_preset,
         "num_workers": args.num_workers,
         "max_samples": args.max_samples_per_split,
         "max_samples_per_split": args.max_samples_per_split,
@@ -299,82 +274,24 @@ def get_args_parser() -> argparse.ArgumentParser:
             "Only ResNet18+CIFAR10 and ResNet50+ImageNet1k are supported."
         )
     )
-    parser.add_argument(
-        "--workload",
-        choices=("resnet18_cifar10", "resnet50_imagenet1k"),
-        required=True,
-        help="model + dataset pair to run",
-    )
-    parser.add_argument(
-        "--output-dir",
-        required=True,
-        help="directory that will receive run_config.json plus train/ and val/ activation files",
-    )
-    parser.add_argument(
-        "--device",
-        default="cuda" if torch.cuda.is_available() else "cpu",
-        help="torch device for the forward pass",
-    )
-    parser.add_argument(
-        "--weights-path",
-        default=None,
-        help="optional model checkpoint or raw state_dict to load after the architecture is built",
-    )
-    parser.add_argument(
-        "--torchvision-pretrained-variant",
-        choices=("auto", "none", "default", "imagenet1k_v1", "imagenet1k_v2"),
-        default="none",
-        help=(
-            "for resnet50_imagenet1k only: choose torchvision pretrained weights. "
-            "'auto' resolves to the repo default; 'none' keeps the LLR2 random init unless --weights-path is used"
-        ),
-    )
-    parser.add_argument(
-        "--imagenet-preset",
-        type=int,
-        default=1,
-        choices=(0, 1),
-        help=(
-            "LLR2 ImageNet preset index used to build the dataset setup. "
-            "The script still overwrites the train split to use the validation transform"
-        ),
-    )
+    parser.add_argument("--workload", choices=("resnet18_cifar10", "resnet50_imagenet1k"), required=True, help="model + dataset pair to run")
+    parser.add_argument("--output-dir", required=True, help="directory that will receive run_config.json plus train/ and val/ activation files")
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="torch device for the forward pass")
+    parser.add_argument("--weights-path", default=None, help="optional model checkpoint or raw state_dict to load after the architecture is built")
     parser.add_argument("--num-workers", type=int, default=0, help="number of dataloader workers")
-    parser.add_argument(
-        "--max-samples",
-        "--max-samples-per-split",
-        dest="max_samples_per_split",
-        type=int,
-        default=None,
-        help="process only the first N samples in each split",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="overwrite existing sample files; by default existing files are skipped",
-    )
+    parser.add_argument("--max-samples", "--max-samples-per-split", dest="max_samples_per_split", type=int, default=None, help="process only the first N samples in each split")
+    parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=False, help="overwrite existing sample files; by default existing files are skipped")
     parser.add_argument("--log-every", type=int, default=50, help="progress print interval")
-    parser.add_argument(
-        "--strict-load",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="use strict state_dict loading when --weights-path is provided",
-    )
+    parser.add_argument("--strict-load", action=argparse.BooleanOptionalAction, default=True, help="use strict state_dict loading when --weights-path is provided")
     return parser
 
 
 def main(args: argparse.Namespace) -> None:
     output_dir = Path(os.path.expanduser(args.output_dir)).resolve()
     device = torch.device(args.device)
-    effective_torchvision_variant = args.torchvision_pretrained_variant if args.weights_path is None else "none"
-    using_random_init = args.weights_path is None and effective_torchvision_variant == "none"
+    using_random_init = args.weights_path is None
 
-    model, train_dataset, val_dataset = _build_workload(
-        workload=args.workload,
-        imagenet_preset=args.imagenet_preset,
-        torchvision_variant=effective_torchvision_variant,
-    )
+    model, train_dataset, val_dataset = _build_workload(args.workload)
     if args.weights_path is not None:
         state_dict = _load_state_dict_from_path(os.path.expanduser(args.weights_path))
         model.load_state_dict(state_dict, strict=args.strict_load)
@@ -388,7 +305,6 @@ def main(args: argparse.Namespace) -> None:
         _write_run_metadata(
             output_dir,
             args=args,
-            effective_torchvision_pretrained_variant=effective_torchvision_variant,
             train_dataset=train_dataset,
             val_dataset=val_dataset,
             recorder=recorder,

@@ -136,6 +136,33 @@ def _make_loader(dataset: Dataset, num_workers: int) -> DataLoader:
     )
 
 
+def _resolve_label_ids(dataset: Dataset) -> list[int]:
+    if hasattr(dataset, "classes"):
+        classes = dataset.classes  # type: ignore[attr-defined]
+        if isinstance(classes, Sequence):
+            return list(range(len(classes)))
+    if hasattr(dataset, "targets"):
+        targets = dataset.targets  # type: ignore[attr-defined]
+        if torch.is_tensor(targets):
+            return sorted(int(label) for label in targets.unique().tolist())
+        return sorted({int(label) for label in targets})
+    if hasattr(dataset, "samples"):
+        samples = dataset.samples  # type: ignore[attr-defined]
+        return sorted({int(sample[1]) for sample in samples})
+    raise ValueError("could not infer dataset label ids for balanced sampling")
+
+
+def _make_label_quota(dataset: Dataset, num_samples: int | None) -> dict[int, int] | None:
+    if num_samples is None:
+        return None
+    label_ids = _resolve_label_ids(dataset)
+    if len(label_ids) == 0:
+        raise ValueError("cannot build a label quota for a dataset with no labels")
+    base_quota = num_samples // len(label_ids)
+    remainder = num_samples % len(label_ids)
+    return {label: base_quota + (1 if index < remainder else 0) for index, label in enumerate(label_ids)}
+
+
 def _resolve_source_path(dataset: Dataset, index: int) -> str | None:
     if hasattr(dataset, "samples"):
         sample = dataset.samples[index]  # type: ignore[index]
@@ -202,18 +229,30 @@ def _process_split(
     log_every: int,
 ) -> None:
     loader = _make_loader(dataset, num_workers)
-    total_samples = len(dataset) # type: ignore
-    split_limit = total_samples if max_samples_per_split is None else min(total_samples, max_samples_per_split)
-    seen_samples = 0
+    label_quota = _make_label_quota(dataset, max_samples_per_split)
+    selected_per_label = {} if label_quota is None else {label: 0 for label in label_quota}
+    target_selected = None if label_quota is None else sum(label_quota.values())
+    scanned_samples = 0
+    selected_samples = 0
     saved_samples = 0
     skipped_samples = 0
 
     for image, target, dataset_index_tensor in loader:
-        if seen_samples >= split_limit:
+        if target_selected is not None and selected_samples >= target_selected:
             break
+        scanned_samples += 1
         dataset_index = int(dataset_index_tensor.item())
-        output_path = split_output_dir / f"{dataset_index:08d}.pt"
-        seen_samples += 1
+        label = int(target.item())
+        if label_quota is not None:
+            label_target = label_quota.get(label, 0)
+            label_count = selected_per_label.get(label, 0)
+            if label_count >= label_target:
+                if scanned_samples % log_every == 0:
+                    print(f"[{split_name}] scanned={scanned_samples} selected={selected_samples}/{target_selected} saved={saved_samples} skipped={skipped_samples}")
+                continue
+            selected_per_label[label] = label_count + 1
+        selected_samples += 1
+        output_path = split_output_dir / str(label) / f"{dataset_index:08d}.pt"
 
         if output_path.exists() and not overwrite:
             skipped_samples += 1
@@ -232,11 +271,9 @@ def _process_split(
             )
             saved_samples += 1
 
-        if seen_samples % log_every == 0 or seen_samples == split_limit:
-            print(
-                f"[{split_name}] processed={seen_samples}/{split_limit} "
-                f"saved={saved_samples} skipped={skipped_samples}"
-            )
+        if selected_samples % log_every == 0 or (target_selected is not None and selected_samples == target_selected):
+            selected_total = selected_samples if target_selected is None else f"{selected_samples}/{target_selected}"
+            print(f"[{split_name}] scanned={scanned_samples} selected={selected_total} saved={saved_samples} skipped={skipped_samples}")
 
 
 def _write_run_metadata(
@@ -253,13 +290,16 @@ def _write_run_metadata(
         "device": str(device),
         "weights_path": args.weights_path,
         "num_workers": args.num_workers,
-        "max_samples": args.max_samples_per_split,
-        "max_samples_per_split": args.max_samples_per_split,
+        "num_samples": args.num_samples_per_split,
+        "max_samples": args.num_samples_per_split,
+        "max_samples_per_split": args.num_samples_per_split,
         "overwrite": args.overwrite,
         "train_size": len(train_dataset), # type: ignore
         "val_size": len(val_dataset), # type: ignore
         "train_transform": repr(train_dataset.transform), # type: ignore
         "val_transform": repr(val_dataset.transform), # type: ignore
+        "output_layout": "split/<label>/<dataset_index>.pt",
+        "sampling_strategy": "balanced_per_label" if args.num_samples_per_split is not None else "all_samples",
         "leaf_module_names": recorder.leaf_module_names,
     }
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -279,7 +319,7 @@ def get_args_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu", help="torch device for the forward pass")
     parser.add_argument("--weights-path", default=None, help="optional model checkpoint or raw state_dict to load after the architecture is built")
     parser.add_argument("--num-workers", type=int, default=0, help="number of dataloader workers")
-    parser.add_argument("--max-samples", "--max-samples-per-split", dest="max_samples_per_split", type=int, default=None, help="process only the first N samples in each split")
+    parser.add_argument("--num-samples", "--max-samples", "--max-samples-per-split", dest="num_samples_per_split", type=int, default=None, help="process up to N samples in each split, balanced as evenly as possible across labels")
     parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=False, help="overwrite existing sample files; by default existing files are skipped")
     parser.add_argument("--log-every", type=int, default=50, help="progress print interval")
     parser.add_argument("--strict-load", action=argparse.BooleanOptionalAction, default=True, help="use strict state_dict loading when --weights-path is provided")
@@ -323,7 +363,7 @@ def main(args: argparse.Namespace) -> None:
             device=device,
             workload=args.workload,
             num_workers=args.num_workers,
-            max_samples_per_split=args.max_samples_per_split,
+            max_samples_per_split=args.num_samples_per_split,
             overwrite=args.overwrite,
             log_every=args.log_every,
         )
@@ -336,7 +376,7 @@ def main(args: argparse.Namespace) -> None:
             device=device,
             workload=args.workload,
             num_workers=args.num_workers,
-            max_samples_per_split=args.max_samples_per_split,
+            max_samples_per_split=args.num_samples_per_split,
             overwrite=args.overwrite,
             log_every=args.log_every,
         )

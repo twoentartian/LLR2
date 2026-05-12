@@ -37,6 +37,10 @@ class RunningTensorStats:
         return self.mean.to(dtype=torch.float32), variance.to(dtype=torch.float32)
 
 
+def _initialize_running_stats(layers: OrderedDict[str, torch.Tensor]) -> OrderedDict[str, RunningTensorStats]:
+    return OrderedDict((name, RunningTensorStats(tensor)) for name, tensor in layers.items())
+
+
 def _flatten_tensor_tree(prefix: str, value: Any) -> list[tuple[str, torch.Tensor]]:
     if torch.is_tensor(value):
         return [(prefix, value)]
@@ -63,6 +67,30 @@ def _extract_layer_tensors(payload: Mapping[str, Any]) -> OrderedDict[str, torch
         for name, tensor in _flatten_tensor_tree(str(layer_name), value):
             layers[name] = tensor
     return layers
+
+
+def _normalize_layer_name(layer_name: str) -> str:
+    normalized = layer_name
+    if ":" in normalized:
+        normalized = normalized.split(":", 1)[1]
+    if "#" in normalized:
+        normalized = normalized.split("#", 1)[0]
+    return normalized
+
+
+def _is_batch_norm_layer(layer_name: str) -> bool:
+    if layer_name == "input":
+        return False
+    module_name = _normalize_layer_name(layer_name)
+    if module_name == "bn1":
+        return True
+    if module_name.endswith("downsample.1"):
+        return True
+    return module_name.split(".")[-1].startswith("bn")
+
+
+def _filter_layers_in_forward_order(layers: OrderedDict[str, torch.Tensor]) -> OrderedDict[str, torch.Tensor]:
+    return OrderedDict((layer_name, tensor) for layer_name, tensor in layers.items() if not _is_batch_norm_layer(layer_name))
 
 
 def _load_payload(path: Path) -> Mapping[str, Any]:
@@ -115,12 +143,19 @@ def _make_layer_summary(layer_name: str, mean_tensor: torch.Tensor, variance_ten
     return summary, tensor_record
 
 
-def _summaries_for_json(layer_summaries: OrderedDict[str, dict[str, Any]]) -> OrderedDict[str, dict[str, Any]]:
-    ordered_names = sorted(layer_summaries, key=lambda name: layer_summaries[name]["amount_of_variation"], reverse=True)
-    ordered = OrderedDict()
-    for name in ordered_names:
-        ordered[name] = layer_summaries[name]
-    return ordered
+def _finalize_stats_collection(
+    stats: OrderedDict[str, RunningTensorStats],
+    include_tensors: bool,
+) -> tuple[OrderedDict[str, dict[str, Any]], OrderedDict[str, dict[str, torch.Tensor]] | None]:
+    layer_summaries: OrderedDict[str, dict[str, Any]] = OrderedDict()
+    layer_tensors: OrderedDict[str, dict[str, torch.Tensor]] | None = OrderedDict() if include_tensors else None
+    for layer_name, layer_stats in stats.items():
+        mean_tensor, variance_tensor = layer_stats.finalize()
+        summary, tensor_record = _make_layer_summary(layer_name, mean_tensor, variance_tensor, layer_stats.count)
+        layer_summaries[layer_name] = summary
+        if layer_tensors is not None:
+            layer_tensors[layer_name] = tensor_record
+    return layer_summaries, layer_tensors
 
 
 def _extract_label_from_metadata(payload: Mapping[str, Any], path: Path) -> int:
@@ -196,10 +231,14 @@ def main(args: argparse.Namespace) -> None:
     selected_labels = sorted(set(args.labels)) if args.labels is not None else available_labels
     if len(selected_labels) == 0:
         raise ValueError("no labels were selected for variation calculation")
+    missing_labels = [label for label in selected_labels if label not in available_labels]
+    if missing_labels:
+        raise ValueError(f"requested labels are not present in the activation dump: {missing_labels}")
     label_quota = _make_label_quota(selected_labels, args.num_samples)
     target_selected = None if label_quota is None else sum(label_quota.values())
     expected_layer_names: list[str] | None = None
-    stats: OrderedDict[str, RunningTensorStats] | None = None
+    overall_stats: OrderedDict[str, RunningTensorStats] | None = None
+    per_label_stats: dict[int, OrderedDict[str, RunningTensorStats]] = {}
     selected_per_label = {label: 0 for label in selected_labels}
     label_counts: dict[int, int] = {}
     matched_count = 0
@@ -219,38 +258,43 @@ def main(args: argparse.Namespace) -> None:
             continue
 
         payload = _load_payload(path)
-        layers = _extract_layer_tensors(payload)
+        layers = _filter_layers_in_forward_order(_extract_layer_tensors(payload))
         current_layer_names = list(layers.keys())
         if expected_layer_names is None:
+            if len(current_layer_names) == 0:
+                raise ValueError(f"no non-BatchNorm layers were found in {path}")
             expected_layer_names = current_layer_names
-            stats = OrderedDict((name, RunningTensorStats(tensor)) for name, tensor in layers.items())
+            overall_stats = _initialize_running_stats(layers)
         elif current_layer_names != expected_layer_names:
             raise ValueError(f"layer mismatch in {path}: expected {expected_layer_names[:5]}..., got {current_layer_names[:5]}...")
 
+        if label not in per_label_stats:
+            per_label_stats[label] = _initialize_running_stats(layers)
         selected_per_label[label] += 1
         label_counts[label] = label_counts.get(label, 0) + 1
         for layer_name, tensor in layers.items():
-            assert stats is not None
-            stats[layer_name].update(tensor)
+            assert overall_stats is not None
+            overall_stats[layer_name].update(tensor)
+            per_label_stats[label][layer_name].update(tensor)
         matched_count += 1
 
         if matched_count % args.log_every == 0 or (target_selected is not None and matched_count == target_selected):
             print(f"Scanned {scanned_count}/{len(candidate_file_paths)} files, matched {matched_count}.")
 
-    if stats is None or expected_layer_names is None or matched_count == 0:
+    if overall_stats is None or expected_layer_names is None or matched_count == 0:
         raise ValueError(f"no activation dump files matched split={args.split!r} and labels={selected_labels}")
 
     print(f"Finished scanning {scanned_count} files and using {matched_count} samples.")
 
-    layer_summaries: OrderedDict[str, dict[str, Any]] = OrderedDict()
-    layer_tensors: OrderedDict[str, dict[str, torch.Tensor]] = OrderedDict()
-    for layer_name, layer_stats in stats.items():
-        mean_tensor, variance_tensor = layer_stats.finalize()
-        summary, tensor_record = _make_layer_summary(layer_name, mean_tensor, variance_tensor, layer_stats.count)
-        layer_summaries[layer_name] = summary
-        layer_tensors[layer_name] = tensor_record
+    layer_summaries, layer_tensors = _finalize_stats_collection(overall_stats, include_tensors=True)
+    assert layer_tensors is not None
+    per_label_layer_summaries: OrderedDict[str, OrderedDict[str, dict[str, Any]]] = OrderedDict()
+    for label in selected_labels:
+        if label not in per_label_stats:
+            continue
+        label_summary, _ = _finalize_stats_collection(per_label_stats[label], include_tensors=False)
+        per_label_layer_summaries[str(label)] = label_summary
 
-    summary_by_variation = _summaries_for_json(layer_summaries)
     result = {
         "metadata": {
             "input_dir": str(input_dir),
@@ -265,13 +309,18 @@ def main(args: argparse.Namespace) -> None:
             "labels": selected_labels,
             "label_counts": {str(label): count for label, count in sorted(label_counts.items())},
             "per_label_quota": None if label_quota is None else {str(label): count for label, count in sorted(label_quota.items())},
-            "variation_definition": "amount_of_variation = mean(sample_variance_tensor) with sample variance denominator n-1",
+            "ignored_layers": "all BatchNorm layers are skipped, including bn* and downsample.1",
+            "report_order": "forward_order_after_batchnorm_filtering",
+            "variation_definition": "amount_of_variation = mean(sample_variance_tensor) with sample variance denominator n-1; reported for all selected samples and separately within each selected label",
             "source_run_config": dict(run_config) if run_config is not None else None,
+            "layer_order": list(layer_summaries.keys()),
+            "per_label_report": "summary_only",
         },
         "layer_summaries": layer_summaries,
         "layers": layer_tensors,
+        "per_label_layer_summaries": per_label_layer_summaries,
     }
-    json_result = {"metadata": result["metadata"], "layer_summaries": summary_by_variation}
+    json_result = {"metadata": result["metadata"], "layer_summaries": layer_summaries, "per_label_layer_summaries": per_label_layer_summaries}
 
     pt_path = output_dir / f"variation_{args.split}.pt"
     json_path = output_dir / f"variation_{args.split}.json"
@@ -281,9 +330,14 @@ def main(args: argparse.Namespace) -> None:
 
     print(f"Saved tensor statistics to {pt_path}.")
     print(f"Saved summary statistics to {json_path}.")
-    print("Top layers by amount_of_variation:")
-    for layer_name, summary in list(summary_by_variation.items())[:10]:
+    print("Overall variation, first layers in forward order:")
+    for layer_name, summary in list(layer_summaries.items())[:10]:
         print(f"  {layer_name}: {summary['amount_of_variation']:.8f}")
+    if len(per_label_layer_summaries) > 0:
+        first_label = next(iter(per_label_layer_summaries))
+        print(f"Within-label variation example for label {first_label}, first layers:")
+        for layer_name, summary in list(per_label_layer_summaries[first_label].items())[:5]:
+            print(f"  {layer_name}: {summary['amount_of_variation']:.8f}")
 
 
 if __name__ == "__main__":

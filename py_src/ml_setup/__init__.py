@@ -1,5 +1,7 @@
 from .factory import get_ml_setup_from_config
 from .ml_setup import MLSetup, ApplicationType
+from py_src.ml_setup_model import ModelType
+from py_src.ml_setup_dataset import DatasetType
 
 from .alexnet import alexnet_imagenet1k
 from .convnext import conveNeXt_tiny_imagenet1k, convnext_tiny_imagenet1k
@@ -32,7 +34,7 @@ from .grokking import (
 from .nanoclip import nanoclip_flickr30k_default
 
 __all__ = [
-    "get_ml_setup_from_config", "MLSetup", "ApplicationType",
+    "get_ml_setup_from_config", "MLSetup", "ApplicationType", "ModelType", "DatasetType",
     "alexnet_imagenet1k",
     "conveNeXt_tiny_imagenet1k", "convnext_tiny_imagenet1k",
     "densenet121_cifar10", "densenet121_imagenet1k", "densenet_cifar_cifar10",

@@ -2197,7 +2197,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--test_interval", type=int, default=1)
     parser.add_argument("--test_batch", type=int, default=100)
     parser.add_argument("-P", "--torch_preset_version", type=int, default=None)
-    parser.add_argument("-S", "--silence", action="store_true")
+    parser.add_argument("--silence", type=bool, default=True, help="disable the interactive check, default is True")
     parser.add_argument("--linear_interpolation_points_size", type=int, default=0)
     parser.add_argument("--linear_interpolation_dataset_size", type=int, default=1000)
     parser.add_argument("--disable_service_test", action="store_true")

@@ -11,6 +11,7 @@ from typing import Optional
 
 import torch
 
+from py_src.adapters import StandardAdapter, clone_adapter_for_model
 from py_src.util import MovingAverage
 
 
@@ -54,7 +55,8 @@ def rebuild_norm_layer_function(
 
     model.train()
     model.to(device)
-    criterion = _get_criterion(ml_setup)
+    criterion = _try_get_criterion(ml_setup)
+    adapter = clone_adapter_for_model(ml_setup.adapter, model, criterion=criterion)
     rebuild_norm_optimizer.load_state_dict(training_optimizer_state)
     _optimizer_to(rebuild_norm_optimizer, device)
 
@@ -64,26 +66,23 @@ def rebuild_norm_layer_function(
     step = 0
     while True:
         done = False
-        for data, label in dataloader:
+        for batch_idx, batch in enumerate(dataloader):
             step += 1
-            data = data.to(device, non_blocking=True)
-            label = label.to(device, non_blocking=True)
-            rebuild_norm_optimizer.zero_grad(set_to_none=True)
+            result = adapter.train_step(
+                batch=batch,
+                batch_idx=batch_idx,
+                optimizer=rebuild_norm_optimizer,
+                lr_scheduler=None,
+                device=device,
+                scaler=scaler,
+                backpropagation=True,
+                zero_grad=True,
+                step_optimizer=True,
+            )
+            if result.optimizer_was_run:
+                adapter.post_train_step()
 
-            if scaler is not None:
-                with torch.cuda.amp.autocast():
-                    out = model(data)
-                    loss = criterion(out, label)
-                scaler.scale(loss).backward()
-                scaler.step(rebuild_norm_optimizer)
-                scaler.update()
-            else:
-                out = model(data)
-                loss = criterion(out, label)
-                loss.backward()
-                rebuild_norm_optimizer.step()
-
-            loss_val = loss.item()
+            loss_val = result.loss
             moving_average.add(loss_val)
 
             if runtime_parameter.verbose and step % 10 == 0 and logger:
@@ -109,14 +108,21 @@ def rebuild_norm_layer_function(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _get_criterion(ml_setup) -> torch.nn.Module:
-    """Extract criterion from an MLSetup."""
-    from py_src.adapters import StandardAdapter
+def _try_get_criterion(ml_setup) -> Optional[torch.nn.Module]:
+    """Extract criterion from an MLSetup when the adapter exposes one."""
     criterion = getattr(ml_setup, "criterion", None)
     if criterion is not None:
         return criterion
     if isinstance(ml_setup.adapter, StandardAdapter):
         return ml_setup.adapter._criterion
+    return None
+
+
+def _get_criterion(ml_setup) -> torch.nn.Module:
+    """Extract criterion from an MLSetup."""
+    criterion = _try_get_criterion(ml_setup)
+    if criterion is not None:
+        return criterion
     raise AttributeError("Cannot extract criterion from adapter type: "
                          f"{type(ml_setup.adapter).__name__}")
 

@@ -38,7 +38,7 @@ from tool.find_high_accuracy_path.find_parameters import (
     ParameterRebuildNorm,
     ParameterTrain,
 )
-from tool.find_high_accuracy_path.functions import _get_criterion, _optimizer_to, rebuild_norm_layer_function
+from tool.find_high_accuracy_path.functions import _optimizer_to, _try_get_criterion, rebuild_norm_layer_function
 
 from py_src.engine import Device, train as engine_train
 from py_src.ml_setup.dataloader_util import DataloaderConfig
@@ -257,11 +257,8 @@ def _apply_ml_setup_compatibility(ml_setup) -> None:
         ml_setup.override_training_dataset_loader = ml_setup.override_train_loader
     if not hasattr(ml_setup, "override_testing_dataset_loader"):
         ml_setup.override_testing_dataset_loader = ml_setup.override_test_loader
-    if not hasattr(ml_setup, "criterion"):
-        try:
-            ml_setup.criterion = _get_criterion(ml_setup)
-        except AttributeError:
-            ml_setup.criterion = None
+    if getattr(ml_setup, "criterion", None) is None:
+        ml_setup.criterion = _try_get_criterion(ml_setup)
 
 
 def get_files_to_process(start_folder: str, end_folder: str, mode: str) -> list[tuple[str, str]]:
@@ -836,9 +833,8 @@ class FindHighAccuracyPathRunner:
                 prefetch_factor=general_parameter.dataloader_prefetch_factor,
             )
         )
-        self.criterion = _get_criterion(current_ml_setup)
+        self.criterion = _try_get_criterion(current_ml_setup)
         assert self.dataloader is not None
-        assert self.criterion is not None
 
         model.to(device)
         self.optimizer = self._build_train_optimizer(runtime_parameter, current_ml_setup)
@@ -1082,7 +1078,6 @@ class FindHighAccuracyPathRunner:
         assert self.child_logger is not None
         assert self.model is not None
         assert self.current_ml_setup is not None
-        assert self.criterion is not None
         assert self.device_obj is not None
         assert self.starting_point_stat is not None
         assert self.end_model_stat_dict is not None

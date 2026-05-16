@@ -8,6 +8,8 @@ import subprocess
 import sys
 import tempfile
 import json
+import pprint
+import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
@@ -458,6 +460,50 @@ def _format_state_order(state_names: list[str], include_buffers: bool) -> str:
     return "\n".join(lines)
 
 
+_INTERNAL_PHASE_COMPONENT_PATTERNS = (
+    re.compile(r"^(conv|bn|norm|relu|act|dropout|linear|fc)\d*$"),
+    re.compile(r"^(block|mlp|to_qkv|to_kv|to_q|to_k|to_v|to_out|attend|res_conv|proj)(\d+)?$"),
+)
+
+
+def _is_internal_phase_component(part: str) -> bool:
+    return any(pattern.match(part) for pattern in _INTERNAL_PHASE_COMPONENT_PATTERNS)
+
+
+def _should_keep_terminal_numeric(parts: list[str]) -> bool:
+    return (
+        len(parts) >= 3
+        and parts[-1].isdigit()
+        and parts[-2].isdigit()
+        and parts[-3] in {"downs", "ups"}
+    )
+
+
+def _phase_prefix_from_state_name(state_name: str) -> str:
+    parts = state_name.split(".")
+    if len(parts) <= 1:
+        return state_name
+
+    parts = parts[:-1]
+    if len(parts) > 1 and parts[-1].isdigit() and not _should_keep_terminal_numeric(parts):
+        parts.pop()
+    while len(parts) > 1 and _is_internal_phase_component(parts[-1]):
+        parts.pop()
+    return ".".join(parts)
+
+
+def _recommended_phase_prefixes_from_state_order(state_names: Iterable[str]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for state_name in state_names:
+        prefix = _phase_prefix_from_state_name(state_name)
+        if prefix in seen:
+            continue
+        seen.add(prefix)
+        ordered.append(prefix)
+    return ordered
+
+
 def _write_text_if_requested(path: Optional[str], content: str) -> None:
     if path is None:
         return
@@ -482,6 +528,15 @@ def _default_render_output_path(ml_setup: MLSetup, suffix: str) -> str:
 def _txt_output_path_from_pdf_path(pdf_path: str) -> str:
     base, _ = os.path.splitext(pdf_path)
     return f"{base}.txt"
+
+
+def _py_output_path_from_pdf_path(pdf_path: str) -> str:
+    base, _ = os.path.splitext(pdf_path)
+    return f"{base}.py"
+
+
+def _format_phase_prefixes_python(phase_prefixes: list[str]) -> str:
+    return "FDF_PHASE_PREFIXES = " + pprint.pformat(phase_prefixes, width=100) + "\n"
 
 
 def _resolve_optional_output_path(raw_value: Optional[str], default_path: str) -> Optional[str]:
@@ -586,6 +641,7 @@ def main() -> None:
         trace_source = "runtime hooks"
 
     state_order = _state_order_from_module_order(model, module_records, args.include_buffers)
+    phase_prefixes = _recommended_phase_prefixes_from_state_order(state_order)
 
     report_lines = [
         f"model_type={ml_setup.model_type.name}",
@@ -616,8 +672,10 @@ def main() -> None:
     )
     assert pdf_output_path is not None
     txt_output_path = _txt_output_path_from_pdf_path(pdf_output_path)
+    py_output_path = _py_output_path_from_pdf_path(pdf_output_path)
 
     _write_text_if_requested(txt_output_path, report_text)
+    _write_text_if_requested(py_output_path, _format_phase_prefixes_python(phase_prefixes))
 
     render_input_path: Optional[str] = None
     temporary_diagram_path: Optional[str] = None
@@ -647,6 +705,7 @@ def main() -> None:
     if diagram_output_path is not None:
         print(f"diagram_saved_to={diagram_output_path}")
     print(f"txt_saved_to={txt_output_path}")
+    print(f"py_saved_to={py_output_path}")
     if png_output_path is not None:
         print(f"png_saved_to={png_output_path}")
     if pdf_output_path is not None:

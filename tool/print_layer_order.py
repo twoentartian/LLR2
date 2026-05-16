@@ -460,6 +460,48 @@ def _format_state_order(state_names: list[str], include_buffers: bool) -> str:
     return "\n".join(lines)
 
 
+def _recommended_always_skip_layers(model: torch.nn.Module) -> tuple[list[str], list[str]]:
+    state_dict_keys = set(model.state_dict().keys())
+    child_prefixes = [name for name, _ in model.named_children()]
+
+    parameter_names: set[str] = set()
+    for name, _ in model.named_parameters():
+        if name in state_dict_keys:
+            parameter_names.add(name)
+            continue
+
+        matched = False
+        for prefix in child_prefixes:
+            candidate = f"{prefix}.{name}"
+            if candidate in state_dict_keys:
+                parameter_names.add(candidate)
+                matched = True
+        if not matched:
+            parameter_names.add(name)
+
+    skip_layer_keywords: set[str] = set()
+    skip_layers: list[str] = []
+
+    for name in state_dict_keys:
+        if name in parameter_names:
+            continue
+        if name.startswith("ema."):
+            skip_layer_keywords.add("ema")
+            continue
+        if name.endswith(".running_mean"):
+            skip_layer_keywords.add("running_mean")
+            continue
+        if name.endswith(".running_var"):
+            skip_layer_keywords.add("running_var")
+            continue
+        if name.endswith(".num_batches_tracked"):
+            skip_layer_keywords.add("num_batches_tracked")
+            continue
+        skip_layers.append(name)
+
+    return sorted(skip_layer_keywords), sorted(skip_layers)
+
+
 _INTERNAL_PHASE_COMPONENT_PATTERNS = (
     re.compile(r"^(conv|bn|norm|relu|act|dropout|linear|fc)\d*$"),
     re.compile(r"^(block|mlp|to_qkv|to_kv|to_q|to_k|to_v|to_out|attend|res_conv|proj)(\d+)?$"),
@@ -535,8 +577,20 @@ def _py_output_path_from_pdf_path(pdf_path: str) -> str:
     return f"{base}.py"
 
 
-def _format_phase_prefixes_python(phase_prefixes: list[str]) -> str:
-    return "FDF_PHASE_PREFIXES = " + pprint.pformat(phase_prefixes, width=100) + "\n"
+def _format_phase_prefixes_python(
+    phase_prefixes: list[str],
+    always_skip_keywords: list[str],
+    always_skip_layers: list[str],
+) -> str:
+    parts = [
+        "FDF_PHASE_PREFIXES = " + pprint.pformat(phase_prefixes, width=100),
+        "",
+        "FDF_ALWAYS_SKIP_KEYWORDS = " + pprint.pformat(always_skip_keywords, width=100),
+        "",
+        "FDF_ALWAYS_SKIP_LAYERS = " + pprint.pformat(always_skip_layers, width=100),
+        "",
+    ]
+    return "\n".join(parts)
 
 
 def _resolve_optional_output_path(raw_value: Optional[str], default_path: str) -> Optional[str]:
@@ -642,6 +696,7 @@ def main() -> None:
 
     state_order = _state_order_from_module_order(model, module_records, args.include_buffers)
     phase_prefixes = _recommended_phase_prefixes_from_state_order(state_order)
+    always_skip_keywords, always_skip_layers = _recommended_always_skip_layers(model)
 
     report_lines = [
         f"model_type={ml_setup.model_type.name}",
@@ -675,7 +730,10 @@ def main() -> None:
     py_output_path = _py_output_path_from_pdf_path(pdf_output_path)
 
     _write_text_if_requested(txt_output_path, report_text)
-    _write_text_if_requested(py_output_path, _format_phase_prefixes_python(phase_prefixes))
+    _write_text_if_requested(
+        py_output_path,
+        _format_phase_prefixes_python(phase_prefixes, always_skip_keywords, always_skip_layers),
+    )
 
     render_input_path: Optional[str] = None
     temporary_diagram_path: Optional[str] = None

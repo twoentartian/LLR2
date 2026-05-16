@@ -345,6 +345,33 @@ def calculate_layer_wise_projection_to_variance_sphere(
     return output
 
 
+def _build_compensate_destination(
+    source_state: Dict[str, Any],
+    end_state: Dict[str, Any],
+    layer_names: list[str],
+) -> tuple[Dict[str, Any], list[str]]:
+    destination: Dict[str, Any] = {}
+    skipped_layers: list[str] = []
+
+    for layer_name in sorted(set(layer_names)):
+        if layer_name not in source_state or layer_name not in end_state:
+            skipped_layers.append(layer_name)
+            continue
+
+        source_value = source_state[layer_name]
+        end_value = end_state[layer_name]
+        if not (torch.is_tensor(source_value) and torch.is_tensor(end_value)):
+            skipped_layers.append(layer_name)
+            continue
+        if not (source_value.dtype.is_floating_point and end_value.dtype.is_floating_point):
+            skipped_layers.append(layer_name)
+            continue
+
+        destination[layer_name] = source_value.detach().clone() * 2 - end_value
+
+    return destination, skipped_layers
+
+
 def _capture_attention_state(
     model_state: Dict[str, Any],
     attention_layers: list[str],
@@ -1611,11 +1638,30 @@ class FindHighAccuracyPathRunner:
             ratio_step_per_layer=self.ratio_step_size,
         )
 
-        compensate_destination = {
-            key: value.detach().clone() * 2 - end_model_stat_dict[key]
-            for key, value in current_state.items()
-        }
-        if self.compensate_move_layer:
+        compensate_move_layer = list(self.compensate_move_layer)
+        compensate_movex2_layer = list(self.compensate_movex2_layer)
+        compensate_destination: Dict[str, Any] = {}
+        requested_compensate_layers = compensate_move_layer + compensate_movex2_layer
+        if requested_compensate_layers:
+            compensate_destination, skipped_compensate_layers = _build_compensate_destination(
+                current_state,
+                end_model_stat_dict,
+                requested_compensate_layers,
+            )
+            if skipped_compensate_layers:
+                child_logger.info(
+                    "skip_compensate (%s): %s",
+                    len(skipped_compensate_layers),
+                    skipped_compensate_layers,
+                )
+            compensate_move_layer = [
+                layer_name for layer_name in compensate_move_layer if layer_name in compensate_destination
+            ]
+            compensate_movex2_layer = [
+                layer_name for layer_name in compensate_movex2_layer if layer_name in compensate_destination
+            ]
+
+        if compensate_move_layer:
             if self.ratio_step_size is not None:
                 child_logger.warning("ratio_step_size with compensate layers can be hard to interpret")
             target_state = move_model_state_toward(
@@ -1624,17 +1670,17 @@ class FindHighAccuracyPathRunner:
                 step_size,
                 adoptive_step_size,
                 enable_merge_bias_with_weight=merge_bias_with_weights,
-                move_layer=self.compensate_move_layer,
+                move_layer=compensate_move_layer,
                 ratio_step_per_layer=self.ratio_step_size,
             )
-        if self.compensate_movex2_layer:
+        if compensate_movex2_layer:
             target_state = move_model_state_toward(
                 target_state,
                 compensate_destination,
                 step_size,
                 adoptive_step_size,
                 enable_merge_bias_with_weight=merge_bias_with_weights,
-                move_layer=self.compensate_movex2_layer,
+                move_layer=compensate_movex2_layer,
                 ratio_step_per_layer=self.ratio_step_size,
             )
 

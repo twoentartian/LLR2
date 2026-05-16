@@ -38,6 +38,36 @@ class _ToyDiffusionModel(nn.Module):
 
 
 class TestFindHighAccuracyPathHelpers(unittest.TestCase):
+    def test_build_compensate_destination_only_uses_requested_floating_layers(self) -> None:
+        impl = find_high_accuracy_path_pkg._load_impl_module()
+        source_state = {
+            "proj.weight": torch.tensor([2.0, 3.0]),
+            "proj.mask": torch.tensor([True, False]),
+        }
+        end_state = {
+            "proj.weight": torch.tensor([0.5, 1.5]),
+            "proj.mask": torch.tensor([False, True]),
+        }
+
+        destination, skipped_layers = impl._build_compensate_destination(
+            source_state,
+            end_state,
+            ["proj.weight"],
+        )
+
+        self.assertEqual(skipped_layers, [])
+        self.assertEqual(sorted(destination.keys()), ["proj.weight"])
+        self.assertTrue(torch.equal(destination["proj.weight"], torch.tensor([3.5, 4.5])))
+
+        destination, skipped_layers = impl._build_compensate_destination(
+            source_state,
+            end_state,
+            ["proj.weight", "proj.mask"],
+        )
+
+        self.assertEqual(skipped_layers, ["proj.mask"])
+        self.assertEqual(sorted(destination.keys()), ["proj.weight"])
+
     def test_apply_ml_setup_compatibility_backfills_standard_adapter_criterion(self) -> None:
         model = nn.Linear(4, 2)
         criterion = nn.CrossEntropyLoss()

@@ -227,6 +227,39 @@ def _state_dicts_equal(state_a: Dict[str, Any], state_b: Dict[str, Any]) -> bool
     return True
 
 
+def _get_trainable_state_keys(model: torch.nn.Module, model_state: Dict[str, Any]) -> list[str]:
+    parameter_ids = {id(parameter) for parameter in model.parameters()}
+    state_with_vars = model.state_dict(keep_vars=True)
+    return sorted(
+        key
+        for key, value in state_with_vars.items()
+        if id(value) in parameter_ids
+    )
+
+
+def _get_non_trainable_state_keys(model: torch.nn.Module, model_state: Dict[str, Any]) -> list[str]:
+    trainable_keys = set(_get_trainable_state_keys(model, model_state))
+    return sorted(key for key in model_state.keys() if key not in trainable_keys)
+
+
+def _state_dicts_equal_on_keys(
+    state_a: Dict[str, Any],
+    state_b: Dict[str, Any],
+    keys: Iterable[str],
+) -> bool:
+    for key in keys:
+        if key not in state_a or key not in state_b:
+            return False
+        value_a = state_a[key]
+        value_b = state_b[key]
+        if torch.is_tensor(value_a) and torch.is_tensor(value_b):
+            if not torch.equal(value_a, value_b):
+                return False
+        elif value_a != value_b:
+            return False
+    return True
+
+
 def _compute_file_sha256(path: Optional[str]) -> Optional[str]:
     if path is None or not os.path.exists(path):
         return None
@@ -553,6 +586,8 @@ class FindHighAccuracyPathRunner:
         self.compensate_movex2_layer: list[str] = []
         self.attention_layer: list[str] = []
         self.ignore_move_layers: list[str] = []
+        self.trainable_state_keys: list[str] = []
+        self.non_trainable_state_keys: list[str] = []
         self.ratio_step_size: Optional[dict[str, float]] = None
 
         self.initialized = False
@@ -1002,6 +1037,8 @@ class FindHighAccuracyPathRunner:
             assert self.model is not None
             model = self.model
             model.load_state_dict(start_model_state)
+            self.trainable_state_keys = _get_trainable_state_keys(model, start_model_state)
+            self.non_trainable_state_keys = _get_non_trainable_state_keys(model, start_model_state)
             self.adapter = current_ml_setup.adapter
 
             if runtime_parameter.work_mode == WorkMode.to_origin:
@@ -1051,7 +1088,8 @@ class FindHighAccuracyPathRunner:
                 raise NotImplementedError(f"Unknown work mode: {runtime_parameter.work_mode}")
 
             assert self.end_model_stat_dict is not None
-            assert not _state_dicts_equal(start_model_state, self.end_model_stat_dict), (
+            keys_to_compare = self.trainable_state_keys or list(start_model_state.keys())
+            assert not _state_dicts_equal_on_keys(start_model_state, self.end_model_stat_dict, keys_to_compare), (
                 "Starting model is identical to destination model"
             )
 
@@ -1087,6 +1125,8 @@ class FindHighAccuracyPathRunner:
             model = self.model
             assert checkpoint_content.current_model_stat is not None
             model.load_state_dict(checkpoint_content.current_model_stat)
+            self.trainable_state_keys = _get_trainable_state_keys(model, checkpoint_content.current_model_stat)
+            self.non_trainable_state_keys = _get_non_trainable_state_keys(model, checkpoint_content.current_model_stat)
             assert self.current_phase_start_model_stat is not None
             self.adapter = current_ml_setup.adapter
 
@@ -1272,6 +1312,7 @@ class FindHighAccuracyPathRunner:
         self.compensate_movex2_layer = []
         self.attention_layer = []
         self.ignore_move_layers = []
+        self.ignore_move_layers.extend(self.non_trainable_state_keys)
 
         norm_results = find_normalization_layers(model)
         batch_norm_layer_names, _ = find_layers_according_to_name_and_keyword(
@@ -1364,9 +1405,11 @@ class FindHighAccuracyPathRunner:
             return
 
         ratio_step_size: dict[str, float] = {}
-        for layer_name, current_weights in current_phase_start_model_stat.items():
+        movable_keys = self.trainable_state_keys or list(current_phase_start_model_stat.keys())
+        for layer_name in movable_keys:
             if layer_name not in end_model_stat_dict:
                 continue
+            current_weights = current_phase_start_model_stat[layer_name]
             distance = geodesic_distance(current_weights, end_model_stat_dict[layer_name])
             if distance is not None:
                 ratio_step_size[layer_name] = distance.item() * parameter_move.ratio_step_size

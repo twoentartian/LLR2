@@ -209,11 +209,12 @@ def _generate_sample_from_zero_to_one(
     current_epoch: int,
     device: torch.device,
     count: int,
+    seed: Optional[int] = None,
 ) -> None:
     old_mode = model.training
     model.eval()
     try:
-        with _fixed_sampling_seed(device, _FLOWERS_SAMPLE_SEED):
+        with _fixed_sampling_seed(device, _FLOWERS_SAMPLE_SEED if seed is None else seed):
             samples = model.sample(batch_size=count)  # type: ignore
         _save_samples(samples, output_folder, current_epoch)
     finally:

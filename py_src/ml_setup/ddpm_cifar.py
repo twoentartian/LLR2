@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 from typing import Literal, Optional
 
@@ -96,16 +97,38 @@ def _save_samples(samples: torch.Tensor, output_folder: str, current_epoch: int)
         )
 
 
+@contextmanager
+def _fixed_sampling_seed(device: torch.device, seed: Optional[int]):
+    if seed is None:
+        yield
+        return
+
+    devices: list[int] = []
+    if device.type == "cuda":
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        devices = [device_index]
+
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(seed)
+        yield
+
+
 def _generate_sample_from_neg_one_to_one(
     model: torch.nn.Module,
     output_folder: str,
     current_epoch: int,
     device: torch.device,
     count: int,
+    seed: Optional[int] = None,
 ) -> None:
+    old_mode = model.training
     model.eval()
-    samples = model.sample(count, device)  # type: ignore
-    _save_samples((samples + 1) / 2, output_folder, current_epoch)
+    try:
+        with _fixed_sampling_seed(device, seed):
+            samples = model.sample(count, device)  # type: ignore
+        _save_samples((samples + 1) / 2, output_folder, current_epoch)
+    finally:
+        model.train(old_mode)
 
 
 def ddpm_cifar10(override_dataset: Optional[DatasetSetup] = None) -> MLSetup:

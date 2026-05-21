@@ -37,6 +37,36 @@ class _ToyDiffusionModel(nn.Module):
         return x.pow(2).mean()
 
 
+class _ToyTrainDiffusion(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Linear(4, 4)
+        self.register_buffer("betas", torch.tensor([0.1, 0.2]))
+
+
+class _ToyDiffusionWrapper(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.train_diffusion = _ToyTrainDiffusion()
+        self.ema = nn.Linear(4, 4)
+        self.register_buffer("ema_step", torch.tensor(0))
+
+    def parameters(self, recurse: bool = True):
+        return self.train_diffusion.parameters(recurse=recurse)
+
+    def named_parameters(
+        self,
+        prefix: str = "",
+        recurse: bool = True,
+        remove_duplicate: bool = True,
+    ):
+        return self.train_diffusion.named_parameters(
+            prefix=prefix,
+            recurse=recurse,
+            remove_duplicate=remove_duplicate,
+        )
+
+
 class TestFindHighAccuracyPathHelpers(unittest.TestCase):
     def test_build_compensate_destination_only_uses_requested_floating_layers(self) -> None:
         impl = find_high_accuracy_path_pkg._load_impl_module()
@@ -100,6 +130,40 @@ class TestFindHighAccuracyPathHelpers(unittest.TestCase):
         )
 
         self.assertIsNone(_try_get_criterion(ml_setup))
+
+    def test_trainable_state_key_detection_ignores_ema_and_buffers(self) -> None:
+        model = _ToyDiffusionWrapper()
+        model_state = model.state_dict()
+        impl = find_high_accuracy_path_pkg._load_impl_module()
+
+        trainable_keys = impl._get_trainable_state_keys(model, model_state)
+        non_trainable_keys = impl._get_non_trainable_state_keys(model, model_state)
+
+        self.assertEqual(
+            trainable_keys,
+            [
+                "train_diffusion.proj.bias",
+                "train_diffusion.proj.weight",
+            ],
+        )
+        self.assertIn("train_diffusion.betas", non_trainable_keys)
+        self.assertIn("ema.weight", non_trainable_keys)
+        self.assertIn("ema.bias", non_trainable_keys)
+        self.assertIn("ema_step", non_trainable_keys)
+        self.assertNotIn("train_diffusion.proj.weight", non_trainable_keys)
+
+    def test_state_dict_equality_on_trainable_keys_ignores_ema_only_differences(self) -> None:
+        model = _ToyDiffusionWrapper()
+        impl = find_high_accuracy_path_pkg._load_impl_module()
+        state_a = _clone_state_dict(model.state_dict())
+        state_b = _clone_state_dict(model.state_dict())
+        state_b["ema.weight"] = state_b["ema.weight"] + 1.0
+        state_b["train_diffusion.betas"] = state_b["train_diffusion.betas"] + 1.0
+
+        trainable_keys = impl._get_trainable_state_keys(model, state_a)
+
+        self.assertFalse(impl._state_dicts_equal(state_a, state_b))
+        self.assertTrue(impl._state_dicts_equal_on_keys(state_a, state_b, trainable_keys))
 
     def test_rebuild_norm_layer_function_uses_diffusion_adapter_training_step(self) -> None:
         torch.manual_seed(0)

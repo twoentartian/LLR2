@@ -235,6 +235,26 @@ class TestRunSingleBatch(unittest.TestCase):
                 with open(first_path, "rb") as first_file, open(second_path, "rb") as second_file:
                     self.assertEqual(first_file.read(), second_file.read())
 
+    def test_ddpm_flowers102_sample_hook_allows_seed_override(self):
+        from py_src.ml_setup.ddpm_flowers import _generate_sample_from_zero_to_one
+
+        model = _RandomSamplingModel()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _generate_sample_from_zero_to_one(model, tmpdir, 0, torch.device("cpu"), 1, 11)
+            _generate_sample_from_zero_to_one(model, tmpdir, 1, torch.device("cpu"), 1, 11)
+            _generate_sample_from_zero_to_one(model, tmpdir, 2, torch.device("cpu"), 1, 12)
+
+            with open(os.path.join(tmpdir, "epoch0_0.png"), "rb") as first_file:
+                first_bytes = first_file.read()
+            with open(os.path.join(tmpdir, "epoch1_0.png"), "rb") as second_file:
+                second_bytes = second_file.read()
+            with open(os.path.join(tmpdir, "epoch2_0.png"), "rb") as third_file:
+                third_bytes = third_file.read()
+
+            self.assertEqual(first_bytes, second_bytes)
+            self.assertNotEqual(first_bytes, third_bytes)
+
     def test_arithmetic_addition_grokking_train_and_val(self):
         self._assert_classifier_single_batch(
             "arithmetic_addition_grokking",

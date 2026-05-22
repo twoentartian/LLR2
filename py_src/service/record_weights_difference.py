@@ -18,6 +18,15 @@ from py_src.service_base import Service
 from py_src.simulation_runtime_parameters import RuntimeParameters, SimulationPhase
 
 
+def _resolve_layer_order(
+    model_stat: dict,
+    layer_names: Optional[List[str]],
+) -> List[str]:
+    if layer_names is None:
+        return list(model_stat.keys())
+    return [name for name in layer_names if name in model_stat]
+
+
 # ---------------------------------------------------------------------------
 # ServiceWeightsDifferenceRecorder
 # ---------------------------------------------------------------------------
@@ -32,11 +41,13 @@ class ServiceWeightsDifferenceRecorder(Service):
         interval: int,
         l1_save_file_name: str = "weight_difference_l1.csv",
         l2_save_file_name: str = "weight_difference_l2.csv",
+        layer_names: Optional[List[str]] = None,
     ):
         super().__init__()
         self.interval = interval
         self.l1_save_file_name = l1_save_file_name
         self.l2_save_file_name = l2_save_file_name
+        self.layer_names = list(layer_names) if layer_names is not None else None
         self.l1_save_file = None
         self.l2_save_file = None
         self.layer_order: Optional[List[str]] = None
@@ -74,7 +85,7 @@ class ServiceWeightsDifferenceRecorder(Service):
         self.logger = logger
         self.l1_save_file = open(os.path.join(output_path, self.l1_save_file_name), "w+")
         self.l2_save_file = open(os.path.join(output_path, self.l2_save_file_name), "w+")
-        self.layer_order = list(model_stats[0].keys())
+        self.layer_order = _resolve_layer_order(model_stats[0], self.layer_names)
         header = ",".join(["tick", *self.layer_order])
         self.l1_save_file.write(header + "\n")
         self.l2_save_file.write(header + "\n")
@@ -139,12 +150,14 @@ class ServiceDistanceToOriginRecorder(Service):
         nodes_to_record: List[int],
         l1_save_file_name: str = "distance_to_origin_l1.csv",
         l2_save_file_name: str = "distance_to_origin_l2.csv",
+        layer_names: Optional[List[str]] = None,
     ):
         super().__init__()
         self.interval = interval
         self.nodes_to_record = nodes_to_record
         self.l1_save_file_name = l1_save_file_name
         self.l2_save_file_name = l2_save_file_name
+        self.layer_names = list(layer_names) if layer_names is not None else None
         self.l1_save_file: Dict = {}
         self.l2_save_file: Dict = {}
         self.layer_order: Optional[List[str]] = None
@@ -183,7 +196,7 @@ class ServiceDistanceToOriginRecorder(Service):
     ):
         self.logger = logger
         first_stat = next(iter(node_name_and_model_stat.values()))
-        self.layer_order = list(first_stat.keys())
+        self.layer_order = _resolve_layer_order(first_stat, self.layer_names)
         header = ",".join(["tick", *self.layer_order])
         for node_name in node_name_and_model_stat:
             f1 = open(os.path.join(output_path, f"{node_name}__{self.l1_save_file_name}"), "w+")

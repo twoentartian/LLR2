@@ -1163,8 +1163,16 @@ class FindHighAccuracyPathRunner:
         child_logger.info("Initializing services")
         current_state = model.state_dict()
         all_model_states = [current_state, end_model_stat_dict]
+        trainable_layer_names = self.trainable_state_keys or list(current_state.keys())
+        weight_metric_layer_names = [
+            name for name in trainable_layer_names
+            if "weight" in name
+        ]
 
-        self.weight_diff_service = record_weights_difference.ServiceWeightsDifferenceRecorder(1)
+        self.weight_diff_service = record_weights_difference.ServiceWeightsDifferenceRecorder(
+            1,
+            layer_names=trainable_layer_names,
+        )
         self.weight_diff_service.initialize_without_runtime_parameters(
             all_model_states,
             output_path,
@@ -1175,6 +1183,7 @@ class FindHighAccuracyPathRunner:
             1,
             l1_save_file_name="weight_change_l1.csv",
             l2_save_file_name="weight_change_l2.csv",
+            layer_names=trainable_layer_names,
         )
         self.model_state_of_last_tick = _clone_state_dict(current_state)
         self.weight_change_service.initialize_without_runtime_parameters(
@@ -1183,14 +1192,21 @@ class FindHighAccuracyPathRunner:
             logger=child_logger,
         )
 
-        self.distance_to_origin_service = record_weights_difference.ServiceDistanceToOriginRecorder(1, [0])
+        self.distance_to_origin_service = record_weights_difference.ServiceDistanceToOriginRecorder(
+            1,
+            [0],
+            layer_names=trainable_layer_names,
+        )
         self.distance_to_origin_service.initialize_without_runtime_parameters(
             {0: starting_point_stat},
             output_path,
             logger=child_logger,
         )
 
-        self.record_variance_service = record_variance.ServiceVarianceRecorder(1)
+        self.record_variance_service = record_variance.ServiceVarianceRecorder(
+            1,
+            layer_names=weight_metric_layer_names,
+        )
         self.record_variance_service.initialize_without_runtime_parameters(
             [0],
             [starting_point_stat],
@@ -1199,7 +1215,10 @@ class FindHighAccuracyPathRunner:
         )
 
         if not runtime_parameter.service_cosine_similarity_disable:
-            self.record_cosine_similarity_service = record_cosine_similarity.ServiceCosineSimilarityRecorder(1)
+            self.record_cosine_similarity_service = record_cosine_similarity.ServiceCosineSimilarityRecorder(
+                1,
+                layer_names=weight_metric_layer_names,
+            )
             if runtime_parameter.service_cosine_similarity_ref_model is None:
                 reference_model = starting_point_stat
             else:

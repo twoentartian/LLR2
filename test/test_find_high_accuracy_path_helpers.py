@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import tempfile
 from types import SimpleNamespace
 import unittest
 
@@ -11,6 +13,7 @@ from py_src.adapters import DiffusionAdapter, StandardAdapter
 from py_src.ml_setup.ml_setup import MLSetup
 from py_src.ml_setup_dataset import DatasetType
 from py_src.ml_setup_model import ModelType
+from py_src.service import record_cosine_similarity, record_variance, record_weights_difference
 from tool.find_high_accuracy_path.functions import _try_get_criterion, rebuild_norm_layer_function
 import tool.find_high_accuracy_path as find_high_accuracy_path_pkg
 
@@ -23,6 +26,11 @@ def _clone_state_dict(state_dict):
         else:
             output[key] = value
     return output
+
+
+def _read_nonempty_lines(path: str) -> list[str]:
+    with open(path, "r", encoding="utf-8") as file:
+        return [line.strip() for line in file if line.strip()]
 
 
 class _ToyDiffusionModel(nn.Module):
@@ -164,6 +172,93 @@ class TestFindHighAccuracyPathHelpers(unittest.TestCase):
 
         self.assertFalse(impl._state_dicts_equal(state_a, state_b))
         self.assertTrue(impl._state_dicts_equal_on_keys(state_a, state_b, trainable_keys))
+
+    def test_weight_difference_and_distance_services_can_filter_non_trainable_layers(self) -> None:
+        model = _ToyDiffusionWrapper()
+        impl = find_high_accuracy_path_pkg._load_impl_module()
+        state_a = _clone_state_dict(model.state_dict())
+        state_b = _clone_state_dict(model.state_dict())
+        state_b["train_diffusion.proj.weight"] = state_b["train_diffusion.proj.weight"] + 1.0
+        state_b["train_diffusion.proj.bias"] = state_b["train_diffusion.proj.bias"] + 2.0
+        state_b["ema.weight"] = state_b["ema.weight"] + 3.0
+        state_b["train_diffusion.betas"] = state_b["train_diffusion.betas"] + 4.0
+        trainable_keys = impl._get_trainable_state_keys(model, state_a)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            weight_service = record_weights_difference.ServiceWeightsDifferenceRecorder(
+                1,
+                layer_names=trainable_keys,
+            )
+            weight_service.initialize_without_runtime_parameters([state_a, state_b], temp_dir)
+            weight_service.trigger_without_runtime_parameters(7, [state_a, state_b])
+
+            l1_lines = _read_nonempty_lines(os.path.join(temp_dir, "weight_difference_l1.csv"))
+            self.assertEqual(
+                l1_lines[0],
+                "tick,train_diffusion.proj.bias,train_diffusion.proj.weight",
+            )
+            self.assertEqual(len(l1_lines), 2)
+            self.assertNotIn("ema.weight", l1_lines[0])
+            self.assertNotIn("train_diffusion.betas", l1_lines[0])
+
+            origin_service = record_weights_difference.ServiceDistanceToOriginRecorder(
+                1,
+                [0],
+                layer_names=trainable_keys,
+            )
+            origin_service.initialize_without_runtime_parameters({0: state_a}, temp_dir)
+            origin_service.trigger_without_runtime_parameters(7, {0: state_b})
+
+            origin_lines = _read_nonempty_lines(os.path.join(temp_dir, "0__distance_to_origin_l1.csv"))
+            self.assertEqual(
+                origin_lines[0],
+                "tick,train_diffusion.proj.bias,train_diffusion.proj.weight",
+            )
+            self.assertEqual(len(origin_lines), 2)
+            self.assertNotIn("ema.weight", origin_lines[0])
+            self.assertNotIn("train_diffusion.betas", origin_lines[0])
+
+    def test_variance_and_cosine_services_can_filter_non_trainable_layers(self) -> None:
+        state_a = {
+            "train_diffusion.proj.weight": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            "train_diffusion.proj.bias": torch.tensor([0.5, -0.5]),
+            "ema.weight": torch.tensor([[9.0, 9.0], [9.0, 9.0]]),
+            "train_diffusion.betas": torch.tensor([0.1, 0.2]),
+        }
+        state_b = {
+            "train_diffusion.proj.weight": torch.tensor([[2.0, 1.0], [4.0, 3.0]]),
+            "train_diffusion.proj.bias": torch.tensor([1.5, -1.5]),
+            "ema.weight": torch.tensor([[7.0, 7.0], [7.0, 7.0]]),
+            "train_diffusion.betas": torch.tensor([0.3, 0.4]),
+        }
+        weight_only_keys = ["train_diffusion.proj.weight"]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            variance_service = record_variance.ServiceVarianceRecorder(
+                1,
+                layer_names=weight_only_keys,
+            )
+            variance_service.initialize_without_runtime_parameters([0], [state_a], temp_dir)
+            variance_service.trigger_without_runtime_parameters(11, [0], [state_b], phase_str="END_OF_TICK")
+
+            variance_lines = _read_nonempty_lines(os.path.join(temp_dir, "variance", "0.csv"))
+            self.assertEqual(variance_lines[0], "tick,phase,train_diffusion.proj.weight")
+            self.assertEqual(len(variance_lines), 2)
+            self.assertNotIn("ema.weight", variance_lines[0])
+            self.assertNotIn("train_diffusion.proj.bias", variance_lines[0])
+
+            cosine_service = record_cosine_similarity.ServiceCosineSimilarityRecorder(
+                1,
+                layer_names=weight_only_keys,
+            )
+            cosine_service.initialize_without_runtime_parameters({0: state_a}, temp_dir)
+            cosine_service.trigger_without_runtime_parameters(11, {0: state_b}, phase_str="END_OF_TICK")
+
+            cosine_lines = _read_nonempty_lines(os.path.join(temp_dir, "cosine_similarity", "0.csv"))
+            self.assertEqual(cosine_lines[0], "tick,phase,train_diffusion.proj.weight")
+            self.assertEqual(len(cosine_lines), 2)
+            self.assertNotIn("ema.weight", cosine_lines[0])
+            self.assertNotIn("train_diffusion.proj.bias", cosine_lines[0])
 
     def test_rebuild_norm_layer_function_uses_diffusion_adapter_training_step(self) -> None:
         torch.manual_seed(0)

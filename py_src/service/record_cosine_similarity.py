@@ -29,11 +29,13 @@ class ServiceCosineSimilarityRecorder(Service):
         interval: int,
         phase: Optional[list] = None,
         record_node=None,
+        layer_names: Optional[List[str]] = None,
     ):
         super().__init__()
         self.interval = interval
         self.record_phase = phase or [SimulationPhase.END_OF_TICK]
         self.record_node = record_node
+        self.layer_names = list(layer_names) if layer_names is not None else None
         self.save_path: Optional[str] = None
         self.save_files: Dict = {}
         self.header_order: Optional[List[str]] = None
@@ -110,8 +112,12 @@ class ServiceCosineSimilarityRecorder(Service):
 
     def set_reference_model_state(self, node_name, model_stat: dict):
         """Store a CPU copy of the reference model state."""
+        if self.layer_names is None:
+            keys_to_store = model_stat.keys()
+        else:
+            keys_to_store = [name for name in self.layer_names if name in model_stat]
         self.reference_model_state[node_name] = {
-            k: v.detach().cpu().float() for k, v in model_stat.items()
+            k: model_stat[k].detach().cpu().float() for k in keys_to_store
         }
 
     # ---- internals ----------------------------------------------------------
@@ -140,7 +146,10 @@ class ServiceCosineSimilarityRecorder(Service):
 
     def _write_header(self, model_stat: dict, f):
         if self.header_order is None:
-            self.header_order = [name for name in model_stat if 'weight' in name]
+            if self.layer_names is None:
+                self.header_order = [name for name in model_stat if 'weight' in name]
+            else:
+                self.header_order = [name for name in self.layer_names if name in model_stat]
         header = ",".join(["tick", "phase", *self.header_order])
         f.write(header + "\n")
         f.flush()

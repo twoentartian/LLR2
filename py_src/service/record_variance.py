@@ -119,7 +119,8 @@ class ServiceVarianceRecorder(Service):
             if self.layer_names is None:
                 self.header_order = [name for name in model_stat if 'weight' in name]
             else:
-                self.header_order = [name for name in self.layer_names if name in model_stat]
+                allowed_names = set(self.layer_names)
+                self.header_order = [name for name in model_stat if name in allowed_names]
         header = ",".join(["tick", "phase", *self.header_order])
         f.write(header + "\n")
         f.flush()

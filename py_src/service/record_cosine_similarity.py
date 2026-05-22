@@ -113,9 +113,10 @@ class ServiceCosineSimilarityRecorder(Service):
     def set_reference_model_state(self, node_name, model_stat: dict):
         """Store a CPU copy of the reference model state."""
         if self.layer_names is None:
-            keys_to_store = model_stat.keys()
+            keys_to_store = list(model_stat.keys())
         else:
-            keys_to_store = [name for name in self.layer_names if name in model_stat]
+            allowed_names = set(self.layer_names)
+            keys_to_store = [name for name in model_stat if name in allowed_names]
         self.reference_model_state[node_name] = {
             k: model_stat[k].detach().cpu().float() for k in keys_to_store
         }
@@ -149,7 +150,8 @@ class ServiceCosineSimilarityRecorder(Service):
             if self.layer_names is None:
                 self.header_order = [name for name in model_stat if 'weight' in name]
             else:
-                self.header_order = [name for name in self.layer_names if name in model_stat]
+                allowed_names = set(self.layer_names)
+                self.header_order = [name for name in model_stat if name in allowed_names]
         header = ",".join(["tick", "phase", *self.header_order])
         f.write(header + "\n")
         f.flush()

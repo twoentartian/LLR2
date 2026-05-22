@@ -24,7 +24,8 @@ def _resolve_layer_order(
 ) -> List[str]:
     if layer_names is None:
         return list(model_stat.keys())
-    return [name for name in layer_names if name in model_stat]
+    allowed_names = set(layer_names)
+    return [name for name in model_stat.keys() if name in allowed_names]
 
 
 # ---------------------------------------------------------------------------

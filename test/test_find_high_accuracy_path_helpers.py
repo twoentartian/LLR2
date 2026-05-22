@@ -146,14 +146,19 @@ class TestFindHighAccuracyPathHelpers(unittest.TestCase):
 
         trainable_keys = impl._get_trainable_state_keys(model, model_state)
         non_trainable_keys = impl._get_non_trainable_state_keys(model, model_state)
+        expected_trainable_order = [
+            name
+            for name in model_state.keys()
+            if name in {"train_diffusion.proj.weight", "train_diffusion.proj.bias"}
+        ]
+        expected_non_trainable_order = [
+            name
+            for name in model_state.keys()
+            if name not in {"train_diffusion.proj.weight", "train_diffusion.proj.bias"}
+        ]
 
-        self.assertEqual(
-            trainable_keys,
-            [
-                "train_diffusion.proj.bias",
-                "train_diffusion.proj.weight",
-            ],
-        )
+        self.assertEqual(trainable_keys, expected_trainable_order)
+        self.assertEqual(non_trainable_keys, expected_non_trainable_order)
         self.assertIn("train_diffusion.betas", non_trainable_keys)
         self.assertIn("ema.weight", non_trainable_keys)
         self.assertIn("ema.bias", non_trainable_keys)
@@ -182,7 +187,12 @@ class TestFindHighAccuracyPathHelpers(unittest.TestCase):
         state_b["train_diffusion.proj.bias"] = state_b["train_diffusion.proj.bias"] + 2.0
         state_b["ema.weight"] = state_b["ema.weight"] + 3.0
         state_b["train_diffusion.betas"] = state_b["train_diffusion.betas"] + 4.0
-        trainable_keys = impl._get_trainable_state_keys(model, state_a)
+        trainable_keys = list(reversed(impl._get_trainable_state_keys(model, state_a)))
+        expected_header = "tick," + ",".join(
+            name
+            for name in state_a.keys()
+            if name in {"train_diffusion.proj.weight", "train_diffusion.proj.bias"}
+        )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             weight_service = record_weights_difference.ServiceWeightsDifferenceRecorder(
@@ -193,10 +203,7 @@ class TestFindHighAccuracyPathHelpers(unittest.TestCase):
             weight_service.trigger_without_runtime_parameters(7, [state_a, state_b])
 
             l1_lines = _read_nonempty_lines(os.path.join(temp_dir, "weight_difference_l1.csv"))
-            self.assertEqual(
-                l1_lines[0],
-                "tick,train_diffusion.proj.bias,train_diffusion.proj.weight",
-            )
+            self.assertEqual(l1_lines[0], expected_header)
             self.assertEqual(len(l1_lines), 2)
             self.assertNotIn("ema.weight", l1_lines[0])
             self.assertNotIn("train_diffusion.betas", l1_lines[0])
@@ -210,52 +217,57 @@ class TestFindHighAccuracyPathHelpers(unittest.TestCase):
             origin_service.trigger_without_runtime_parameters(7, {0: state_b})
 
             origin_lines = _read_nonempty_lines(os.path.join(temp_dir, "0__distance_to_origin_l1.csv"))
-            self.assertEqual(
-                origin_lines[0],
-                "tick,train_diffusion.proj.bias,train_diffusion.proj.weight",
-            )
+            self.assertEqual(origin_lines[0], expected_header)
             self.assertEqual(len(origin_lines), 2)
             self.assertNotIn("ema.weight", origin_lines[0])
             self.assertNotIn("train_diffusion.betas", origin_lines[0])
 
     def test_variance_and_cosine_services_can_filter_non_trainable_layers(self) -> None:
         state_a = {
+            "train_diffusion.second.weight": torch.tensor([[5.0, 6.0], [7.0, 8.0]]),
             "train_diffusion.proj.weight": torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
             "train_diffusion.proj.bias": torch.tensor([0.5, -0.5]),
             "ema.weight": torch.tensor([[9.0, 9.0], [9.0, 9.0]]),
             "train_diffusion.betas": torch.tensor([0.1, 0.2]),
         }
         state_b = {
+            "train_diffusion.second.weight": torch.tensor([[8.0, 7.0], [6.0, 5.0]]),
             "train_diffusion.proj.weight": torch.tensor([[2.0, 1.0], [4.0, 3.0]]),
             "train_diffusion.proj.bias": torch.tensor([1.5, -1.5]),
             "ema.weight": torch.tensor([[7.0, 7.0], [7.0, 7.0]]),
             "train_diffusion.betas": torch.tensor([0.3, 0.4]),
         }
-        weight_only_keys = ["train_diffusion.proj.weight"]
+        weight_only_keys = ["train_diffusion.proj.weight", "train_diffusion.second.weight"]
+        layer_names = list(reversed(weight_only_keys))
+        expected_header = "tick,phase," + ",".join(
+            name
+            for name in state_a.keys()
+            if name in set(weight_only_keys)
+        )
 
         with tempfile.TemporaryDirectory() as temp_dir:
             variance_service = record_variance.ServiceVarianceRecorder(
                 1,
-                layer_names=weight_only_keys,
+                layer_names=layer_names,
             )
             variance_service.initialize_without_runtime_parameters([0], [state_a], temp_dir)
             variance_service.trigger_without_runtime_parameters(11, [0], [state_b], phase_str="END_OF_TICK")
 
             variance_lines = _read_nonempty_lines(os.path.join(temp_dir, "variance", "0.csv"))
-            self.assertEqual(variance_lines[0], "tick,phase,train_diffusion.proj.weight")
+            self.assertEqual(variance_lines[0], expected_header)
             self.assertEqual(len(variance_lines), 2)
             self.assertNotIn("ema.weight", variance_lines[0])
             self.assertNotIn("train_diffusion.proj.bias", variance_lines[0])
 
             cosine_service = record_cosine_similarity.ServiceCosineSimilarityRecorder(
                 1,
-                layer_names=weight_only_keys,
+                layer_names=layer_names,
             )
             cosine_service.initialize_without_runtime_parameters({0: state_a}, temp_dir)
             cosine_service.trigger_without_runtime_parameters(11, {0: state_b}, phase_str="END_OF_TICK")
 
             cosine_lines = _read_nonempty_lines(os.path.join(temp_dir, "cosine_similarity", "0.csv"))
-            self.assertEqual(cosine_lines[0], "tick,phase,train_diffusion.proj.weight")
+            self.assertEqual(cosine_lines[0], expected_header)
             self.assertEqual(len(cosine_lines), 2)
             self.assertNotIn("ema.weight", cosine_lines[0])
             self.assertNotIn("train_diffusion.proj.bias", cosine_lines[0])

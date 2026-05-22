@@ -230,16 +230,16 @@ def _state_dicts_equal(state_a: Dict[str, Any], state_b: Dict[str, Any]) -> bool
 def _get_trainable_state_keys(model: torch.nn.Module, model_state: Dict[str, Any]) -> list[str]:
     parameter_ids = {id(parameter) for parameter in model.parameters()}
     state_with_vars = model.state_dict(keep_vars=True)
-    return sorted(
+    return [
         key
         for key, value in state_with_vars.items()
         if id(value) in parameter_ids
-    )
+    ]
 
 
 def _get_non_trainable_state_keys(model: torch.nn.Module, model_state: Dict[str, Any]) -> list[str]:
     trainable_keys = set(_get_trainable_state_keys(model, model_state))
-    return sorted(key for key in model_state.keys() if key not in trainable_keys)
+    return [key for key in model_state.keys() if key not in trainable_keys]
 
 
 def _state_dicts_equal_on_keys(

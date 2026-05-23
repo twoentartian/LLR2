@@ -327,6 +327,24 @@ def build_target_labels(
     raise ValueError(f"unsupported target mode: {target_mode}")
 
 
+def filter_fixed_target_label_matches(
+    eligible_mask: torch.Tensor,
+    labels: torch.Tensor,
+    targeted: bool,
+    target_mode: str,
+    fixed_target_label: Optional[int],
+) -> tuple[torch.Tensor, int]:
+    if not targeted or target_mode != "fixed":
+        return eligible_mask, 0
+
+    assert fixed_target_label is not None
+    conflict_mask = labels.eq(fixed_target_label)
+    skipped_mask = eligible_mask & conflict_mask
+    if not skipped_mask.any():
+        return eligible_mask, 0
+    return eligible_mask & ~conflict_mask, int(skipped_mask.sum().item())
+
+
 def attack_success_mask(
     predictions: torch.Tensor,
     labels: torch.Tensor,
@@ -718,6 +736,13 @@ def finalize_summary(stats: dict[str, Any]) -> dict[str, Any]:
     return stats
 
 
+def total_skipped_samples(stats: dict[str, Any]) -> int:
+    return int(
+        stats.get("skipped_clean_misclassified", 0)
+        + stats.get("skipped_fixed_target_label_matches", 0)
+    )
+
+
 def main() -> None:
     setup_logging()
     args = parse_args()
@@ -787,6 +812,7 @@ def main() -> None:
         "processed_samples": 0,
         "eligible_samples": 0,
         "skipped_clean_misclassified": 0,
+        "skipped_fixed_target_label_matches": 0,
         "attacks": {
             attack_name: {
                 "attempted": 0,
@@ -807,7 +833,7 @@ def main() -> None:
         completed_samples=0,
         current_batch=0,
         eligible_samples=0,
-        skipped_samples=0,
+        skipped_samples=total_skipped_samples(summary),
         stage="starting",
     )
 
@@ -840,7 +866,7 @@ def main() -> None:
                 completed_samples=processed_samples,
                 current_batch=batch_index,
                 eligible_samples=summary["eligible_samples"],
-                skipped_samples=summary["skipped_clean_misclassified"],
+                skipped_samples=total_skipped_samples(summary),
                 stage="evaluating clean predictions",
             )
             with torch.no_grad():
@@ -855,6 +881,14 @@ def main() -> None:
 
             skipped = int((~eligible_mask).sum().item())
             summary["skipped_clean_misclassified"] += skipped
+            eligible_mask, skipped_fixed_target = filter_fixed_target_label_matches(
+                eligible_mask,
+                labels,
+                args.targeted,
+                args.target_mode,
+                args.fixed_target_label,
+            )
+            summary["skipped_fixed_target_label_matches"] += skipped_fixed_target
             eligible_batch_positions = torch.arange(batch_size, device=labels.device)[eligible_mask]
 
             if not eligible_mask.any():
@@ -864,15 +898,18 @@ def main() -> None:
                     completed_samples=processed_samples,
                     current_batch=batch_index,
                     eligible_samples=summary["eligible_samples"],
-                    skipped_samples=summary["skipped_clean_misclassified"],
-                    stage="skipped batch (cleanly misclassified)",
+                    skipped_samples=total_skipped_samples(summary),
+                    stage="skipped batch (no attack-eligible samples)",
                 )
                 if args.log_every > 0 and batch_index % args.log_every == 0:
                     progress.clear()
                     LOGGER.info(
-                        "processed %d samples (%d batches), all skipped because the model already misclassified them",
+                        "processed %d samples (%d batches), batch skipped with no attack-eligible samples "
+                        "(clean_misclassified=%d, fixed_target_label_matches=%d)",
                         processed_samples,
                         batch_index,
+                        skipped,
+                        skipped_fixed_target,
                     )
                 continue
 
@@ -897,7 +934,7 @@ def main() -> None:
                     completed_samples=processed_samples,
                     current_batch=batch_index,
                     eligible_samples=summary["eligible_samples"],
-                    skipped_samples=summary["skipped_clean_misclassified"],
+                    skipped_samples=total_skipped_samples(summary),
                     stage="running FGSM",
                 )
                 attack_outputs["fgsm"] = fgsm_attack(
@@ -913,7 +950,7 @@ def main() -> None:
                     completed_samples=processed_samples,
                     current_batch=batch_index,
                     eligible_samples=summary["eligible_samples"],
-                    skipped_samples=summary["skipped_clean_misclassified"],
+                    skipped_samples=total_skipped_samples(summary),
                     stage="running PGD",
                 )
                 attack_outputs["pgd"] = pgd_attack(
@@ -932,7 +969,7 @@ def main() -> None:
                     completed_samples=processed_samples,
                     current_batch=batch_index,
                     eligible_samples=summary["eligible_samples"],
-                    skipped_samples=summary["skipped_clean_misclassified"],
+                    skipped_samples=total_skipped_samples(summary),
                     stage="running CW",
                 )
                 attack_outputs["cw"] = cw_attack(
@@ -954,7 +991,7 @@ def main() -> None:
                     completed_samples=processed_samples,
                     current_batch=batch_index,
                     eligible_samples=summary["eligible_samples"],
-                    skipped_samples=summary["skipped_clean_misclassified"],
+                    skipped_samples=total_skipped_samples(summary),
                     stage=f"scoring and saving {attack_name}",
                 )
                 with torch.no_grad():
@@ -1049,7 +1086,7 @@ def main() -> None:
                 completed_samples=processed_samples,
                 current_batch=batch_index,
                 eligible_samples=summary["eligible_samples"],
-                skipped_samples=summary["skipped_clean_misclassified"],
+                skipped_samples=total_skipped_samples(summary),
                 stage="completed batch",
             )
             if args.log_every > 0 and batch_index % args.log_every == 0:
@@ -1059,7 +1096,7 @@ def main() -> None:
                     processed_samples,
                     batch_index,
                     summary["eligible_samples"],
-                    summary["skipped_clean_misclassified"],
+                    total_skipped_samples(summary),
                 )
 
             if args.num_samples is not None and processed_samples >= args.num_samples:
@@ -1072,10 +1109,16 @@ def main() -> None:
         completed_samples=processed_samples,
         current_batch=batch_index,
         eligible_samples=summary["eligible_samples"],
-        skipped_samples=summary["skipped_clean_misclassified"],
+        skipped_samples=total_skipped_samples(summary),
         stage="finished",
     )
     LOGGER.info("finished. outputs written to %s", output_dir)
+    if finalized_summary["skipped_fixed_target_label_matches"] > 0:
+        LOGGER.info(
+            "skipped %d samples because their ground-truth label matched --fixed-target-label=%d",
+            finalized_summary["skipped_fixed_target_label_matches"],
+            args.fixed_target_label,
+        )
     for attack_name, attack_stats in finalized_summary["attacks"].items():
         LOGGER.info(
             "%s: attempted=%d success=%d success_rate=%.4f saved=%d",

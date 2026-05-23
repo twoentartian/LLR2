@@ -593,6 +593,89 @@ def build_manifest_record(
         "saved_path": str(saved_path) if saved_path is not None else None,
     }
 
+
+def collect_source_metadata(
+    eligible_indices: Optional[torch.Tensor],
+    eligible_batch_positions: torch.Tensor,
+    batch_start_index: int,
+    dataset_for_metadata: Any,
+) -> tuple[list[int], list[Optional[str]]]:
+    source_indices: list[int] = []
+    source_paths: list[Optional[str]] = []
+    for sample_offset in range(int(eligible_batch_positions.shape[0])):
+        source_index = (
+            int(eligible_indices[sample_offset].detach().cpu().item())
+            if eligible_indices is not None
+            else batch_start_index + int(eligible_batch_positions[sample_offset].detach().cpu().item())
+        )
+        source_indices.append(source_index)
+        source_paths.append(maybe_get_dataset_sample_path(dataset_for_metadata, source_index))
+    return source_indices, source_paths
+
+
+def build_attack_output_paths(
+    output_dir: Path,
+    attack_name: str,
+    labels: torch.Tensor,
+    source_indices: list[int],
+    source_paths: list[Optional[str]],
+    targeted: bool,
+    target_labels: Optional[torch.Tensor],
+) -> list[Path]:
+    output_paths: list[Path] = []
+    for sample_offset, source_index in enumerate(source_indices):
+        label_value = int(labels[sample_offset].detach().cpu().item())
+        target_label_value = (
+            int(target_labels[sample_offset].detach().cpu().item())
+            if targeted and target_labels is not None
+            else None
+        )
+        output_paths.append(
+            build_output_path(
+                output_dir,
+                attack_name,
+                label_value,
+                source_index,
+                source_paths[sample_offset],
+                target_label=target_label_value,
+            )
+        )
+    return output_paths
+
+
+def partition_existing_output_paths(output_paths: list[Path]) -> tuple[list[int], list[int]]:
+    pending_positions: list[int] = []
+    existing_positions: list[int] = []
+    for sample_offset, output_path in enumerate(output_paths):
+        if output_path.exists():
+            existing_positions.append(sample_offset)
+        else:
+            pending_positions.append(sample_offset)
+    return pending_positions, existing_positions
+
+
+def save_missing_clean_originals(
+    output_dir: Path,
+    clean_pixels: torch.Tensor,
+    labels: torch.Tensor,
+    source_indices: list[int],
+    source_paths: list[Optional[str]],
+    sample_positions: list[int],
+) -> None:
+    for sample_offset in sample_positions:
+        label_value = int(labels[sample_offset].detach().cpu().item())
+        clean_path = build_output_path(
+            output_dir,
+            "clean",
+            label_value,
+            source_indices[sample_offset],
+            source_paths[sample_offset],
+            target_label=None,
+        )
+        if not clean_path.exists():
+            save_image_tensor(clean_pixels[sample_offset], clean_path)
+
+
 def resolve_model_and_setup(
     args: argparse.Namespace,
     device: torch.device,
@@ -818,6 +901,7 @@ def main() -> None:
                 "attempted": 0,
                 "success": 0,
                 "saved": 0,
+                "skipped_existing": 0,
                 "l2_sum": 0.0,
                 "linf_sum": 0.0,
                 "successful_l2_sum": 0.0,
@@ -837,7 +921,8 @@ def main() -> None:
         stage="starting",
     )
 
-    with manifest_path.open("w", encoding="utf-8") as manifest_file:
+    manifest_mode = "a" if manifest_path.exists() else "w"
+    with manifest_path.open(manifest_mode, encoding="utf-8") as manifest_file:
         for raw_batch in dataloader:
             batch_index += 1
             batch = move_batch_to_device(raw_batch, device)
@@ -927,66 +1012,105 @@ def main() -> None:
             )
 
             summary["eligible_samples"] += int(eligible_labels.shape[0])
-
-            attack_outputs: dict[str, torch.Tensor] = {}
-            if "fgsm" in args.attacks:
-                progress.update(
-                    completed_samples=processed_samples,
-                    current_batch=batch_index,
-                    eligible_samples=summary["eligible_samples"],
-                    skipped_samples=total_skipped_samples(summary),
-                    stage="running FGSM",
-                )
-                attack_outputs["fgsm"] = fgsm_attack(
-                    model,
-                    eligible_images,
-                    eligible_labels,
-                    epsilon=args.epsilon,
-                    targeted=args.targeted,
-                    target_labels=target_labels,
-                )
-            if "pgd" in args.attacks:
-                progress.update(
-                    completed_samples=processed_samples,
-                    current_batch=batch_index,
-                    eligible_samples=summary["eligible_samples"],
-                    skipped_samples=total_skipped_samples(summary),
-                    stage="running PGD",
-                )
-                attack_outputs["pgd"] = pgd_attack(
-                    model,
-                    eligible_images,
-                    eligible_labels,
-                    epsilon=args.epsilon,
-                    step_size=args.pgd_alpha,
-                    steps=args.pgd_steps,
-                    random_start=not args.no_pgd_random_start,
-                    targeted=args.targeted,
-                    target_labels=target_labels,
-                )
-            if "cw" in args.attacks:
-                progress.update(
-                    completed_samples=processed_samples,
-                    current_batch=batch_index,
-                    eligible_samples=summary["eligible_samples"],
-                    skipped_samples=total_skipped_samples(summary),
-                    stage="running CW",
-                )
-                attack_outputs["cw"] = cw_attack(
-                    model,
-                    eligible_images,
-                    eligible_labels,
-                    steps=args.cw_steps,
-                    learning_rate=args.cw_lr,
-                    c_values=cw_c_values,
-                    kappa=args.cw_kappa,
-                    targeted=args.targeted,
-                    target_labels=target_labels,
-                )
-
             clean_pixels = denormalize_images(eligible_images).clamp(0.0, 1.0)
+            eligible_source_indices, eligible_source_paths = collect_source_metadata(
+                eligible_indices,
+                eligible_batch_positions,
+                batch_start_index,
+                dataset_for_metadata,
+            )
 
-            for attack_name, adv_images in attack_outputs.items():
+            for attack_name in args.attacks:
+                progress.update(
+                    completed_samples=processed_samples,
+                    current_batch=batch_index,
+                    eligible_samples=summary["eligible_samples"],
+                    skipped_samples=total_skipped_samples(summary),
+                    stage=f"checking existing {attack_name}",
+                )
+                output_paths = build_attack_output_paths(
+                    output_dir,
+                    attack_name,
+                    eligible_labels,
+                    eligible_source_indices,
+                    eligible_source_paths,
+                    args.targeted,
+                    target_labels,
+                )
+                pending_positions, existing_positions = partition_existing_output_paths(output_paths)
+                summary["attacks"][attack_name]["skipped_existing"] += len(existing_positions)
+                if args.save_originals and existing_positions:
+                    save_missing_clean_originals(
+                        output_dir,
+                        clean_pixels,
+                        eligible_labels,
+                        eligible_source_indices,
+                        eligible_source_paths,
+                        existing_positions,
+                    )
+
+                if not pending_positions:
+                    continue
+
+                pending_positions_tensor = torch.tensor(
+                    pending_positions,
+                    device=eligible_labels.device,
+                    dtype=torch.long,
+                )
+                pending_images = eligible_images.index_select(0, pending_positions_tensor)
+                pending_labels = eligible_labels.index_select(0, pending_positions_tensor)
+                pending_clean_predictions = eligible_clean_predictions.index_select(0, pending_positions_tensor)
+                pending_target_labels = (
+                    target_labels.index_select(0, pending_positions_tensor)
+                    if target_labels is not None
+                    else None
+                )
+
+                progress.update(
+                    completed_samples=processed_samples,
+                    current_batch=batch_index,
+                    eligible_samples=summary["eligible_samples"],
+                    skipped_samples=total_skipped_samples(summary),
+                    stage=f"running {attack_name}",
+                )
+                if attack_name == "fgsm":
+                    adv_images = fgsm_attack(
+                        model,
+                        pending_images,
+                        pending_labels,
+                        epsilon=args.epsilon,
+                        targeted=args.targeted,
+                        target_labels=pending_target_labels,
+                    )
+                elif attack_name == "pgd":
+                    adv_images = pgd_attack(
+                        model,
+                        pending_images,
+                        pending_labels,
+                        epsilon=args.epsilon,
+                        step_size=args.pgd_alpha,
+                        steps=args.pgd_steps,
+                        random_start=not args.no_pgd_random_start,
+                        targeted=args.targeted,
+                        target_labels=pending_target_labels,
+                    )
+                elif attack_name == "cw":
+                    adv_images = cw_attack(
+                        model,
+                        pending_images,
+                        pending_labels,
+                        steps=args.cw_steps,
+                        learning_rate=args.cw_lr,
+                        c_values=cw_c_values,
+                        kappa=args.cw_kappa,
+                        targeted=args.targeted,
+                        target_labels=pending_target_labels,
+                    )
+                else:
+                    raise ValueError(f"unsupported attack: {attack_name}")
+
+                pending_clean_pixels = clean_pixels.index_select(0, pending_positions_tensor)
+
                 progress.update(
                     completed_samples=processed_samples,
                     current_batch=batch_index,
@@ -999,46 +1123,35 @@ def main() -> None:
                     adv_predictions = adv_logits.argmax(dim=1)
 
                 adv_pixels = denormalize_images(adv_images).clamp(0.0, 1.0)
-                deltas = adv_pixels - clean_pixels
+                deltas = adv_pixels - pending_clean_pixels
                 l2_distances = deltas.reshape(deltas.shape[0], -1).norm(p=2, dim=1)
                 linf_distances = deltas.abs().reshape(deltas.shape[0], -1).max(dim=1).values
                 success_mask = attack_success_mask(
                     adv_predictions,
-                    eligible_labels,
+                    pending_labels,
                     args.targeted,
-                    target_labels,
+                    pending_target_labels,
                 )
 
                 saved_count = 0
-                for sample_offset in range(int(eligible_labels.shape[0])):
-                    source_index = (
-                        int(eligible_indices[sample_offset].detach().cpu().item())
-                        if eligible_indices is not None
-                        else batch_start_index + int(eligible_batch_positions[sample_offset].detach().cpu().item())
-                    )
-                    source_path = maybe_get_dataset_sample_path(dataset_for_metadata, source_index)
-                    label_value = int(eligible_labels[sample_offset].detach().cpu().item())
-                    clean_pred_value = int(eligible_clean_predictions[sample_offset].detach().cpu().item())
-                    adv_pred_value = int(adv_predictions[sample_offset].detach().cpu().item())
+                for local_offset, sample_offset in enumerate(pending_positions):
+                    source_index = eligible_source_indices[sample_offset]
+                    source_path = eligible_source_paths[sample_offset]
+                    label_value = int(pending_labels[local_offset].detach().cpu().item())
+                    clean_pred_value = int(pending_clean_predictions[local_offset].detach().cpu().item())
+                    adv_pred_value = int(adv_predictions[local_offset].detach().cpu().item())
                     clean_correct = bool(clean_pred_value == label_value)
-                    success = bool(success_mask[sample_offset].detach().cpu().item())
+                    success = bool(success_mask[local_offset].detach().cpu().item())
                     target_label_value = (
-                        int(target_labels[sample_offset].detach().cpu().item())
-                        if target_labels is not None
+                        int(pending_target_labels[local_offset].detach().cpu().item())
+                        if pending_target_labels is not None
                         else None
                     )
 
                     saved_path: Optional[Path] = None
                     if not args.save_successful_only or success:
-                        saved_path = build_output_path(
-                            output_dir,
-                            attack_name,
-                            label_value,
-                            source_index,
-                            source_path,
-                            target_label=target_label_value if args.targeted else None,
-                        )
-                        save_image_tensor(adv_pixels[sample_offset], saved_path)
+                        saved_path = output_paths[sample_offset]
+                        save_image_tensor(adv_pixels[local_offset], saved_path)
                         saved_count += 1
 
                         if args.save_originals:
@@ -1051,7 +1164,7 @@ def main() -> None:
                                 target_label=None,
                             )
                             if not clean_path.exists():
-                                save_image_tensor(clean_pixels[sample_offset], clean_path)
+                                save_image_tensor(pending_clean_pixels[local_offset], clean_path)
 
                     record = build_manifest_record(
                         attack_name=attack_name,
@@ -1063,8 +1176,8 @@ def main() -> None:
                         adv_pred=adv_pred_value,
                         clean_correct=clean_correct,
                         success=success,
-                        l2_distance=float(l2_distances[sample_offset].detach().cpu().item()),
-                        linf_distance=float(linf_distances[sample_offset].detach().cpu().item()),
+                        l2_distance=float(l2_distances[local_offset].detach().cpu().item()),
+                        linf_distance=float(linf_distances[local_offset].detach().cpu().item()),
                         saved_path=saved_path,
                         targeted=args.targeted,
                         target_label=target_label_value,
@@ -1121,12 +1234,13 @@ def main() -> None:
         )
     for attack_name, attack_stats in finalized_summary["attacks"].items():
         LOGGER.info(
-            "%s: attempted=%d success=%d success_rate=%.4f saved=%d",
+            "%s: attempted=%d success=%d success_rate=%.4f saved=%d skipped_existing=%d",
             attack_name,
             attack_stats["attempted"],
             attack_stats["success"],
             attack_stats["success_rate"],
             attack_stats["saved"],
+            attack_stats["skipped_existing"],
         )
 
 

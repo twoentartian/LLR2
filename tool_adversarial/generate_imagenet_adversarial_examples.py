@@ -178,9 +178,15 @@ def format_duration(seconds: Optional[float]) -> str:
 
 
 class ProgressTracker:
-    def __init__(self, total_samples: Optional[int], total_batches: Optional[int]):
+    def __init__(
+        self,
+        total_samples: Optional[int],
+        total_batches: Optional[int],
+        total_work_units: Optional[float] = None,
+    ):
         self.total_samples = total_samples
         self.total_batches = total_batches
+        self.total_work_units = total_work_units
         self.start_time = time.time()
         self.last_line_length = 0
 
@@ -199,18 +205,32 @@ class ProgressTracker:
         eligible_samples: int,
         skipped_samples: int,
         stage: Optional[str] = None,
+        completed_work_units: Optional[float] = None,
+        total_work_units: Optional[float] = None,
     ) -> None:
         elapsed = time.time() - self.start_time
-        rate = completed_samples / elapsed if elapsed > 0 and completed_samples > 0 else 0.0
         eta = None
         percent_text = "--.-%"
         sample_text = f"samples {completed_samples}"
+        effective_total_work_units = (
+            total_work_units if total_work_units is not None else self.total_work_units
+        )
+        if completed_work_units is None:
+            completed_work_units = float(completed_samples)
+        rate = completed_work_units / elapsed if elapsed > 0 and completed_work_units > 0 else 0.0
 
-        if self.total_samples is not None and self.total_samples > 0:
+        if effective_total_work_units is not None and effective_total_work_units > 0:
+            remaining = max(effective_total_work_units - completed_work_units, 0.0)
+            eta = remaining / rate if rate > 0 else None
+            percent = min(100.0, 100.0 * completed_work_units / effective_total_work_units)
+            percent_text = f"{percent:5.1f}%"
+        elif self.total_samples is not None and self.total_samples > 0:
             remaining = max(self.total_samples - completed_samples, 0)
             eta = remaining / rate if rate > 0 else None
             percent = min(100.0, 100.0 * completed_samples / self.total_samples)
             percent_text = f"{percent:5.1f}%"
+
+        if self.total_samples is not None and self.total_samples > 0:
             sample_text = f"samples {completed_samples}/{self.total_samples}"
 
         batch_text = f"batch {current_batch}"
@@ -237,8 +257,18 @@ class ProgressTracker:
         eligible_samples: int,
         skipped_samples: int,
         stage: Optional[str] = None,
+        completed_work_units: Optional[float] = None,
+        total_work_units: Optional[float] = None,
     ) -> None:
-        self.update(completed_samples, current_batch, eligible_samples, skipped_samples, stage=stage)
+        self.update(
+            completed_samples,
+            current_batch,
+            eligible_samples,
+            skipped_samples,
+            stage=stage,
+            completed_work_units=completed_work_units,
+            total_work_units=total_work_units,
+        )
         sys.stderr.write("\n")
         sys.stderr.flush()
         self.last_line_length = 0
@@ -826,6 +856,25 @@ def total_skipped_samples(stats: dict[str, Any]) -> int:
     )
 
 
+def build_attack_work_profile(
+    attack_names: list[str],
+    pgd_steps: int,
+    cw_steps: int,
+    cw_c_values: list[float],
+) -> dict[str, tuple[float, float]]:
+    profile: dict[str, tuple[float, float]] = {}
+    for attack_name in attack_names:
+        if attack_name == "fgsm":
+            profile[attack_name] = (2.0, 1.0)
+        elif attack_name == "pgd":
+            profile[attack_name] = (float(2 * pgd_steps), 1.0)
+        elif attack_name == "cw":
+            profile[attack_name] = (float(2 * cw_steps * len(cw_c_values)), 1.0)
+        else:
+            raise ValueError(f"unsupported attack: {attack_name}")
+    return profile
+
+
 def main() -> None:
     setup_logging()
     args = parse_args()
@@ -838,6 +887,17 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     cw_c_values = parse_float_list(args.cw_c_values)
+    attack_work_profile = build_attack_work_profile(
+        args.attacks,
+        args.pgd_steps,
+        args.cw_steps,
+        cw_c_values,
+    )
+    clean_eval_work_units = 1.0
+    total_attack_work_units_per_sample = sum(
+        generation_units + scoring_units
+        for generation_units, scoring_units in attack_work_profile.values()
+    )
     model, ml_setup, resolved_model_type, resolved_dataset_type = resolve_model_and_setup(args, device)
     dataloader, dataset_for_metadata = build_eval_dataloader(ml_setup, args)
     dataset_length = safe_len(dataset_for_metadata)
@@ -849,7 +909,16 @@ def main() -> None:
         if planned_total_samples is not None and args.batch_size > 0
         else safe_len(dataloader)
     )
-    progress = ProgressTracker(planned_total_samples, planned_total_batches)
+    planned_total_work_units = (
+        planned_total_samples * (clean_eval_work_units + total_attack_work_units_per_sample)
+        if planned_total_samples is not None
+        else None
+    )
+    progress = ProgressTracker(
+        planned_total_samples,
+        planned_total_batches,
+        total_work_units=planned_total_work_units,
+    )
 
     manifest_path = output_dir / "manifest.jsonl"
     config_path = output_dir / "run_config.json"
@@ -913,12 +982,16 @@ def main() -> None:
 
     processed_samples = 0
     batch_index = 0
+    completed_work_units = 0.0
+    remaining_total_work_units = planned_total_work_units
     progress.update(
         completed_samples=0,
         current_batch=0,
         eligible_samples=0,
         skipped_samples=total_skipped_samples(summary),
         stage="starting",
+        completed_work_units=completed_work_units,
+        total_work_units=remaining_total_work_units,
     )
 
     manifest_mode = "a" if manifest_path.exists() else "w"
@@ -953,10 +1026,13 @@ def main() -> None:
                 eligible_samples=summary["eligible_samples"],
                 skipped_samples=total_skipped_samples(summary),
                 stage="evaluating clean predictions",
+                completed_work_units=completed_work_units,
+                total_work_units=remaining_total_work_units,
             )
             with torch.no_grad():
                 clean_logits = forward_logits(model, images)
                 clean_predictions = clean_logits.argmax(dim=1)
+            completed_work_units += batch_size * clean_eval_work_units
 
             clean_correct_mask = clean_predictions.eq(labels)
             if args.attack_all_samples:
@@ -974,6 +1050,9 @@ def main() -> None:
                 args.fixed_target_label,
             )
             summary["skipped_fixed_target_label_matches"] += skipped_fixed_target
+            skipped_attack_samples = batch_size - int(eligible_mask.sum().item())
+            if remaining_total_work_units is not None:
+                remaining_total_work_units -= skipped_attack_samples * total_attack_work_units_per_sample
             eligible_batch_positions = torch.arange(batch_size, device=labels.device)[eligible_mask]
 
             if not eligible_mask.any():
@@ -985,6 +1064,8 @@ def main() -> None:
                     eligible_samples=summary["eligible_samples"],
                     skipped_samples=total_skipped_samples(summary),
                     stage="skipped batch (no attack-eligible samples)",
+                    completed_work_units=completed_work_units,
+                    total_work_units=remaining_total_work_units,
                 )
                 if args.log_every > 0 and batch_index % args.log_every == 0:
                     progress.clear()
@@ -1027,6 +1108,8 @@ def main() -> None:
                     eligible_samples=summary["eligible_samples"],
                     skipped_samples=total_skipped_samples(summary),
                     stage=f"checking existing {attack_name}",
+                    completed_work_units=completed_work_units,
+                    total_work_units=remaining_total_work_units,
                 )
                 output_paths = build_attack_output_paths(
                     output_dir,
@@ -1039,6 +1122,10 @@ def main() -> None:
                 )
                 pending_positions, existing_positions = partition_existing_output_paths(output_paths)
                 summary["attacks"][attack_name]["skipped_existing"] += len(existing_positions)
+                attack_generation_units, attack_scoring_units = attack_work_profile[attack_name]
+                attack_total_work_units = attack_generation_units + attack_scoring_units
+                if remaining_total_work_units is not None:
+                    remaining_total_work_units -= len(existing_positions) * attack_total_work_units
                 if args.save_originals and existing_positions:
                     save_missing_clean_originals(
                         output_dir,
@@ -1072,6 +1159,8 @@ def main() -> None:
                     eligible_samples=summary["eligible_samples"],
                     skipped_samples=total_skipped_samples(summary),
                     stage=f"running {attack_name}",
+                    completed_work_units=completed_work_units,
+                    total_work_units=remaining_total_work_units,
                 )
                 if attack_name == "fgsm":
                     adv_images = fgsm_attack(
@@ -1108,6 +1197,7 @@ def main() -> None:
                     )
                 else:
                     raise ValueError(f"unsupported attack: {attack_name}")
+                completed_work_units += len(pending_positions) * attack_generation_units
 
                 pending_clean_pixels = clean_pixels.index_select(0, pending_positions_tensor)
 
@@ -1117,6 +1207,8 @@ def main() -> None:
                     eligible_samples=summary["eligible_samples"],
                     skipped_samples=total_skipped_samples(summary),
                     stage=f"scoring and saving {attack_name}",
+                    completed_work_units=completed_work_units,
+                    total_work_units=remaining_total_work_units,
                 )
                 with torch.no_grad():
                     adv_logits = forward_logits(model, adv_images)
@@ -1192,6 +1284,7 @@ def main() -> None:
                     linf_distances,
                     saved_count,
                 )
+                completed_work_units += len(pending_positions) * attack_scoring_units
 
             summary["processed_samples"] += batch_size
             processed_samples += batch_size
@@ -1201,6 +1294,8 @@ def main() -> None:
                 eligible_samples=summary["eligible_samples"],
                 skipped_samples=total_skipped_samples(summary),
                 stage="completed batch",
+                completed_work_units=completed_work_units,
+                total_work_units=remaining_total_work_units,
             )
             if args.log_every > 0 and batch_index % args.log_every == 0:
                 progress.clear()
@@ -1224,6 +1319,8 @@ def main() -> None:
         eligible_samples=summary["eligible_samples"],
         skipped_samples=total_skipped_samples(summary),
         stage="finished",
+        completed_work_units=completed_work_units,
+        total_work_units=remaining_total_work_units,
     )
     LOGGER.info("finished. outputs written to %s", output_dir)
     if finalized_summary["skipped_fixed_target_label_matches"] > 0:

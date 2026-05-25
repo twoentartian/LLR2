@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate evenly spaced linear interpolations between two LLR2 .model.pt files."""
+"""Measure train/val metrics along the linear interpolation between two LLR2 checkpoints."""
 
 from __future__ import annotations
 
@@ -18,9 +18,12 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from py_src.engine import Device, train as engine_train, val as engine_val
+from py_src.ml_setup import MLSetup, get_ml_setup_from_config
+from py_src.ml_setup.dataloader_util import DataloaderConfig
 from py_src.ml_setup_dataset import DatasetType
 from py_src.ml_setup_model import ModelType
-from py_src.model_opti_save_load import load_model_state_file, save_model_state
+from py_src.model_opti_save_load import load_model_state_file
 from py_src.util import setup_logging
 
 logger = logging.getLogger("linear_interpolate_models")
@@ -28,7 +31,7 @@ logger = logging.getLogger("linear_interpolate_models")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate evenly spaced linear interpolations between two .model.pt files",
+        description="Measure train/val metrics along the linear interpolation between two .model.pt files",
     )
     parser.add_argument("start_model", type=Path, help="path to the starting .model.pt file")
     parser.add_argument("end_model", type=Path, help="path to the ending .model.pt file")
@@ -37,15 +40,45 @@ def parse_args() -> argparse.Namespace:
         "--size",
         type=int,
         default=10,
-        help="number of equal interpolation intervals; size=10 writes alpha 0.0..1.0 in steps of 0.1",
+        help="number of equal interpolation intervals; size=10 evaluates alpha 0.0..1.0 in steps of 0.1",
     )
     parser.add_argument("-d", "--dataset", default=None, help="Dataset override")
     parser.add_argument(
         "-o",
         "--output_folder_name",
         default=None,
-        help="output folder for the interpolated checkpoints",
+        help="output folder for the CSV report",
     )
+    parser.add_argument(
+        "-b",
+        "--batch_size",
+        type=int,
+        default=None,
+        help="batch size override for both train and val loaders",
+    )
+    parser.add_argument(
+        "--train_dataset_size",
+        type=int,
+        default=None,
+        help="optional training dataset subsample size",
+    )
+    parser.add_argument(
+        "--val_dataset_size",
+        type=int,
+        default=None,
+        help="optional validation dataset subsample size",
+    )
+    parser.add_argument("--cpu", action="store_true", help="force CPU evaluation")
+    parser.add_argument(
+        "--dali",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="use NVIDIA DALI for ImageNet dataloading when supported by the setup",
+    )
+    parser.add_argument("--dali_device_id", type=int, default=0, help="CUDA device id used by DALI pipelines")
+    parser.add_argument("-P", "--torch_preset_version", type=int, default=None, help="factory preset index")
+    parser.add_argument("-w", "--worker", type=int, default=0, help="dataloader worker count")
+    parser.add_argument("--prefetch_factor", type=int, default=None, help="dataloader prefetch factor")
     return parser.parse_args()
 
 
@@ -62,7 +95,7 @@ def _resolve_output_folder(args: argparse.Namespace) -> Path:
 
     start_stem = _checkpoint_stem(args.start_model)
     end_stem = _checkpoint_stem(args.end_model)
-    folder_name = f"linear_interpolation_{start_stem}_to_{end_stem}_size_{args.size}"
+    folder_name = f"linear_interpolation_metrics_{start_stem}_to_{end_stem}_size_{args.size}"
     return (Path.cwd() / folder_name).resolve()
 
 
@@ -139,12 +172,6 @@ def _resolve_dataset_type(
             "dataset metadata is missing in both checkpoints; provide -d/--dataset"
         )
     return metadata_type
-
-
-def _copy_value(value: Any) -> Any:
-    if torch.is_tensor(value):
-        return value.detach().cpu().clone()
-    return copy.deepcopy(value)
 
 
 def _validate_state_dicts(
@@ -234,34 +261,115 @@ def _interpolate_state_dict(
         if torch.is_tensor(start_value):
             output[key] = _interpolate_tensor(start_value, end_value, alpha)
         else:
-            output[key] = _copy_value(start_value)
+            output[key] = copy.deepcopy(start_value)
     return output
 
 
-def _write_manifest(
-    output_folder: Path,
-    rows: list[tuple[int, float, str]],
-    start_model: Path,
-    end_model: Path,
+def _build_ml_setup(
     model_type: ModelType,
     dataset_type: DatasetType,
+    args: argparse.Namespace,
+) -> MLSetup:
+    return get_ml_setup_from_config(
+        model_type.name,
+        dataset_type=dataset_type.name,
+        preset=args.torch_preset_version or 1,
+        use_dali=args.dali,
+        dali_device_id=args.dali_device_id,
+    )
+
+
+def _build_train_dataloader(ml_setup: MLSetup, args: argparse.Namespace):
+    if ml_setup.training_data is None:
+        return None
+
+    loader_setup = copy.copy(ml_setup)
+    loader_setup.override_train_loader = None
+    loader_config = DataloaderConfig(
+        batch_size=args.batch_size or ml_setup.default_batch_size,
+        num_workers=args.worker,
+        num_samples=args.train_dataset_size,
+        shuffle=False,
+        pin_memory=True,
+        prefetch_factor=args.prefetch_factor,
+    )
+    return loader_setup.train_dataloader(loader_config, ignore_override=False)
+
+
+def _build_val_dataloader(ml_setup: MLSetup, args: argparse.Namespace):
+    if ml_setup.testing_data is None:
+        return None
+
+    loader_setup = copy.copy(ml_setup)
+    loader_setup.override_test_loader = None
+    loader_config = DataloaderConfig(
+        batch_size=args.batch_size or ml_setup.default_batch_size,
+        num_workers=args.worker,
+        num_samples=args.val_dataset_size,
+        shuffle=False,
+        pin_memory=True,
+        prefetch_factor=args.prefetch_factor,
+    )
+    return loader_setup.val_dataloader(loader_config, ignore_override=False)
+
+
+def _format_optional_metric(value: Optional[float], *, missing: bool = False) -> str:
+    if missing or value is None:
+        return ""
+    return f"{value:.10e}"
+
+
+def _format_count(value: Optional[int]) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _evaluate_train_metrics(model, adapter, dataloader, device_obj: Device):
+    if dataloader is None:
+        return None
+    result = engine_train(
+        adapter,
+        dataloader,
+        optimizer=None,
+        lr_scheduler=None,
+        device=device_obj,
+        scaler=None,
+        backpropagation=False,
+        training_mode=False,
+    )
+    if result.total_count == 0:
+        return None
+    return result
+
+
+def _evaluate_val_metrics(adapter, dataloader, device_obj: Device):
+    if dataloader is None:
+        return None
+    result = engine_val(adapter, dataloader, device=device_obj)
+    if result.total_count == 0:
+        return None
+    return result
+
+
+def _write_metrics_csv(
+    output_path: Path,
+    rows: list[dict[str, str]],
 ) -> None:
-    manifest_path = output_folder / "manifest.csv"
-    with manifest_path.open("w", encoding="utf-8", newline="") as manifest_file:
-        writer = csv.writer(manifest_file)
-        writer.writerow(["index", "alpha", "path", "model_type", "dataset_type", "start_model", "end_model"])
-        for index, alpha, path in rows:
-            writer.writerow(
-                [
-                    index,
-                    f"{alpha:.10f}",
-                    path,
-                    model_type.name,
-                    dataset_type.name,
-                    str(start_model.resolve()),
-                    str(end_model.resolve()),
-                ]
-            )
+    fieldnames = [
+        "index",
+        "alpha",
+        "train_loss",
+        "train_accuracy",
+        "train_count",
+        "val_loss",
+        "val_accuracy",
+        "val_count",
+    ]
+    with output_path.open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def main() -> None:
@@ -270,6 +378,8 @@ def main() -> None:
 
     if args.size < 1:
         raise RuntimeError(f"--size must be at least 1, got {args.size}")
+    if args.cpu and args.dali:
+        raise RuntimeError("--dali requires CUDA; do not combine it with --cpu")
 
     for path in (args.start_model, args.end_model):
         if not path.is_file():
@@ -282,41 +392,79 @@ def main() -> None:
     dataset_type = _resolve_dataset_type(start_dataset_name, end_dataset_name, args.dataset)
     _validate_state_dicts(start_state, end_state)
 
-    output_folder = _resolve_output_folder(args)
-    output_folder.mkdir(parents=True, exist_ok=True)
-
     logger.info(
-        "interpolating %s -> %s with model=%s dataset=%s size=%d output=%s",
-        args.start_model,
-        args.end_model,
+        "building ML setup for model=%s dataset=%s",
         model_type.name,
         dataset_type.name,
+    )
+    ml_setup = _build_ml_setup(model_type, dataset_type, args)
+
+    device_obj = Device.cpu() if args.cpu else Device.auto()
+    model = ml_setup.model.to(device_obj.device)
+    adapter = ml_setup.adapter
+
+    train_dataloader = _build_train_dataloader(ml_setup, args)
+    val_dataloader = _build_val_dataloader(ml_setup, args)
+
+    output_folder = _resolve_output_folder(args)
+    output_folder.mkdir(parents=True, exist_ok=True)
+    output_csv_path = output_folder / "interpolation_metrics.csv"
+
+    logger.info(
+        "measuring interpolation %s -> %s with size=%d on device=%s output=%s",
+        args.start_model,
+        args.end_model,
         args.size,
-        output_folder,
+        device_obj.device,
+        output_csv_path,
     )
 
-    manifest_rows: list[tuple[int, float, str]] = []
+    rows: list[dict[str, str]] = []
     for index in range(args.size + 1):
         alpha = index / args.size
         interpolated_state = _interpolate_state_dict(start_state, end_state, alpha)
-        output_path = output_folder / f"{index:04d}_alpha_{alpha:.6f}.model.pt"
-        save_model_state(
-            str(output_path),
-            interpolated_state,
-            model_type.name,
-            dataset_type.name,
-        )
-        manifest_rows.append((index, alpha, str(output_path)))
+        model.load_state_dict(interpolated_state)
 
-    _write_manifest(
-        output_folder,
-        manifest_rows,
-        args.start_model,
-        args.end_model,
-        model_type,
-        dataset_type,
-    )
-    logger.info("wrote %d interpolated checkpoints to %s", len(manifest_rows), output_folder)
+        train_result = _evaluate_train_metrics(model, adapter, train_dataloader, device_obj)
+        val_result = _evaluate_val_metrics(adapter, val_dataloader, device_obj)
+
+        row = {
+            "index": str(index),
+            "alpha": f"{alpha:.10f}",
+            "train_loss": _format_optional_metric(
+                None if train_result is None else train_result.avg_loss,
+                missing=train_result is None,
+            ),
+            "train_accuracy": _format_optional_metric(
+                None if train_result is None else train_result.accuracy,
+                missing=train_result is None,
+            ),
+            "train_count": _format_count(None if train_result is None else train_result.total_count),
+            "val_loss": _format_optional_metric(
+                None if val_result is None else val_result.avg_loss,
+                missing=val_result is None,
+            ),
+            "val_accuracy": _format_optional_metric(
+                None if val_result is None else val_result.accuracy,
+                missing=val_result is None,
+            ),
+            "val_count": _format_count(None if val_result is None else val_result.total_count),
+        }
+        rows.append(row)
+
+        logger.info(
+            "point %d/%d alpha=%.6f train_loss=%s train_acc=%s val_loss=%s val_acc=%s",
+            index,
+            args.size,
+            alpha,
+            row["train_loss"] or "NA",
+            row["train_accuracy"] or "NA",
+            row["val_loss"] or "NA",
+            row["val_accuracy"] or "NA",
+        )
+
+    _write_metrics_csv(output_csv_path, rows)
+    logger.info("wrote metrics CSV to %s", output_csv_path)
 
 
 if __name__ == "__main__":

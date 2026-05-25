@@ -47,9 +47,10 @@ from typing import Any, Optional
 
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from torch import nn
 from torch.utils.data import Dataset
-from torchvision.transforms.functional import to_pil_image
+from torchvision.transforms.functional import to_pil_image, to_tensor
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -104,6 +105,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fixed-target-label",type=int,default=None,help="Required when using --targeted --target-mode fixed.",)
     parser.add_argument("--save-originals",action="store_true",help="Also save the corresponding clean images.",)
     parser.add_argument("--save-successful-only",action="store_true",help="Only write adversarial images for successful attacks.",)
+    parser.add_argument("--fix-manifest",action="store_true",help="Rebuild manifest.jsonl from existing adversarial PNGs while skipping already-generated outputs.",)
     parser.add_argument("--epsilon",type=float,default=8.0 / 255.0,help="FGSM / PGD Linf budget in pixel space [0, 1].",)
     parser.add_argument("--pgd-alpha",type=float,default=2.0 / 255.0,help="PGD step size in pixel space [0, 1].",)
     parser.add_argument("--pgd-steps",type=int,default=10,help="Number of PGD steps.",)
@@ -706,6 +708,88 @@ def save_missing_clean_originals(
             save_image_tensor(clean_pixels[sample_offset], clean_path)
 
 
+def load_saved_adv_images(output_paths: list[Path], device: torch.device) -> torch.Tensor:
+    images: list[torch.Tensor] = []
+    for output_path in output_paths:
+        with Image.open(output_path) as image:
+            pixel_tensor = to_tensor(image.convert("RGB"))
+        images.append(normalize_images(pixel_tensor.unsqueeze(0)).squeeze(0))
+    if not images:
+        raise ValueError("expected at least one saved adversarial image to load")
+    return torch.stack(images, dim=0).to(device=device, dtype=torch.float32)
+
+
+def score_attack_batch(
+    model: nn.Module,
+    adv_images: torch.Tensor,
+    clean_pixels: torch.Tensor,
+    labels: torch.Tensor,
+    targeted: bool,
+    target_labels: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    with torch.no_grad():
+        adv_logits = forward_logits(model, adv_images)
+        adv_predictions = adv_logits.argmax(dim=1)
+
+    adv_pixels = denormalize_images(adv_images).clamp(0.0, 1.0)
+    deltas = adv_pixels - clean_pixels
+    l2_distances = deltas.reshape(deltas.shape[0], -1).norm(p=2, dim=1)
+    linf_distances = deltas.abs().reshape(deltas.shape[0], -1).max(dim=1).values
+    success_mask = attack_success_mask(
+        adv_predictions,
+        labels,
+        targeted,
+        target_labels,
+    )
+    return adv_predictions, adv_pixels, l2_distances, linf_distances, success_mask
+
+
+def write_manifest_rows(
+    manifest_file,
+    attack_name: str,
+    split: str,
+    source_indices: list[int],
+    source_paths: list[Optional[str]],
+    labels: torch.Tensor,
+    clean_predictions: torch.Tensor,
+    adv_predictions: torch.Tensor,
+    success_mask: torch.Tensor,
+    l2_distances: torch.Tensor,
+    linf_distances: torch.Tensor,
+    saved_paths: list[Optional[Path]],
+    targeted: bool,
+    target_labels: Optional[torch.Tensor],
+) -> None:
+    for sample_offset, source_index in enumerate(source_indices):
+        label_value = int(labels[sample_offset].detach().cpu().item())
+        clean_pred_value = int(clean_predictions[sample_offset].detach().cpu().item())
+        adv_pred_value = int(adv_predictions[sample_offset].detach().cpu().item())
+        clean_correct = bool(clean_pred_value == label_value)
+        success = bool(success_mask[sample_offset].detach().cpu().item())
+        target_label_value = (
+            int(target_labels[sample_offset].detach().cpu().item())
+            if target_labels is not None
+            else None
+        )
+        record = build_manifest_record(
+            attack_name=attack_name,
+            split=split,
+            source_index=source_index,
+            source_path=source_paths[sample_offset],
+            label=label_value,
+            clean_pred=clean_pred_value,
+            adv_pred=adv_pred_value,
+            clean_correct=clean_correct,
+            success=success,
+            l2_distance=float(l2_distances[sample_offset].detach().cpu().item()),
+            linf_distance=float(linf_distances[sample_offset].detach().cpu().item()),
+            saved_path=saved_paths[sample_offset],
+            targeted=targeted,
+            target_label=target_label_value,
+        )
+        manifest_file.write(json.dumps(record) + "\n")
+
+
 def resolve_model_and_setup(
     args: argparse.Namespace,
     device: torch.device,
@@ -946,6 +1030,7 @@ def main() -> None:
         "fixed_target_label": args.fixed_target_label,
         "save_originals": args.save_originals,
         "save_successful_only": args.save_successful_only,
+        "fix_manifest": args.fix_manifest,
         "epsilon": args.epsilon,
         "pgd_alpha": args.pgd_alpha,
         "pgd_steps": args.pgd_steps,
@@ -965,6 +1050,7 @@ def main() -> None:
         "eligible_samples": 0,
         "skipped_clean_misclassified": 0,
         "skipped_fixed_target_label_matches": 0,
+        "manifest_rebuilt": args.fix_manifest,
         "attacks": {
             attack_name: {
                 "attempted": 0,
@@ -994,7 +1080,12 @@ def main() -> None:
         total_work_units=remaining_total_work_units,
     )
 
-    manifest_mode = "a" if manifest_path.exists() else "w"
+    manifest_mode = "w" if args.fix_manifest else ("a" if manifest_path.exists() else "w")
+    if args.fix_manifest:
+        LOGGER.info(
+            "rebuilding manifest at %s from existing outputs and any newly generated attacks",
+            manifest_path,
+        )
     with manifest_path.open(manifest_mode, encoding="utf-8") as manifest_file:
         for raw_batch in dataloader:
             batch_index += 1
@@ -1135,6 +1226,60 @@ def main() -> None:
                         eligible_source_paths,
                         existing_positions,
                     )
+                if args.fix_manifest and existing_positions:
+                    existing_positions_tensor = torch.tensor(
+                        existing_positions,
+                        device=eligible_labels.device,
+                        dtype=torch.long,
+                    )
+                    existing_output_paths = [output_paths[sample_offset] for sample_offset in existing_positions]
+                    existing_images = load_saved_adv_images(existing_output_paths, device)
+                    existing_clean_pixels = clean_pixels.index_select(0, existing_positions_tensor)
+                    existing_labels = eligible_labels.index_select(0, existing_positions_tensor)
+                    existing_clean_predictions = eligible_clean_predictions.index_select(0, existing_positions_tensor)
+                    existing_target_labels = (
+                        target_labels.index_select(0, existing_positions_tensor)
+                        if target_labels is not None
+                        else None
+                    )
+                    (
+                        existing_adv_predictions,
+                        _,
+                        existing_l2_distances,
+                        existing_linf_distances,
+                        existing_success_mask,
+                    ) = score_attack_batch(
+                        model,
+                        existing_images,
+                        existing_clean_pixels,
+                        existing_labels,
+                        args.targeted,
+                        existing_target_labels,
+                    )
+                    write_manifest_rows(
+                        manifest_file=manifest_file,
+                        attack_name=attack_name,
+                        split=args.split,
+                        source_indices=[eligible_source_indices[sample_offset] for sample_offset in existing_positions],
+                        source_paths=[eligible_source_paths[sample_offset] for sample_offset in existing_positions],
+                        labels=existing_labels,
+                        clean_predictions=existing_clean_predictions,
+                        adv_predictions=existing_adv_predictions,
+                        success_mask=existing_success_mask,
+                        l2_distances=existing_l2_distances,
+                        linf_distances=existing_linf_distances,
+                        saved_paths=existing_output_paths,
+                        targeted=args.targeted,
+                        target_labels=existing_target_labels,
+                    )
+                    update_summary_attack_stats(
+                        summary,
+                        attack_name,
+                        existing_success_mask,
+                        existing_l2_distances,
+                        existing_linf_distances,
+                        len(existing_output_paths),
+                    )
 
                 if not pending_positions:
                     continue
@@ -1210,35 +1355,28 @@ def main() -> None:
                     completed_work_units=completed_work_units,
                     total_work_units=remaining_total_work_units,
                 )
-                with torch.no_grad():
-                    adv_logits = forward_logits(model, adv_images)
-                    adv_predictions = adv_logits.argmax(dim=1)
-
-                adv_pixels = denormalize_images(adv_images).clamp(0.0, 1.0)
-                deltas = adv_pixels - pending_clean_pixels
-                l2_distances = deltas.reshape(deltas.shape[0], -1).norm(p=2, dim=1)
-                linf_distances = deltas.abs().reshape(deltas.shape[0], -1).max(dim=1).values
-                success_mask = attack_success_mask(
+                (
                     adv_predictions,
+                    adv_pixels,
+                    l2_distances,
+                    linf_distances,
+                    success_mask,
+                ) = score_attack_batch(
+                    model,
+                    adv_images,
+                    pending_clean_pixels,
                     pending_labels,
                     args.targeted,
                     pending_target_labels,
                 )
 
                 saved_count = 0
+                saved_paths: list[Optional[Path]] = []
                 for local_offset, sample_offset in enumerate(pending_positions):
                     source_index = eligible_source_indices[sample_offset]
                     source_path = eligible_source_paths[sample_offset]
                     label_value = int(pending_labels[local_offset].detach().cpu().item())
-                    clean_pred_value = int(pending_clean_predictions[local_offset].detach().cpu().item())
-                    adv_pred_value = int(adv_predictions[local_offset].detach().cpu().item())
-                    clean_correct = bool(clean_pred_value == label_value)
                     success = bool(success_mask[local_offset].detach().cpu().item())
-                    target_label_value = (
-                        int(pending_target_labels[local_offset].detach().cpu().item())
-                        if pending_target_labels is not None
-                        else None
-                    )
 
                     saved_path: Optional[Path] = None
                     if not args.save_successful_only or success:
@@ -1257,24 +1395,24 @@ def main() -> None:
                             )
                             if not clean_path.exists():
                                 save_image_tensor(pending_clean_pixels[local_offset], clean_path)
+                    saved_paths.append(saved_path)
 
-                    record = build_manifest_record(
-                        attack_name=attack_name,
-                        split=args.split,
-                        source_index=source_index,
-                        source_path=source_path,
-                        label=label_value,
-                        clean_pred=clean_pred_value,
-                        adv_pred=adv_pred_value,
-                        clean_correct=clean_correct,
-                        success=success,
-                        l2_distance=float(l2_distances[local_offset].detach().cpu().item()),
-                        linf_distance=float(linf_distances[local_offset].detach().cpu().item()),
-                        saved_path=saved_path,
-                        targeted=args.targeted,
-                        target_label=target_label_value,
-                    )
-                    manifest_file.write(json.dumps(record) + "\n")
+                write_manifest_rows(
+                    manifest_file=manifest_file,
+                    attack_name=attack_name,
+                    split=args.split,
+                    source_indices=[eligible_source_indices[sample_offset] for sample_offset in pending_positions],
+                    source_paths=[eligible_source_paths[sample_offset] for sample_offset in pending_positions],
+                    labels=pending_labels,
+                    clean_predictions=pending_clean_predictions,
+                    adv_predictions=adv_predictions,
+                    success_mask=success_mask,
+                    l2_distances=l2_distances,
+                    linf_distances=linf_distances,
+                    saved_paths=saved_paths,
+                    targeted=args.targeted,
+                    target_labels=pending_target_labels,
+                )
 
                 update_summary_attack_stats(
                     summary,

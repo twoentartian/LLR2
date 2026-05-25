@@ -4,12 +4,13 @@
 This script is the next stage after
 ``train_imagenet_latent_teacher_decoder.py``. It loads:
 
-- a trained latent decoder checkpoint
+- a trained latent decoder checkpoint, optionally including a latent encoder
 - a classifier (LLR2 checkpoint or torchvision pretrained model)
 - an ImageNet split from the LLR2 dataset setup
 
-Then it optimizes a fresh latent code for each selected image, decodes that
-latent into a perturbation, and saves the resulting adversarial images plus a
+Then it initializes a latent code for each selected image, optionally using the
+saved encoder for an amortized warm start, optimizes that latent code, decodes
+it into a perturbation, and saves the resulting adversarial images plus a
 manifest/summary for later evaluation.
 """
 
@@ -115,6 +116,22 @@ class ProgressTracker:
         self.last_line_length = 0
 
 
+class LatentGridEncoder(nn.Module):
+    def __init__(self, latent_channels: int = 3, grid_size: int = 20):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((grid_size, grid_size)),
+            nn.Conv2d(64, latent_channels, kernel_size=3, padding=1),
+        )
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        return self.net(images)
+
+
 class LatentGridDecoder(nn.Module):
     def __init__(self, grid_size: int, scale: float, latent_channels: int = 3, hidden_channels: int = 24) -> None:
         super().__init__()
@@ -165,7 +182,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=80, help="Number of latent optimization steps per batch.")
     parser.add_argument("--lr", type=float, default=0.08, help="Learning rate for latent optimization.")
     parser.add_argument("--epsilon", type=float, default=None, help="Optional hard Linf budget in pixel space [0, 1]. If omitted, only valid-image clamping is applied.")
-    parser.add_argument("--latent-init-mode", type=str, default="zero", choices=SUPPORTED_LATENT_INIT_MODES, help="How to initialize the optimized latents.")
+    parser.add_argument("--use-encoder", dest="use_encoder", action="store_true", default=True, help="Use the checkpoint's shared encoder for amortized latent initialization when available.")
+    parser.add_argument("--no-use-encoder", dest="use_encoder", action="store_false", help="Disable encoder-based initialization and fall back to --latent-init-mode.")
+    parser.add_argument("--latent-init-mode", type=str, default="zero", choices=SUPPORTED_LATENT_INIT_MODES, help="How to initialize the optimized latents when the encoder is disabled or unavailable.")
     parser.add_argument("--latent-init-scale", type=float, default=1e-3, help="Stddev used when --latent-init-mode random.")
     parser.add_argument("--lambda-attack", type=float, default=1.0, help="Weight for the attack objective.")
     parser.add_argument("--lambda-l2", type=float, default=30.0, help="Weight for decoded delta L2 regularization.")
@@ -283,17 +302,20 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--use-dali requires a CUDA device")
 
 
-def load_latent_decoder_checkpoint(path: Path, device: torch.device) -> tuple[dict[str, Any], LatentGridDecoder]:
+def load_latent_decoder_checkpoint(path: Path, device: torch.device) -> tuple[dict[str, Any], LatentGridDecoder, Optional[LatentGridEncoder]]:
     payload = torch.load(path, map_location="cpu", weights_only=True)
     decoder_config = payload.get("decoder_config")
     decoder_state_dict = payload.get("decoder_state_dict")
+    encoder_state_dict = payload.get("encoder_state_dict")
     if not isinstance(decoder_config, dict) or decoder_state_dict is None:
         raise ValueError(f"{path} is missing decoder_config or decoder_state_dict")
 
+    grid_size = int(decoder_config["grid_size"])
+    latent_channels = int(decoder_config["latent_channels"])
     decoder = LatentGridDecoder(
-        grid_size=int(decoder_config["grid_size"]),
+        grid_size=grid_size,
         scale=float(decoder_config["scale"]),
-        latent_channels=int(decoder_config["latent_channels"]),
+        latent_channels=latent_channels,
         hidden_channels=int(decoder_config["hidden_channels"]),
     )
     decoder.load_state_dict(decoder_state_dict, strict=True)
@@ -301,7 +323,19 @@ def load_latent_decoder_checkpoint(path: Path, device: torch.device) -> tuple[di
     decoder.eval()
     for parameter in decoder.parameters():
         parameter.requires_grad_(False)
-    return payload, decoder
+
+    encoder: Optional[LatentGridEncoder] = None
+    if encoder_state_dict is not None:
+        encoder = LatentGridEncoder(
+            latent_channels=latent_channels,
+            grid_size=grid_size,
+        )
+        encoder.load_state_dict(encoder_state_dict, strict=True)
+        encoder = encoder.to(device)
+        encoder.eval()
+        for parameter in encoder.parameters():
+            parameter.requires_grad_(False)
+    return payload, decoder, encoder
 
 
 def initialize_latents(
@@ -383,11 +417,13 @@ def attack_success_mask(predictions: torch.Tensor, labels: torch.Tensor, targete
 def latent_attack(
     model: nn.Module,
     decoder: LatentGridDecoder,
+    encoder: Optional[LatentGridEncoder],
     inputs: torch.Tensor,
     labels: torch.Tensor,
     target_labels: Optional[torch.Tensor],
     decoder_checkpoint: dict[str, Any],
     device: torch.device,
+    use_encoder: bool,
     steps: int,
     lr: float,
     epsilon: Optional[float],
@@ -404,15 +440,20 @@ def latent_attack(
     if target_labels is not None:
         target_labels = target_labels.to(device=device, dtype=torch.long)
 
-    init_latents = initialize_latents(
-        batch_size=x0.size(0),
-        latent_channels=decoder.latent_channels,
-        grid_size=decoder.grid_size,
-        device=device,
-        init_mode=init_mode,
-        init_scale=init_scale,
-        decoder_checkpoint=decoder_checkpoint,
-    )
+    if use_encoder:
+        assert encoder is not None
+        with torch.no_grad():
+            init_latents = encoder(x0).detach()
+    else:
+        init_latents = initialize_latents(
+            batch_size=x0.size(0),
+            latent_channels=decoder.latent_channels,
+            grid_size=decoder.grid_size,
+            device=device,
+            init_mode=init_mode,
+            init_scale=init_scale,
+            decoder_checkpoint=decoder_checkpoint,
+        )
     anchor = init_latents.detach()
     latents = init_latents.clone().detach().requires_grad_(True)
     optimizer = torch.optim.Adam([latents], lr=lr)
@@ -735,7 +776,13 @@ def main() -> None:
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    decoder_checkpoint, decoder = load_latent_decoder_checkpoint(latent_checkpoint_path, device)
+    decoder_checkpoint, decoder, encoder = load_latent_decoder_checkpoint(latent_checkpoint_path, device)
+    effective_use_encoder = args.use_encoder and encoder is not None
+    if args.use_encoder and encoder is None:
+        LOGGER.warning(
+            "checkpoint does not contain encoder_state_dict; falling back to latent init mode %s",
+            args.latent_init_mode,
+        )
     model, ml_setup, resolved_model_type, resolved_dataset_type = resolve_model_and_setup(args, decoder_checkpoint, device)
     dataloader, dataset_for_metadata = build_eval_dataloader(ml_setup, args)
 
@@ -778,6 +825,9 @@ def main() -> None:
         "fixed_target_label": args.fixed_target_label,
         "save_originals": args.save_originals,
         "save_successful_only": args.save_successful_only,
+        "requested_use_encoder": args.use_encoder,
+        "checkpoint_has_encoder": encoder is not None,
+        "effective_use_encoder": effective_use_encoder,
         "steps": args.steps,
         "lr": args.lr,
         "epsilon": args.epsilon,
@@ -797,6 +847,9 @@ def main() -> None:
         "classifier_dataset_type": resolved_dataset_type,
         "split": args.split,
         "attack_name": args.attack_name,
+        "requested_use_encoder": args.use_encoder,
+        "checkpoint_has_encoder": encoder is not None,
+        "effective_use_encoder": effective_use_encoder,
         "processed_samples": 0,
         "eligible_samples": 0,
         "skipped_clean_misclassified": 0,
@@ -923,11 +976,13 @@ def main() -> None:
             adv_images, attack_metrics = latent_attack(
                 model=model,
                 decoder=decoder,
+                encoder=encoder,
                 inputs=eligible_images,
                 labels=eligible_labels,
                 target_labels=target_labels,
                 decoder_checkpoint=decoder_checkpoint,
                 device=device,
+                use_encoder=effective_use_encoder,
                 steps=args.steps,
                 lr=args.lr,
                 epsilon=args.epsilon,

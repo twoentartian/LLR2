@@ -5,7 +5,8 @@ This script consumes the output of
 ``build_imagenet_adversarial_teacher_bank.py`` and trains:
 
 - one shared ``LatentGridDecoder``
-- one learned latent code per training sample
+- optionally one shared ``LatentGridEncoder``
+- or one learned latent code per training sample when the encoder is disabled
 
 The goal is to distill saved adversarial perturbations into a compact latent
 space that can later be fit/refined for new images.
@@ -115,6 +116,22 @@ def load_teacher_bank_image(path: Path, image_transform: transforms.Compose) -> 
         return image_transform(image.convert("RGB")) # type: ignore
 
 
+class LatentGridEncoder(nn.Module):
+    def __init__(self, latent_channels: int = 3, grid_size: int = 20):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((grid_size, grid_size)),
+            nn.Conv2d(64, latent_channels, kernel_size=3, padding=1),
+        )
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        return self.net(images)
+
+
 class LatentGridDecoder(nn.Module):
     def __init__(
         self,
@@ -169,12 +186,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grid-size", type=int, default=20, help="Latent grid size.")
     parser.add_argument("--latent-channels", type=int, default=3, help="Number of channels in the learned latent grid.")
     parser.add_argument("--hidden-channels", type=int, default=24, help="Hidden channels inside the shared latent decoder.")
+    parser.add_argument("--use-encoder", dest="use_encoder", action="store_true", default=True, help="Train a shared encoder that predicts initial latent grids for each image.")
+    parser.add_argument("--no-use-encoder", dest="use_encoder", action="store_false", help="Disable the shared encoder and instead learn a per-sample latent bank.")
     parser.add_argument("--decoder-scale", type=str, default="auto", help="Scale used for decoder output in normalized space. Use 'auto' to infer it from the training deltas.")
     parser.add_argument("--epochs", type=int, default=10, help="Training epochs.")
     parser.add_argument("--batch-size", type=int, default=32, help="Training batch size.")
     parser.add_argument("--num-workers", type=int, default=8, help="Training dataloader workers for the image-pair teacher bank.")
     parser.add_argument("--lr-decoder", type=float, default=1e-3, help="Learning rate for the shared decoder.")
-    parser.add_argument("--lr-latent", type=float, default=8e-2, help="Learning rate for the train-set latent bank.")
+    parser.add_argument("--lr-latent", type=float, default=8e-2, help="Learning rate for the shared encoder when enabled, or for the train-set latent bank otherwise.")
     parser.add_argument("--weight-decay", type=float, default=0.0, help="Weight decay for both optimizer parameter groups.")
     parser.add_argument("--supervision-mode", type=str, default="target_if_available_else_teacher_pred", choices=("teacher_pred", "target_if_available_else_teacher_pred"), help="How to choose class-label supervision for the attack-alignment loss.")
     parser.add_argument("--lambda-recon", type=float, default=8.0)
@@ -589,7 +608,8 @@ def format_loss_report(metrics: dict[str, float]) -> str:
 def train_decoder(
     classifier: nn.Module,
     decoder: LatentGridDecoder,
-    latent_bank: PerSampleLatentBank,
+    latent_bank: Optional[PerSampleLatentBank],
+    encoder: Optional[LatentGridEncoder],
     loader: DataLoader,
     low: torch.Tensor,
     high: torch.Tensor,
@@ -602,10 +622,14 @@ def train_decoder(
     weight_decay: float,
     log_every: int,
 ) -> list[dict[str, float]]:
+    if (latent_bank is None) == (encoder is None):
+        raise ValueError("expected exactly one of latent_bank or encoder")
+
+    latent_params = encoder.parameters() if encoder is not None else latent_bank.parameters()
     optimizer = torch.optim.Adam(
         [
             {"params": decoder.parameters(), "lr": lr_decoder, "weight_decay": weight_decay},
-            {"params": latent_bank.parameters(), "lr": lr_latent, "weight_decay": weight_decay},
+            {"params": latent_params, "lr": lr_latent, "weight_decay": weight_decay},
         ]
     )
     total_steps = max(1, epochs * len(loader))
@@ -615,13 +639,21 @@ def train_decoder(
     for epoch in range(1, epochs + 1):
         epoch_start = time.time()
         decoder.train()
-        latent_bank.train()
+        if encoder is not None:
+            encoder.train()
+        else:
+            assert latent_bank is not None
+            latent_bank.train()
         sums: dict[str, float] = {}
         total = 0
 
         for batch_index, batch in enumerate(loader, start=1):
             latent_indices, images, teacher_advs, source_labels, target_labels, teacher_pred_labels = batch
-            latents = latent_bank(latent_indices.to(device))
+            if encoder is not None:
+                latents = encoder(images.to(device))
+            else:
+                assert latent_bank is not None
+                latents = latent_bank(latent_indices.to(device))
             loss, metrics, _ = distillation_losses(
                 classifier=classifier,
                 decoder=decoder,
@@ -724,9 +756,54 @@ def evaluate_with_latent_bank(
     return finalize_metric_sums(sums, total)
 
 
+def evaluate_with_encoder(
+    classifier: nn.Module,
+    decoder: LatentGridDecoder,
+    encoder: LatentGridEncoder,
+    loader: DataLoader,
+    low: torch.Tensor,
+    high: torch.Tensor,
+    device: torch.device,
+    weights: LossWeights,
+    supervision_mode: str,
+) -> dict[str, float]:
+    decoder.eval()
+    encoder.eval()
+    sums: dict[str, float] = {}
+    total = 0
+
+    with torch.no_grad():
+        for batch in loader:
+            _, images, teacher_advs, source_labels, target_labels, teacher_pred_labels = batch
+            latents = encoder(images.to(device))
+            _, metrics, _ = distillation_losses(
+                classifier=classifier,
+                decoder=decoder,
+                latents=latents,
+                images=images,
+                teacher_advs=teacher_advs,
+                source_labels=source_labels,
+                target_labels=target_labels,
+                teacher_pred_labels=teacher_pred_labels,
+                low=low,
+                high=high,
+                device=device,
+                weights=weights,
+                supervision_mode=supervision_mode,
+            )
+            batch_size = int(images.size(0))
+            total += batch_size
+            aggregate_metric_sums(sums, metrics, batch_size)
+
+    if total == 0:
+        return {}
+    return finalize_metric_sums(sums, total)
+
+
 def fit_latents_for_loader(
     classifier: nn.Module,
     decoder: LatentGridDecoder,
+    encoder: Optional[LatentGridEncoder],
     loader: DataLoader,
     low: torch.Tensor,
     high: torch.Tensor,
@@ -742,16 +819,24 @@ def fit_latents_for_loader(
         return {}
 
     decoder.eval()
+    if encoder is not None:
+        encoder.eval()
     sums: dict[str, float] = {}
     total = 0
 
     for batch_index, batch in enumerate(loader, start=1):
         _, images, teacher_advs, source_labels, target_labels, teacher_pred_labels = batch
-        latents = torch.zeros(
-            (images.size(0), latent_channels, grid_size, grid_size),
-            device=device,
-            requires_grad=True,
-        )
+
+        if encoder is not None:
+            with torch.no_grad():
+                init_latents = encoder(images.to(device))
+            latents = init_latents.clone().detach().requires_grad_(True)
+        else:
+            latents = torch.zeros(
+                (images.size(0), latent_channels, grid_size, grid_size),
+                device=device,
+                requires_grad=True,
+            )
         optimizer = torch.optim.Adam([latents], lr=fit_lr)
 
         for _ in range(fit_steps):
@@ -810,7 +895,8 @@ def fit_latents_for_loader(
 def save_training_checkpoint(
     path: Path,
     decoder: LatentGridDecoder,
-    latent_bank: PerSampleLatentBank,
+    latent_bank: Optional[PerSampleLatentBank],
+    encoder: Optional[LatentGridEncoder],
     args: argparse.Namespace,
     resolved_model_type: str,
     resolved_dataset_type: str,
@@ -820,7 +906,6 @@ def save_training_checkpoint(
 ) -> None:
     payload = {
         "decoder_state_dict": decoder.state_dict(),
-        "latent_bank_state_dict": latent_bank.state_dict(),
         "decoder_config": {
             "grid_size": args.grid_size,
             "latent_channels": args.latent_channels,
@@ -834,6 +919,10 @@ def save_training_checkpoint(
         "val_count": val_count,
         "saved_at_unix": time.time(),
     }
+    if latent_bank is not None:
+        payload["latent_bank_state_dict"] = latent_bank.state_dict()
+    if encoder is not None:
+        payload["encoder_state_dict"] = encoder.state_dict()
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
 
@@ -926,18 +1015,28 @@ def main() -> None:
         latent_channels=args.latent_channels,
         hidden_channels=args.hidden_channels,
     ).to(device)
-    latent_bank = PerSampleLatentBank(
-        num_samples=len(train_dataset),
-        channels=args.latent_channels,
-        grid_size=args.grid_size,
-    ).to(device)
+    encoder: Optional[LatentGridEncoder] = None
+    latent_bank: Optional[PerSampleLatentBank] = None
+    if args.use_encoder:
+        encoder = LatentGridEncoder(
+            latent_channels=args.latent_channels,
+            grid_size=args.grid_size,
+        ).to(device)
+    else:
+        latent_bank = PerSampleLatentBank(
+            num_samples=len(train_dataset),
+            channels=args.latent_channels,
+            grid_size=args.grid_size,
+        ).to(device)
+    training_mode = "encoder_decoder" if encoder is not None else "decoder_latent_bank"
 
     LOGGER.info(
-        "training with %d train records and %d validation records | split_strategy=%s | decoder_scale=%.6f",
+        "training with %d train records and %d validation records | split_strategy=%s | decoder_scale=%.6f | mode=%s",
         len(train_dataset),
         len(val_dataset),
         split_strategy,
         decoder_scale,
+        training_mode,
     )
 
     run_config = {
@@ -950,6 +1049,7 @@ def main() -> None:
         "device": str(device),
         "teacher_bank_storage_mode": "image_pairs_png",
         "split_strategy": split_strategy,
+        "training_mode": training_mode,
         "train_count": len(train_dataset),
         "val_count": len(val_dataset),
         "decoder_scale": decoder_scale,
@@ -962,6 +1062,7 @@ def main() -> None:
         classifier=classifier,
         decoder=decoder,
         latent_bank=latent_bank,
+        encoder=encoder,
         loader=train_loader,
         low=low,
         high=high,
@@ -975,20 +1076,35 @@ def main() -> None:
         log_every=args.log_every,
     )
 
-    final_train_metrics = evaluate_with_latent_bank(
-        classifier=classifier,
-        decoder=decoder,
-        latent_bank=latent_bank,
-        loader=train_eval_loader,
-        low=low,
-        high=high,
-        device=device,
-        weights=weights,
-        supervision_mode=args.supervision_mode,
-    )
+    if encoder is not None:
+        final_train_metrics = evaluate_with_encoder(
+            classifier=classifier,
+            decoder=decoder,
+            encoder=encoder,
+            loader=train_eval_loader,
+            low=low,
+            high=high,
+            device=device,
+            weights=weights,
+            supervision_mode=args.supervision_mode,
+        )
+    else:
+        assert latent_bank is not None
+        final_train_metrics = evaluate_with_latent_bank(
+            classifier=classifier,
+            decoder=decoder,
+            latent_bank=latent_bank,
+            loader=train_eval_loader,
+            low=low,
+            high=high,
+            device=device,
+            weights=weights,
+            supervision_mode=args.supervision_mode,
+        )
     val_fit_metrics = fit_latents_for_loader(
         classifier=classifier,
         decoder=decoder,
+        encoder=encoder,
         loader=val_loader,
         low=low,
         high=high,
@@ -1006,6 +1122,7 @@ def main() -> None:
         path=checkpoint_path,
         decoder=decoder,
         latent_bank=latent_bank,
+        encoder=encoder,
         args=args,
         resolved_model_type=resolved_model_type,
         resolved_dataset_type=resolved_dataset_type,
@@ -1024,6 +1141,7 @@ def main() -> None:
         "device": str(device),
         "teacher_bank_storage_mode": "image_pairs_png",
         "split_strategy": split_strategy,
+        "training_mode": training_mode,
         "train_count": len(train_dataset),
         "val_count": len(val_dataset),
         "decoder_scale": decoder_scale,

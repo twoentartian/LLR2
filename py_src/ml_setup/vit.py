@@ -25,7 +25,7 @@ def vit_b_32_imagenet1k(preset: int = 1, override_dataset: Optional[DatasetSetup
         model,
         ModelType.vit_b_32,
         ds,
-        128,
+        512,
         criterion=imagenet_criterion(pv),
         clip_grad_norm=1,
         default_collate_fn=imagenet_collate_fn(pv, mixup_alpha=0.2, cutmix_alpha=1.0),

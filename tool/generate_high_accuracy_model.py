@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import sys
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Optional
 
@@ -13,6 +14,7 @@ import numpy as np
 import torch
 from PIL import Image
 import lightning as L
+from tqdm.auto import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -78,6 +80,51 @@ def initialize_model_to_opposite_direction(
     )
 
 
+def maybe_enable_torch_compile(
+    model: torch.nn.Module,
+    adapter,
+    device: Device,
+    child_logger: logging.Logger,
+    enable_torch_compile: bool,
+) -> None:
+    if not enable_torch_compile:
+        child_logger.info("torch.compile disabled")
+        return
+    if device.device.type != "cuda":
+        child_logger.info("torch.compile skipped: device=%s", device.device.type)
+        return
+    if not hasattr(torch, "compile"):
+        child_logger.info("torch.compile unavailable in this PyTorch build")
+        return
+    if not isinstance(adapter, (_adapters.StandardAdapter, _adapters.DiffusionAdapter)):
+        child_logger.info(
+            "torch.compile skipped: adapter %s is not supported in this training path",
+            type(adapter).__name__,
+        )
+        return
+
+    try:
+        compiled_model = torch.compile(model)
+        if isinstance(compiled_model, torch.nn.Module):
+            adapter._model = compiled_model # type: ignore[attr-defined]
+            child_logger.info("torch.compile enabled")
+        else:
+            child_logger.info("torch.compile returned a non-Module wrapper; using the original module")
+    except Exception as exc:
+        child_logger.info("torch.compile skipped: %s", exc)
+
+
+class _ProgressIterable:
+    def __init__(self, iterable, progress_bar):
+        self._iterable = iterable
+        self._progress_bar = progress_bar
+
+    def __iter__(self):
+        for batch in self._iterable:
+            yield batch
+            self._progress_bar.update(1)
+
+
 # ---------------------------------------------------------------------------
 # Core training routine (single process, no multiprocessing)
 # ---------------------------------------------------------------------------
@@ -92,6 +139,7 @@ def training_model(
     arg_save_format: str,
     arg_save_interval: int,
     arg_amp: bool,
+    arg_compile: bool,
     arg_preset: int,
     arg_epoch_override,
     transfer_learn_model_path,
@@ -212,19 +260,35 @@ def training_model(
     if hasattr(model, "set_batches_per_epoch"):
         model.set_batches_per_epoch(len(dataloader)) # type: ignore
 
+    maybe_enable_torch_compile(model, adapter, device, child_logger, arg_compile)
+
     scaler = device.make_scaler() if arg_amp else None
 
     for epoch in range(epochs):
-        train_result = train(
-            adapter,
-            dataloader,
-            optimizer, # type: ignore
-            lr_scheduler, # type: ignore
-            device=device,
-            scaler=scaler,
-            gradient_accumulate_every=arg_ml_setup.gradient_accumulate_every,
-            max_grad_norm=arg_ml_setup.max_grad_norm,
-        ) # type: ignore
+        progress_enabled = arg_worker_count == 1
+        progress_context = tqdm(
+            total=steps_per_epoch,
+            desc=f"epoch {epoch + 1}/{epochs}",
+            unit="batch",
+            dynamic_ncols=True,
+            leave=True,
+        ) if progress_enabled else nullcontext()
+        with progress_context as progress_bar:
+            train_iterable = (
+                _ProgressIterable(dataloader, progress_bar)
+                if progress_enabled and progress_bar is not None
+                else dataloader
+            )
+            train_result = train(
+                adapter,
+                train_iterable,
+                optimizer, # type: ignore
+                lr_scheduler, # type: ignore
+                device=device,
+                scaler=scaler,
+                gradient_accumulate_every=arg_ml_setup.gradient_accumulate_every,
+                max_grad_norm=arg_ml_setup.max_grad_norm,
+            ) # type: ignore
 
         lrs = [pg["lr"] for pg in optimizer.param_groups] # type: ignore
 
@@ -304,6 +368,12 @@ if __name__ == "__main__":
                         help="save per-epoch checkpoints (file) or skip (none)")
     parser.add_argument("--save_interval", type=int, default=1, help="checkpoint every N epochs")
     parser.add_argument("--amp", action="store_true", help="enable automatic mixed precision")
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable torch.compile on CUDA when supported",
+    )
     parser.add_argument("-s", "--random_seed", type=int, default=None)
     parser.add_argument("-i", "--start_index", type=int, default=0)
     parser.add_argument("-P", "--preset", type=int, default=1, help="training hyperparameter preset index")
@@ -361,6 +431,7 @@ if __name__ == "__main__":
         "generated_by_cpu": args.cpu,
         "use_dali": args.dali,
         "dali_device_id": args.dali_device_id,
+        "torch_compile": args.compile,
         "opposite_init_model": args.opposite_init_model,
     }
     with open(os.path.join(output_folder_path, "info.json"), "w") as f:
@@ -373,7 +444,7 @@ if __name__ == "__main__":
         (output_folder_path, i, number_of_models,
          current_ml_setup, args.cpu, args.random_seed,
          worker_count, total_cpu_cores,
-         args.save_format, args.save_interval, args.amp, args.preset, args.epoch,
+         args.save_format, args.save_interval, args.amp, args.compile, args.preset, args.epoch,
          args.transfer_learn, args.initial_model, args.opposite_init_model,
          args.disable_reinit, args.enable_eval)
         for i in range(args.start_index, args.start_index + number_of_models)

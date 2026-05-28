@@ -192,6 +192,40 @@ class FastTrainingSetup:
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
             return optimizer, scheduler, epochs
 
+        elif mt == ModelType.vit_b_32:
+            if dt == DatasetType.imagenet1k:
+                # Torchvision's recipe is defined in epochs, while LLR2 steps the
+                # scheduler after every optimizer update.
+                initial_lr, weight_decay = 3e-3, 3e-1
+                warmup_decay, warmup_epochs, epochs = 0.033, 30, 300
+                warmup_steps = warmup_epochs * steps_per_epoch
+                total_steps = epochs * steps_per_epoch
+
+                optimizer = torch.optim.AdamW(
+                    model.parameters(),
+                    lr=initial_lr,
+                    weight_decay=weight_decay,
+                )
+                warmup = torch.optim.lr_scheduler.LinearLR(
+                    optimizer,
+                    start_factor=warmup_decay,
+                    end_factor=1.0,
+                    total_iters=warmup_steps,
+                )
+                cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=total_steps - warmup_steps,
+                    eta_min=0.0,
+                )
+                scheduler = torch.optim.lr_scheduler.SequentialLR(
+                    optimizer,
+                    schedulers=[warmup, cosine],
+                    milestones=[warmup_steps],
+                )
+                return optimizer, scheduler, epochs
+            else:
+                raise err
+
         elif mt == ModelType.mobilenet_v2:
             if dt == DatasetType.cifar10:
                 epochs = 200

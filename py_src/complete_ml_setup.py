@@ -196,8 +196,8 @@ class FastTrainingSetup:
             if dt == DatasetType.imagenet1k:
                 # Torchvision's recipe is defined in epochs, while LLR2 steps the
                 # scheduler after every optimizer update.
-                initial_lr, weight_decay = 3e-3, 3e-1
-                warmup_decay, warmup_epochs, epochs = 0.033, 30, 300
+                initial_lr, weight_decay = 5e-4, 5e-2 # DeiT style
+                warmup_decay, warmup_epochs, epochs = 0.033, 5, 300
                 warmup_steps = warmup_epochs * steps_per_epoch
                 total_steps = epochs * steps_per_epoch
 

@@ -6,7 +6,9 @@ validation batch. All data is synthetic and in-memory.
 
 from __future__ import annotations
 
+import logging
 import os
+import random
 import sys
 import tempfile
 import unittest
@@ -14,6 +16,7 @@ from typing import Any
 from unittest.mock import patch
 
 import lightning as L
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -76,6 +79,13 @@ from py_src.ml_setup.ml_setup import MLSetup
 from py_src.complete_ml_setup import FastTrainingSetup
 from py_src.ml_setup.dataloader_util import DataloaderConfig
 from py_src.ml_setup_dataset import DatasetSetup, DatasetType
+from tool.generate_high_accuracy_model import (
+    _capture_rng_state,
+    _prepare_log_csv_for_resume,
+    _restore_rng_state,
+    load_training_checkpoint,
+    save_training_checkpoint,
+)
 from test.util import (
     DummyDatasetNanoCLIP,
     make_dummy_cifar10,
@@ -547,6 +557,122 @@ class TestRunSingleBatch(unittest.TestCase):
         self.assertIsNone(val_result)
         print("nanoclip_flickr30k_default")
         print(f"train loss:{train_result.avg_loss:.4f} train accuracy:{train_result.accuracy:.4f}")
+
+
+class TestGenerateHighAccuracyModelCheckpointing(unittest.TestCase):
+    def test_training_checkpoint_round_trip_preserves_training_state(self):
+        model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)
+
+        batch = torch.randn(3, 4)
+        loss = model(batch).sum()
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+        run_config = {
+            "model_type": "dummy_model",
+            "dataset_type": "dummy_dataset",
+            "cpu": True,
+            "dali": False,
+            "dali_device_id": 0,
+            "save_format": "file",
+            "save_interval": 1,
+            "amp": False,
+            "compile": False,
+            "random_seed": 123,
+            "preset": 1,
+            "epoch_override": 4,
+            "transfer_learn": None,
+            "initial_model": None,
+            "opposite_init_model": None,
+            "disable_reinit": False,
+            "enable_eval": False,
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = os.path.join(tmpdir, "training_checkpoint_epoch0.pt")
+            save_training_checkpoint(
+                checkpoint_path,
+                model=model,
+                optimizer=optimizer,
+                lr_scheduler=scheduler,
+                scaler=None,
+                completed_epoch=0,
+                total_epochs=4,
+                index=3,
+                number_of_models=10,
+                output_folder=tmpdir,
+                run_config=run_config,
+            )
+
+            checkpoint = load_training_checkpoint(checkpoint_path)
+
+        self.assertEqual(checkpoint["checkpoint_type"], "generate_high_accuracy_model")
+        self.assertEqual(checkpoint["completed_epoch"], 0)
+        self.assertEqual(checkpoint["next_epoch"], 1)
+        self.assertEqual(checkpoint["total_epochs"], 4)
+        self.assertEqual(checkpoint["index"], 3)
+        self.assertEqual(checkpoint["number_of_models"], 10)
+        self.assertEqual(checkpoint["run_config"]["model_type"], "dummy_model")
+        self.assertIsNotNone(checkpoint["optimizer_state_dict"])
+        self.assertIsNotNone(checkpoint["lr_scheduler_state_dict"])
+        self.assertIsNone(checkpoint["scaler_state_dict"])
+
+        restored_model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
+        restored_model.load_state_dict(checkpoint["state_dict"])
+        for expected, actual in zip(model.parameters(), restored_model.parameters()):
+            self.assertTrue(torch.allclose(expected, actual))
+
+    def test_prepare_log_csv_for_resume_truncates_rows_after_checkpoint_epoch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_csv_path = os.path.join(tmpdir, "00.log.csv")
+            with open(log_csv_path, "w", encoding="utf-8") as log_file:
+                log_file.write("epoch,training_loss,training_accuracy,validation_loss,validation_accuracy,lrs\n")
+                log_file.write("0,1.0,0.1,nan,nan,[0.1]\n")
+                log_file.write("1,0.8,0.2,nan,nan,[0.1]\n")
+                log_file.write("2,0.6,0.3,nan,nan,[0.1]\n")
+
+            _prepare_log_csv_for_resume(log_csv_path, completed_epoch=1)
+
+            with open(log_csv_path, "r", encoding="utf-8") as log_file:
+                lines = log_file.readlines()
+
+        self.assertEqual(
+            lines,
+            [
+                "epoch,training_loss,training_accuracy,validation_loss,validation_accuracy,lrs\n",
+                "0,1.0,0.1,nan,nan,[0.1]\n",
+                "1,0.8,0.2,nan,nan,[0.1]\n",
+            ],
+        )
+
+    def test_rng_state_round_trip_replays_same_samples(self):
+        logger = logging.getLogger("test_generate_high_accuracy_model_checkpointing")
+        random.seed(7)
+        np.random.seed(7)
+        torch.manual_seed(7)
+
+        rng_state = _capture_rng_state()
+
+        python_first = random.random()
+        numpy_first = np.random.rand(3)
+        torch_first = torch.rand(3)
+
+        random.random()
+        np.random.rand(3)
+        torch.rand(3)
+
+        _restore_rng_state(rng_state, logger)
+
+        python_second = random.random()
+        numpy_second = np.random.rand(3)
+        torch_second = torch.rand(3)
+
+        self.assertEqual(python_first, python_second)
+        self.assertTrue(np.allclose(numpy_first, numpy_second))
+        self.assertTrue(torch.allclose(torch_first, torch_second))
 
 
 if __name__ == "__main__":

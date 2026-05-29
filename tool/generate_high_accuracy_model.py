@@ -125,6 +125,14 @@ class _ProgressIterable:
             self._progress_bar.update(1)
 
 
+def _should_enable_progress_bar(arg_worker_count: int) -> bool:
+    if arg_worker_count != 1:
+        return False
+    # sbatch and redirected logs are typically non-interactive; avoid
+    # emitting tqdm control characters into those outputs.
+    return sys.stderr.isatty()
+
+
 # ---------------------------------------------------------------------------
 # Core training routine (single process, no multiprocessing)
 # ---------------------------------------------------------------------------
@@ -264,8 +272,11 @@ def training_model(
 
     scaler = device.make_scaler() if arg_amp else None
 
+    progress_enabled = _should_enable_progress_bar(arg_worker_count)
+    if arg_worker_count == 1 and not progress_enabled:
+        child_logger.info("progress bar disabled for non-interactive output")
+
     for epoch in range(epochs):
-        progress_enabled = arg_worker_count == 1
         progress_context = tqdm(
             total=steps_per_epoch,
             desc=f"epoch {epoch + 1}/{epochs}",

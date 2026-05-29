@@ -560,7 +560,7 @@ class TestRunSingleBatch(unittest.TestCase):
 
 
 class TestGenerateHighAccuracyModelCheckpointing(unittest.TestCase):
-    def test_training_checkpoint_round_trip_preserves_training_state(self):
+    def test_training_checkpoint_round_trip_preserves_latest_training_state(self):
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.5)
@@ -592,7 +592,7 @@ class TestGenerateHighAccuracyModelCheckpointing(unittest.TestCase):
         }
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            checkpoint_path = os.path.join(tmpdir, "training_checkpoint_epoch0.pt")
+            checkpoint_path = os.path.join(tmpdir, "training_checkpoint.pt")
             save_training_checkpoint(
                 checkpoint_path,
                 model=model,
@@ -607,11 +607,31 @@ class TestGenerateHighAccuracyModelCheckpointing(unittest.TestCase):
                 run_config=run_config,
             )
 
+            optimizer.zero_grad(set_to_none=True)
+            second_loss = model(torch.randn(3, 4)).sum()
+            second_loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            save_training_checkpoint(
+                checkpoint_path,
+                model=model,
+                optimizer=optimizer,
+                lr_scheduler=scheduler,
+                scaler=None,
+                completed_epoch=1,
+                total_epochs=4,
+                index=3,
+                number_of_models=10,
+                output_folder=tmpdir,
+                run_config=run_config,
+            )
+
             checkpoint = load_training_checkpoint(checkpoint_path)
 
         self.assertEqual(checkpoint["checkpoint_type"], "generate_high_accuracy_model")
-        self.assertEqual(checkpoint["completed_epoch"], 0)
-        self.assertEqual(checkpoint["next_epoch"], 1)
+        self.assertEqual(checkpoint["completed_epoch"], 1)
+        self.assertEqual(checkpoint["next_epoch"], 2)
         self.assertEqual(checkpoint["total_epochs"], 4)
         self.assertEqual(checkpoint["index"], 3)
         self.assertEqual(checkpoint["number_of_models"], 10)

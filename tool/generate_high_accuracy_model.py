@@ -258,7 +258,9 @@ def save_training_checkpoint(
         "run_config": copy.deepcopy(run_config),
         "rng_state": _capture_rng_state(),
     }
-    torch.save(checkpoint, path)
+    temp_path = f"{path}.tmp"
+    torch.save(checkpoint, temp_path)
+    os.replace(temp_path, path)
 
 
 def load_training_checkpoint(path: str) -> dict[str, Any]:
@@ -372,9 +374,12 @@ def training_model(
     )
     epochs = arg_epoch_override if arg_epoch_override is not None else resumed_total_epochs
 
+    checkpoint_folder = os.path.join(output_folder, str(index))
+    os.makedirs(checkpoint_folder, exist_ok=True)
+    training_checkpoint_path = os.path.join(checkpoint_folder, "training_checkpoint.pt")
+
     if arg_save_format != "none":
-        ckpt_folder = os.path.join(output_folder, str(index))
-        os.makedirs(ckpt_folder, exist_ok=resume_checkpoint is not None)
+        ckpt_folder = checkpoint_folder
     else:
         ckpt_folder = None
 
@@ -593,21 +598,19 @@ def training_model(
                 with torch.no_grad():
                     arg_ml_setup.difussion_generate_sample(model, output_folder, epoch, device.device, sample_count)
 
-        if ckpt_folder is not None and epoch % arg_save_interval == 0:
-            checkpoint_path = os.path.join(ckpt_folder, f"training_checkpoint_epoch{epoch}.pt")
-            save_training_checkpoint(
-                checkpoint_path,
-                model=model,
-                optimizer=optimizer,
-                lr_scheduler=lr_scheduler,
-                scaler=scaler,
-                completed_epoch=epoch,
-                total_epochs=epochs,
-                index=index,
-                number_of_models=number_of_models,
-                output_folder=output_folder,
-                run_config=checkpoint_run_config,
-            )
+        save_training_checkpoint(
+            training_checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+            scaler=scaler,
+            completed_epoch=epoch,
+            total_epochs=epochs,
+            index=index,
+            number_of_models=number_of_models,
+            output_folder=output_folder,
+            run_config=checkpoint_run_config,
+        )
 
     child_logger.info("training complete")
     log_csv.flush()

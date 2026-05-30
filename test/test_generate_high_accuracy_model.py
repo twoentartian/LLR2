@@ -79,11 +79,13 @@ from py_src.ml_setup.ml_setup import MLSetup
 from py_src.complete_ml_setup import FastTrainingSetup
 from py_src.ml_setup.dataloader_util import DataloaderConfig
 from py_src.ml_setup_dataset import DatasetSetup, DatasetType
+from py_src.model_opti_save_load import load_model_state_file
 from tool.generate_high_accuracy_model import (
     _capture_rng_state,
     _prepare_log_csv_for_resume,
     _restore_rng_state,
     load_training_checkpoint,
+    maybe_save_best_training_models,
     save_training_checkpoint,
 )
 from test.util import (
@@ -560,6 +562,65 @@ class TestRunSingleBatch(unittest.TestCase):
 
 
 class TestGenerateHighAccuracyModelCheckpointing(unittest.TestCase):
+    def test_best_training_models_track_loss_and_accuracy_independently(self):
+        logger = logging.getLogger("test_generate_high_accuracy_model_best_models")
+        model = nn.Linear(4, 2)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            best_loss, best_accuracy = maybe_save_best_training_models(
+                output_folder=tmpdir,
+                index=3,
+                digit_width=2,
+                model=model,
+                model_type_name="dummy_model",
+                dataset_type_name="dummy_dataset",
+                epoch=0,
+                training_loss=1.0,
+                training_accuracy=0.4,
+                best_training_loss=None,
+                best_training_accuracy=None,
+                child_logger=logger,
+            )
+
+            first_loss_state, _, _ = load_model_state_file(
+                os.path.join(tmpdir, "03.best_training_loss.model.pt")
+            )
+            first_accuracy_state, _, _ = load_model_state_file(
+                os.path.join(tmpdir, "03.best_training_accuracy.model.pt")
+            )
+
+            with torch.no_grad():
+                for parameter in model.parameters():
+                    parameter.add_(1.0)
+
+            best_loss, best_accuracy = maybe_save_best_training_models(
+                output_folder=tmpdir,
+                index=3,
+                digit_width=2,
+                model=model,
+                model_type_name="dummy_model",
+                dataset_type_name="dummy_dataset",
+                epoch=1,
+                training_loss=1.2,
+                training_accuracy=0.5,
+                best_training_loss=best_loss,
+                best_training_accuracy=best_accuracy,
+                child_logger=logger,
+            )
+
+            second_loss_state, _, _ = load_model_state_file(
+                os.path.join(tmpdir, "03.best_training_loss.model.pt")
+            )
+            second_accuracy_state, _, _ = load_model_state_file(
+                os.path.join(tmpdir, "03.best_training_accuracy.model.pt")
+            )
+
+        self.assertEqual(best_loss, 1.0)
+        self.assertEqual(best_accuracy, 0.5)
+        for key in first_loss_state:
+            self.assertTrue(torch.allclose(first_loss_state[key], second_loss_state[key]))
+            self.assertFalse(torch.allclose(first_accuracy_state[key], second_accuracy_state[key]))
+
     def test_training_checkpoint_round_trip_preserves_latest_training_state(self):
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)

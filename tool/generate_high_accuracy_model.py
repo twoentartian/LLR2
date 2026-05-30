@@ -263,6 +263,52 @@ def save_training_checkpoint(
     os.replace(temp_path, path)
 
 
+def maybe_save_best_training_models(
+    *,
+    output_folder: str,
+    index: int,
+    digit_width: int,
+    model: torch.nn.Module,
+    model_type_name: str,
+    dataset_type_name: str,
+    epoch: int,
+    training_loss: float,
+    training_accuracy: Optional[float],
+    best_training_loss: Optional[float],
+    best_training_accuracy: Optional[float],
+    child_logger: logging.Logger,
+) -> tuple[Optional[float], Optional[float]]:
+    if best_training_loss is None or training_loss < best_training_loss:
+        best_loss_path = os.path.join(
+            output_folder,
+            f"{str(index).zfill(digit_width)}.best_training_loss.model.pt",
+        )
+        save_model_state(best_loss_path, model.state_dict(), model_type_name, dataset_type_name)
+        best_training_loss = training_loss
+        child_logger.info(
+            "saved best-training-loss model at epoch %d with loss %.6f",
+            epoch,
+            training_loss,
+        )
+
+    if training_accuracy is not None and (
+        best_training_accuracy is None or training_accuracy > best_training_accuracy
+    ):
+        best_accuracy_path = os.path.join(
+            output_folder,
+            f"{str(index).zfill(digit_width)}.best_training_accuracy.model.pt",
+        )
+        save_model_state(best_accuracy_path, model.state_dict(), model_type_name, dataset_type_name)
+        best_training_accuracy = training_accuracy
+        child_logger.info(
+            "saved best-training-accuracy model at epoch %d with accuracy %.6f",
+            epoch,
+            training_accuracy,
+        )
+
+    return best_training_loss, best_training_accuracy
+
+
 def load_training_checkpoint(path: str) -> dict[str, Any]:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     checkpoint_type = checkpoint.get("checkpoint_type")
@@ -529,6 +575,8 @@ def training_model(
 
     checkpoint_run_config = copy.deepcopy(run_config)
     checkpoint_run_config["epoch_override"] = arg_epoch_override
+    best_training_loss: Optional[float] = None
+    best_training_accuracy: Optional[float] = None
 
     for epoch in range(start_epoch, epochs):
         progress_context = tqdm(
@@ -583,6 +631,21 @@ def training_model(
                 f"{val_result.avg_loss:.3e},{val_acc:.4e},{lrs}\n"
             )
         log_csv.flush()
+
+        best_training_loss, best_training_accuracy = maybe_save_best_training_models(
+            output_folder=output_folder,
+            index=index,
+            digit_width=digit_width,
+            model=model,
+            model_type_name=arg_ml_setup.model_type.name,
+            dataset_type_name=arg_ml_setup.dataset_type.name,
+            epoch=epoch,
+            training_loss=train_result.avg_loss,
+            training_accuracy=train_result.accuracy,
+            best_training_loss=best_training_loss,
+            best_training_accuracy=best_training_accuracy,
+            child_logger=child_logger,
+        )
 
         if ckpt_folder is not None and epoch % arg_save_interval == 0:
             ckpt_path = os.path.join(ckpt_folder, f"epoch{epoch}.pt")

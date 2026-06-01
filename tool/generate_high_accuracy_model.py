@@ -35,7 +35,7 @@ logger = logging.getLogger("generate_high_accuracy_model")
 LOG_CSV_HEADER = "epoch,training_loss,training_accuracy,validation_loss,validation_accuracy,lrs\n"
 TRAINING_CHECKPOINT_TYPE = "generate_high_accuracy_model"
 TRAINING_CHECKPOINT_VERSION = 1
-MAX_THREAD_PER_PROCESS = 16
+MAX_THREAD_PER_PROCESS = 8
 NumpyRngStateTuple: TypeAlias = tuple[str, npt.NDArray[np.uint32], int, int, float]
 TorchStateDict: TypeAlias = dict[str, Any]
 

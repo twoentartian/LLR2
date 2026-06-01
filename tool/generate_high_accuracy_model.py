@@ -404,7 +404,7 @@ def training_model(
                              _adapters.LightningAdapter, _adapters.CustomStepAdapter)):
         adapter._model = model # type: ignore
 
-    num_workers = min(thread_per_process, 8)
+    num_workers = min(thread_per_process, 16)
 
     dataloader = arg_ml_setup.train_dataloader(DataloaderConfig(num_workers=num_workers))
     steps_per_epoch = len(dataloader) # type: ignore

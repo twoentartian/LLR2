@@ -76,4 +76,5 @@ def vit_b_32_imagenet1k(preset: int = 1, override_dataset: Optional[DatasetSetup
         default_collate_fn=collate_fn,
         default_collate_fn_val=default_collate,
         default_sampler_fn=sampler_fn,
+        default_prefetch_factor=16,
     )

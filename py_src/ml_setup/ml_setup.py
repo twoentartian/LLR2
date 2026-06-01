@@ -40,6 +40,7 @@ class MLSetup:
     default_collate_fn: Optional[Callable] = None
     default_collate_fn_val: Optional[Callable] = None
     default_sampler_fn: Optional[Callable] = None
+    default_prefetch_factor: int = 4
     has_normalization_layer: bool = False
     gradient_accumulate_every: int = 1
     max_grad_norm: Optional[float] = None
@@ -66,6 +67,7 @@ class MLSetup:
         return build_dataloader(
             dataset=self.training_data,
             default_batch_size=self.default_batch_size,
+            default_prefetch_factor=self.default_prefetch_factor,
             config=config,
             is_train=True,
             default_collate_fn=self.default_collate_fn,
@@ -80,6 +82,7 @@ class MLSetup:
         return build_dataloader(
             dataset=self.testing_data,
             default_batch_size=self.default_batch_size,
+            default_prefetch_factor=self.default_prefetch_factor,
             config=config,
             is_train=False,
             default_collate_fn=collate,

@@ -53,6 +53,7 @@ def cache_dataloader_on_device(dataloader: Iterable, device: torch.device) -> li
 def build_dataloader(
     dataset: Any,
     default_batch_size: int,
+    default_prefetch_factor: int = 4,
     config: Optional[DataloaderConfig] = None,
     is_train: bool = True,
     default_collate_fn: Optional[Callable] = None,
@@ -123,7 +124,7 @@ def build_dataloader(
         collate_fn=collate_fn,
     )
     if cfg.num_workers > 0:
-        prefetch_factor = cfg.prefetch_factor if cfg.prefetch_factor is not None else 4
+        prefetch_factor = cfg.prefetch_factor if cfg.prefetch_factor is not None else default_prefetch_factor
         persistent_workers = (
             cfg.persistent_workers
             if cfg.persistent_workers is not None

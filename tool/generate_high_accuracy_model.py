@@ -579,6 +579,10 @@ def training_model(
     best_training_accuracy: Optional[float] = None
 
     for epoch in range(start_epoch, epochs):
+        train_sampler = getattr(dataloader, "sampler", None)
+        if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
+            train_sampler.set_epoch(epoch)
+
         progress_context = tqdm(
             total=steps_per_epoch,
             desc=f"epoch {epoch + 1}/{epochs}",

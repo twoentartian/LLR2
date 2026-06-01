@@ -35,6 +35,7 @@ logger = logging.getLogger("generate_high_accuracy_model")
 LOG_CSV_HEADER = "epoch,training_loss,training_accuracy,validation_loss,validation_accuracy,lrs\n"
 TRAINING_CHECKPOINT_TYPE = "generate_high_accuracy_model"
 TRAINING_CHECKPOINT_VERSION = 1
+MAX_THREAD_PER_PROCESS = 16
 NumpyRngStateTuple: TypeAlias = tuple[str, npt.NDArray[np.uint32], int, int, float]
 TorchStateDict: TypeAlias = dict[str, Any]
 
@@ -383,7 +384,7 @@ def training_model(
     load_checkpoint_path: Optional[str],
 ):
     thread_per_process = arg_total_cpu_count // arg_worker_count
-    thread_per_process = min(thread_per_process, 8)
+    thread_per_process = min(thread_per_process, MAX_THREAD_PER_PROCESS)
     torch.set_num_threads(thread_per_process)
 
     child_logger = logging.getLogger(f"generate_high_accuracy_model.{index}")
@@ -404,7 +405,7 @@ def training_model(
                              _adapters.LightningAdapter, _adapters.CustomStepAdapter)):
         adapter._model = model # type: ignore
 
-    num_workers = min(thread_per_process, 16)
+    num_workers = min(thread_per_process, MAX_THREAD_PER_PROCESS)
 
     dataloader = arg_ml_setup.train_dataloader(DataloaderConfig(num_workers=num_workers, prefetch_factor=4))
     steps_per_epoch = len(dataloader) # type: ignore

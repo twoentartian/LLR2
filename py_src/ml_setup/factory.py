@@ -219,7 +219,12 @@ def _build(mt: ModelType, dt, preset: int, device, *, use_dali: bool = False, da
     elif mt == ModelType.vit_b_32:
         from .vit import vit_b_32_imagenet1k
         if _default or dt == DatasetType.imagenet1k:
-            override = _imagenet_dataset_override(DatasetType.imagenet1k, preset, use_dali, dali_device_id)
+            if use_dali:
+                from py_src.ml_setup_dataset import dataset_imagenet1k_from_pytorch_dali
+
+                override = dataset_imagenet1k_from_pytorch_dali(dali_device_id=dali_device_id)
+            else:
+                override = None
             return vit_b_32_imagenet1k(preset, override_dataset=override)
         raise _nie(mt, dt)
 

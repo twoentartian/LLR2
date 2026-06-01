@@ -17,8 +17,14 @@ def _mixup_cutmix_collate(
     *,
     mixup_cutmix,
 ):
-    images, targets = default_collate(batch)
-    return mixup_cutmix(images, targets)
+    if isinstance(batch, tuple) and len(batch) == 2:
+        images, targets = batch
+    else:
+        images, targets = default_collate(batch)
+    images, targets = mixup_cutmix(images, targets)
+    if hasattr(images, "device") and hasattr(targets, "to") and targets.device != images.device:
+        targets = targets.to(images.device, non_blocking=True)
+    return images, targets
 
 
 def _vit_b_32_torchvision_collate_fn():
@@ -46,11 +52,6 @@ def vit_b_32_imagenet1k(preset: int = 1, override_dataset: Optional[DatasetSetup
 
     if preset not in (0, 1):
         raise ValueError(f"vit_b_32 only supports the Torchvision recipe (preset=1), got preset={preset}")
-    if override_dataset is not None and hasattr(override_dataset.train_data, "build_dataloader"):
-        raise ValueError(
-            "vit_b_32 preset=1 expects torchvision-style host-side augmentations "
-            "and is not supported with dataloader-backed dataset overrides such as DALI."
-        )
     ds = override_dataset if override_dataset is not None else dataset_imagenet1k_from_pytorch(
         train_crop_size=224,
         val_resize_size=256,

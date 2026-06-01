@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, Callable, Any, Iterable
 
 import torch
@@ -85,6 +85,8 @@ def build_dataloader(
     # while keeping the public MLSetup.train_dataloader/val_dataloader API the
     # same for callers.
     if hasattr(dataset, "build_dataloader") and callable(dataset.build_dataloader):
+        if cfg.collate_fn is None and default_collate_fn is not None:
+            cfg = replace(cfg, collate_fn=default_collate_fn)
         return dataset.build_dataloader(
             default_batch_size=default_batch_size,
             config=cfg,

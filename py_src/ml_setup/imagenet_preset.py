@@ -8,8 +8,8 @@ from py_src.torch_vision_train import RASampler, get_mixup_cutmix
 def preset_version(preset: int) -> int:
     """Map LLR2 preset index to imagenet preprocessing version.
 
-    preset=0 → preprocessing v1 (basic, DFL_torch default for DLA)
-    preset=1 → preprocessing v2 (advanced, +TrivialAugmentWide+RandAugment)
+    preset=1 → preprocessing v1 (basic)
+    preset!=1 → preprocessing v2 (advanced, +TrivialAugmentWide+RandAugment)
     """
     return 1 if preset == 1 else 2
 
@@ -24,7 +24,14 @@ class collate_fn_inst():
         self.target = target
 
     def __call__(self, batch):
-        return self.target(*default_collate(batch))
+        if isinstance(batch, tuple) and len(batch) == 2:
+            images, targets = batch
+        else:
+            images, targets = default_collate(batch)
+        images, targets = self.target(images, targets)
+        if hasattr(images, "device") and hasattr(targets, "to") and targets.device != images.device:
+            targets = targets.to(images.device, non_blocking=True)
+        return images, targets
 
 
 def imagenet_collate_fn(preset: int, mixup_alpha=0.2, cutmix_alpha=1.0, num_classes=1000) -> Optional[Callable]:

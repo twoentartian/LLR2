@@ -406,11 +406,11 @@ def training_model(
 
     num_workers = min(thread_per_process, 16)
 
-    dataloader = arg_ml_setup.train_dataloader(DataloaderConfig(num_workers=num_workers))
+    dataloader = arg_ml_setup.train_dataloader(DataloaderConfig(num_workers=num_workers, prefetch_factor=4))
     steps_per_epoch = len(dataloader) # type: ignore
 
     if enable_validation and arg_ml_setup.application_type==ApplicationType.classifier:
-        dataloader_test = arg_ml_setup.val_dataloader(DataloaderConfig(num_workers=num_workers))
+        dataloader_test = arg_ml_setup.val_dataloader(DataloaderConfig(num_workers=num_workers, prefetch_factor=4))
     else:
         dataloader_test = None
 

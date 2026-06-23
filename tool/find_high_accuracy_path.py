@@ -47,6 +47,7 @@ from py_src.ml_setup.dataloader_util import DataloaderConfig
 from py_src.ml_setup.factory import get_ml_setup_from_config
 from py_src.ml_setup_dataset.dataset_modular import ArithmeticDataset
 from py_src.ml_setup_dataset.dataset_types import DatasetSetup, DatasetType
+from py_src.ml_setup_model import ModelType
 from py_src.model_average import move_model_state_toward
 from py_src.model_opti_save_load import (
     load_model_state_file,
@@ -299,11 +300,19 @@ def _apply_ml_setup_compatibility(ml_setup) -> None:
 
 
 def _ensure_transformer_for_grokking(model_type, dataset_path: str) -> None:
-    if model_type is None or model_type.name != "transformer_for_grokking":
+    if model_type != ModelType.transformer_for_grokking:
         actual = model_type.name if model_type is not None else None
         raise ValueError(
-            "--grokking_dataset_path can only be used with transformer_for_grokking models; "
+            f"--grokking_dataset_path can only be used with {ModelType.transformer_for_grokking.name} models; "
             f"got {actual!r} for dataset path {dataset_path!r}"
+        )
+
+
+def _require_grokking_dataset_path_for_model(model_type, dataset_path: Optional[str]) -> None:
+    if model_type == ModelType.transformer_for_grokking and dataset_path is None:
+        raise ValueError(
+            f"{ModelType.transformer_for_grokking.name} models require --grokking_dataset_path "
+            "so path finding uses the saved grokking train/validation split"
         )
 
 
@@ -1058,6 +1067,7 @@ class FindHighAccuracyPathRunner:
 
             child_logger.info("Loading start model from %s", start_point)
             grokking_dataset_path = getattr(runtime_parameter, "grokking_dataset_path", None)
+            _require_grokking_dataset_path_for_model(start_model_type, grokking_dataset_path)
             if grokking_dataset_path is not None:
                 _ensure_transformer_for_grokking(start_model_type, grokking_dataset_path)
                 self.current_ml_setup = _get_grokking_ml_setup_from_dataset_path(
@@ -1180,6 +1190,7 @@ class FindHighAccuracyPathRunner:
                 runtime_parameter.save_ticks = _parse_save_ticks(runtime_parameter.save_ticks)
 
             grokking_dataset_path = getattr(runtime_parameter, "grokking_dataset_path", None)
+            _require_grokking_dataset_path_for_model(runtime_parameter.model_type, grokking_dataset_path)
             if grokking_dataset_path is not None:
                 _ensure_transformer_for_grokking(runtime_parameter.model_type, grokking_dataset_path)
                 self.current_ml_setup = _get_grokking_ml_setup_from_dataset_path(

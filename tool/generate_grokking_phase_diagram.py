@@ -198,6 +198,7 @@ def main():
             args.modulus,
             args.split_type,
             args.operand_length,
+            seed=args.random_seed,
         )
 
     total_cells = len(learning_rates) * len(weight_decays)

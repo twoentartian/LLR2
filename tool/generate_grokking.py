@@ -150,7 +150,7 @@ def loading_dataset_from(path: str, modulus: Optional[int] = None):
     return train_dataset, val_dataset
 
 
-def generate_dataset(output_folder_path, train_pct, expression, modulus, train_split_type, operand_length):
+def generate_dataset(output_folder_path, train_pct, expression, modulus, train_split_type, operand_length, seed=None):
     normalized_expression = normalize_expression(expression, modulus)
     train_dataset, val_dataset = ArithmeticDataset.splits(
         train_pct=train_pct,
@@ -158,6 +158,7 @@ def generate_dataset(output_folder_path, train_pct, expression, modulus, train_s
         train_split_type=train_split_type,
         modulus=modulus,
         operand_length=operand_length,
+        seed=seed,
     )
     name = train_dataset.name
     train_dataset.save_to_file(os.path.join(output_folder_path, name, "train.txt"))
@@ -588,7 +589,7 @@ def main():
     else:
         if args.dataset_exp is None:
             raise ValueError("--dataset_exp is required when --dataset_path is not provided")
-        train_ds, val_ds = generate_dataset(output_folder_path, args.train_pct, args.dataset_exp, args.modulus, args.split_type, args.operand_length)
+        train_ds, val_ds = generate_dataset(output_folder_path, args.train_pct, args.dataset_exp, args.modulus, args.split_type, args.operand_length, seed=args.random_seed)
 
     if args.inverse_train_val:
         logger.info("inverse training/validation mode enabled; forcing number_of_models to 2")

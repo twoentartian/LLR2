@@ -171,6 +171,7 @@ class ArithmeticDataset:
         modulus = 97,
         operand_length: Optional[int] = None,
         train_split_type: Literal["random", "chessboard", "updown", "leftright", "tl_to_br", "tr_to_bl", "interlace_row", "interlace_col", "chessboard_random"] = "random",
+        seed: Optional[int] = None,
     ):
         """
         Creates training and validation datasets
@@ -178,13 +179,14 @@ class ArithmeticDataset:
         :param train_pct: percentage of total equations used for training data
         :param operator: The arithmetic operator for this dataset e.g. '+', '-', '*', '/', 'sort'
         :param operand_length: for list based datasets the length of the lists
+        :param seed: random seed for randomized dataset generation; if None, use fresh entropy
         :returns: (train_dataset, validation_dataset)
         """
 
         assert (0 < train_pct) and (train_pct <= 100)
 
         ds_name = cls.get_dsname(modulus, operator, operand_length, train_pct, train_split_type)
-        eqs_train, eqs_val = cls.make_data(operator, modulus, operand_length, train_split_type=train_split_type, train_pct=train_pct)
+        eqs_train, eqs_val = cls.make_data(operator, modulus, operand_length, seed=seed, train_split_type=train_split_type, train_pct=train_pct)
 
         train_ds = cls(ds_name, eqs_train, modulus, train=True)
         val_ds = cls(ds_name, eqs_val, modulus, train=False)
@@ -437,7 +439,7 @@ class ArithmeticDataset:
             assert train_pct is not None, ("train_pct must be provided for spatial train_split_type")
             assert data_table is not None, ("Spatial splits are only supported for binary-operation datasets")
             assert noise_level == 0, ("noise level has to be 0 for non-random splits")
-            train_mask, val_mask = cls._get_spatial_train_val_masks(operator, modulus, train_pct, train_split_type)
+            train_mask, val_mask = cls._get_spatial_train_val_masks(operator, modulus, train_pct, train_split_type, rng=rng)
 
             elems_a = list(range(modulus))
             elems_b = list(range(modulus))
@@ -491,7 +493,7 @@ class ArithmeticDataset:
 
 
     @classmethod
-    def _get_spatial_train_val_masks(cls, operator, modulus, train_pct, train_split_type):
+    def _get_spatial_train_val_masks(cls, operator, modulus, train_pct, train_split_type, rng: Optional[np.random.Generator] = None):
         """
         Build boolean train/val masks over the n×n grid of (a, b) operand pairs.
 
@@ -561,7 +563,8 @@ class ArithmeticDataset:
         elif train_split_type == "chessboard_random":
             M = ((i + j) % 2 == 0).astype(np.int8)
 
-            rng = np.random.default_rng(int(frac * 1e9))  # reproducible
+            if rng is None:
+                rng = np.random.default_rng()
             num_swaps = n * n * 50  # enough passes for thorough mixing
             max_attempts = num_swaps * 20
 

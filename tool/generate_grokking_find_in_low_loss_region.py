@@ -122,7 +122,7 @@ def _empty_dataset_like(dataset: ArithmeticDataset, *, name_suffix: str) -> Arit
     )
 
 
-def build_dataset_without_saving(train_pct: float, expression: str, modulus: int, split_type: str, operand_length: int | None):
+def build_dataset_without_saving(train_pct: float, expression: str, modulus: int, split_type: str, operand_length: int | None, seed: int | None = None):
     normalized_expression = normalize_expression(expression, modulus)
     return ArithmeticDataset.splits(
         train_pct=train_pct,
@@ -130,6 +130,7 @@ def build_dataset_without_saving(train_pct: float, expression: str, modulus: int
         train_split_type=split_type,  # type: ignore[arg-type]
         modulus=modulus,
         operand_length=operand_length,
+        seed=seed,
     )
 
 
@@ -738,6 +739,7 @@ def main():
             args.modulus,
             args.split_type,
             args.operand_length,
+            seed=args.random_seed,
         )
 
     effective_shift = args.label_shift % train_dataset.modulus

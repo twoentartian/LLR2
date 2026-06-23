@@ -74,6 +74,7 @@ class GrokkingParameters:
         self.save_interval = None
         self.save_name = None
         self.record_weight_norm_interval = None
+        self.distance_to_origin_interval = None
         self.early_stop_train_accuracy = 1.00
         self.early_stop_val_accuracy = 1.00
         self.disable_validation = False
@@ -107,11 +108,21 @@ class GrokkingParameters:
     def set_disable_validation(self, enabled=True):
         self.disable_validation = enabled
 
-    def set_model_save(self, save_name, save_format="none", save_interval=500, record_weight_norm_interval=100):
+    def set_model_save(
+        self,
+        save_name,
+        save_format="none",
+        save_interval=500,
+        record_weight_norm_interval=None,
+        distance_to_origin_interval=None,
+    ):
         self.save_name = save_name
         self.save_format = save_format
         self.save_interval = save_interval
-        self.record_weight_norm_interval = record_weight_norm_interval
+        if distance_to_origin_interval is None:
+            distance_to_origin_interval = record_weight_norm_interval
+        self.distance_to_origin_interval = distance_to_origin_interval
+        self.record_weight_norm_interval = distance_to_origin_interval
 
     def set_ineffective_train_stop(self, enabled=True, window=1000):
         self.ineffective_train_stop = enabled
@@ -273,7 +284,8 @@ def train_grokking(parameters: GrokkingParameters):
     assert parameters.save_name is not None
     assert parameters.save_format is not None
     assert parameters.save_interval is not None
-    assert parameters.record_weight_norm_interval is not None
+    if parameters.distance_to_origin_interval is not None and parameters.distance_to_origin_interval <= 0:
+        raise ValueError("distance_to_origin_interval must be positive when set")
 
     model = parameters.model
 
@@ -349,8 +361,17 @@ def train_grokking(parameters: GrokkingParameters):
             lmdb_db_name=parameters.save_name,
         )
 
-    distance_to_origin_service = record_weights_difference.ServiceDistanceToOriginRecorder(1, [0])
-    distance_to_origin_service.initialize_without_runtime_parameters({0: model.state_dict()}, parameters.output_folder_path, logger=parameters.logger)
+    distance_to_origin_service = None
+    if parameters.distance_to_origin_interval is not None:
+        distance_to_origin_service = record_weights_difference.ServiceDistanceToOriginRecorder(1, [0])
+        distance_to_origin_service.initialize_without_runtime_parameters({0: model.state_dict()}, parameters.output_folder_path, logger=parameters.logger)
+        if parameters.logger is not None:
+            parameters.logger.info(
+                "distance_to_origin_service interval = %d epoch(s)",
+                parameters.distance_to_origin_interval,
+            )
+    elif parameters.logger is not None:
+        parameters.logger.info("distance_to_origin_service disabled")
 
     log_csv_path = os.path.join(parameters.output_folder_path, f"{parameters.save_name}.log.csv")
     log_csv_file = open(log_csv_path, "w", encoding="utf-8")
@@ -477,7 +498,7 @@ def train_grokking(parameters: GrokkingParameters):
         if record_model_service is not None and epoch % parameters.save_interval == 0:
             model_stat = model.state_dict()
             record_model_service.trigger_without_runtime_parameters(epoch, [0], [model_stat])
-        if epoch % parameters.record_weight_norm_interval == 0:
+        if distance_to_origin_service is not None and epoch % parameters.distance_to_origin_interval == 0:
             model_stat = model.state_dict() if model_stat is None else model_stat
             distance_to_origin_service.trigger_without_runtime_parameters(epoch, {0: model_stat})
 
@@ -529,7 +550,7 @@ def parse_args():
     parser.add_argument("-bs", "--batchsize", type=int, default=None)
     parser.add_argument("--save_format", type=str, default="none", choices=["none", "file", "lmdb"])
     parser.add_argument("--save_interval", type=int, default=1)
-    parser.add_argument("--record_weight_norm", type=int, default=None)
+    parser.add_argument("--distance_to_origin_interval", dest="distance_to_origin_interval",type=int,default=None,help="record distance-to-origin every N epochs; omitted/None disables the service")
     parser.add_argument("-s", "--random_seed", type=int, default=None)
     parser.add_argument("-i", "--start_index", type=int, default=0)
     parser.add_argument("-t", "--transfer_learn", type=str, default=None)
@@ -551,6 +572,8 @@ def main():
         raise ValueError("generate_grokking.py only supports --model_type transformer_for_grokking")
     if args.disable_validation and args.inverse_train_val:
         raise ValueError("--disable_validation cannot be combined with --inverse_train_val")
+    if args.distance_to_origin_interval is not None and args.distance_to_origin_interval <= 0:
+        raise ValueError("--distance_to_origin_interval must be positive when set")
 
     torch.set_num_threads(max(1, min(args.core, 8)))
     setup_logging(logger, "main")
@@ -625,7 +648,6 @@ def main():
 
         os.makedirs(output_folder_path_current, exist_ok=True)
         total_epoch = 150000 if args.epoch is None else args.epoch
-        record_weight_norm_interval = max(1, total_epoch // 2000) if args.record_weight_norm is None else args.record_weight_norm
 
         params = GrokkingParameters()
         params.set_env(output_folder_path_current, False, logger=logger)
@@ -640,7 +662,12 @@ def main():
         params.set_dataloader(train_dl, val_dl)
         if args.disable_validation:
             params.set_disable_validation()
-        params.set_model_save(save_name, save_format=args.save_format, save_interval=args.save_interval, record_weight_norm_interval=record_weight_norm_interval)
+        params.set_model_save(
+            save_name,
+            save_format=args.save_format,
+            save_interval=args.save_interval,
+            distance_to_origin_interval=args.distance_to_origin_interval,
+        )
         params.set_ineffective_train_stop()
         params.set_high_loss_train_stop()
         train_grokking(params)

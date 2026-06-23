@@ -16,6 +16,8 @@ from py_src.ml_setup_model import ModelType
 from py_src.ml_setup_model.transformer_for_grokking import TransformerForGrokking
 from py_src.types import StepOutput
 
+DEFAULT_GROKKING_VOCAB_LEN = 2000
+
 
 class GrokkingArithmeticDataset(Dataset[dict[str, torch.Tensor]]):
     """Map-style wrapper for arithmetic sequences used by the grokking model."""
@@ -201,6 +203,35 @@ def _evaluation_step(batch_index, batch, model, extra_ctx) -> StepOutput:
     )
 
 
+def build_grokking_model(
+    dataset,
+    *,
+    n_layers=None,
+    n_heads=None,
+    d_model=None,
+    context_len=None,
+    vocab_len=None,
+    position_encoding=None,
+):
+    if hasattr(dataset, "sequence_length"):
+        min_context_len = int(dataset.sequence_length)
+    else:
+        min_context_len = int(dataset.data.shape[1] - 1)
+    actual_context_len = max(50, min_context_len) if context_len is None else max(context_len, min_context_len)
+    actual_vocab_len = max(
+        DEFAULT_GROKKING_VOCAB_LEN if vocab_len is None else vocab_len,
+        len(dataset.tokenizer),
+    )
+    return TransformerForGrokking(
+        n_layers=2 if n_layers is None else n_layers,
+        n_heads=4 if n_heads is None else n_heads,
+        d_model=128 if d_model is None else d_model,
+        max_context_len=actual_context_len,
+        vocab_len=actual_vocab_len,
+        trainable_position_encoding=position_encoding == "trainable",
+    )
+
+
 def _make_grokking_setup(
     *,
     dataset_type: DatasetType,
@@ -233,13 +264,7 @@ def _make_grokking_setup(
     train_dataset = _wrap_grokking_dataset(dataset_setup.train_data)
     val_dataset = _wrap_grokking_dataset(dataset_setup.valdation_data)
 
-    model = TransformerForGrokking(
-        n_layers=2,
-        n_heads=4,
-        d_model=128,
-        max_context_len=train_dataset.sequence_length,
-        vocab_len=len(train_dataset.tokenizer),
-    )
+    model = build_grokking_model(train_dataset)
     adapter = CustomStepAdapter(
         model,
         _train_step,
@@ -379,6 +404,7 @@ def arithmetic_unknown_exp_grokking(
 
 __all__ = [
     "GrokkingArithmeticDataset",
+    "build_grokking_model",
     "arithmetic_addition_grokking",
     "arithmetic_cubepoly_grokking",
     "arithmetic_cube2_grokking",

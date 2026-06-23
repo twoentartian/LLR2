@@ -22,7 +22,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from py_src.model_opti_save_load import load_model_state_file, save_model_state
 from py_src.ml_setup_dataset.dataset_modular import ArithmeticDataset, ArithmeticIterator
 from py_src.ml_setup.dataloader_util import cache_dataloader_on_device
-from py_src.ml_setup_model.transformer_for_grokking import TransformerForGrokking
+from py_src.ml_setup.grokking import build_grokking_model
 from py_src.service import record_model_stat
 import py_src.service.record_weights_difference as record_weights_difference
 from py_src.util import re_initialize_model, set_seed, setup_logging
@@ -169,19 +169,6 @@ def generate_dataset(output_folder_path, train_pct, expression, modulus, train_s
 
 def default_batch_size(dataset):
     return ArithmeticIterator.calculate_batchsize(len(dataset), batchsize_hint=-1)
-
-
-def build_grokking_model(dataset, *, n_layers=None, n_heads=None, d_model=None, context_len=None, position_encoding=None):
-    min_context_len = int(dataset.data.shape[1] - 1)
-    actual_context_len = max(50, min_context_len) if context_len is None else max(context_len, min_context_len)
-    return TransformerForGrokking(
-        n_layers=2 if n_layers is None else n_layers,
-        n_heads=4 if n_heads is None else n_heads,
-        d_model=128 if d_model is None else d_model,
-        max_context_len=actual_context_len,
-        vocab_len=len(dataset.tokenizer),
-        trainable_position_encoding=position_encoding == "trainable",
-    )
 
 
 def _check_ineffective_train_stop(train_loss_history: deque, current_epoch: int, *, window=1000, min_epoch=1000, loss_threshold=1.5, cv_threshold=0.02) -> bool:

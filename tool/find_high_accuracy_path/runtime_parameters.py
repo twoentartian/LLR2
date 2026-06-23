@@ -38,6 +38,7 @@ class RuntimeParameters:
     config_file_path: str = None # type: ignore
     dataset_type: Optional[DatasetType] = None # type: ignore
     model_type: Optional[ModelType] = None # type: ignore
+    grokking_dataset_path: Optional[str] = None
     pytorch_preset_version: int = None # type: ignore
     store_top_accuracy_model_count: int = None # type: ignore
     checkpoint_interval: int = None # type: ignore

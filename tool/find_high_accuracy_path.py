@@ -16,6 +16,7 @@ import importlib.util
 import logging
 import math
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -41,8 +42,11 @@ from tool.find_high_accuracy_path.find_parameters import (
 from tool.find_high_accuracy_path.functions import _optimizer_to, _try_get_criterion, rebuild_norm_layer_function
 
 from py_src.engine import Device, train as engine_train
+from py_src.ml_setup.grokking import arithmetic_unknown_exp_grokking
 from py_src.ml_setup.dataloader_util import DataloaderConfig
 from py_src.ml_setup.factory import get_ml_setup_from_config
+from py_src.ml_setup_dataset.dataset_modular import ArithmeticDataset
+from py_src.ml_setup_dataset.dataset_types import DatasetSetup, DatasetType
 from py_src.model_average import move_model_state_toward
 from py_src.model_opti_save_load import (
     load_model_state_file,
@@ -292,6 +296,61 @@ def _apply_ml_setup_compatibility(ml_setup) -> None:
         ml_setup.override_testing_dataset_loader = ml_setup.override_test_loader
     if getattr(ml_setup, "criterion", None) is None:
         ml_setup.criterion = _try_get_criterion(ml_setup)
+
+
+def _ensure_transformer_for_grokking(model_type, dataset_path: str) -> None:
+    if model_type is None or model_type.name != "transformer_for_grokking":
+        actual = model_type.name if model_type is not None else None
+        raise ValueError(
+            "--grokking_dataset_path can only be used with transformer_for_grokking models; "
+            f"got {actual!r} for dataset path {dataset_path!r}"
+        )
+
+
+def _infer_grokking_dataset_modulus(dataset_path: str) -> int:
+    match = re.search(r"modulus(\d+)", os.path.basename(os.path.normpath(dataset_path)))
+    if match is None:
+        raise ValueError(
+            "Could not infer modulus from grokking dataset path; "
+            "use a folder name containing 'modulus<N>'"
+        )
+    return int(match.group(1))
+
+
+def _load_grokking_dataset_setup_from_folder(dataset_path: str, dataset_type: DatasetType) -> DatasetSetup:
+    dataset_path = os.path.abspath(dataset_path)
+    if not os.path.isdir(dataset_path):
+        raise FileNotFoundError(f"Grokking dataset folder does not exist: {dataset_path}")
+
+    train_path = os.path.join(dataset_path, "train.txt")
+    val_path = os.path.join(dataset_path, "val.txt")
+    tokenizer_path = os.path.join(dataset_path, "tokenizer.txt")
+    for required_path in (train_path, val_path, tokenizer_path):
+        if not os.path.isfile(required_path):
+            raise FileNotFoundError(f"Required grokking dataset file is missing: {required_path}")
+
+    modulus = _infer_grokking_dataset_modulus(dataset_path)
+    train_dataset = ArithmeticDataset.load_from_file(
+        train_path,
+        modulus,
+        name=dataset_path,
+        train=True,
+        tokenizer_path=tokenizer_path,
+    )
+    val_dataset = ArithmeticDataset.load_from_file(
+        val_path,
+        modulus,
+        name=dataset_path,
+        train=False,
+        tokenizer_path=tokenizer_path,
+    )
+    return DatasetSetup(dataset_type, train_dataset, val_dataset)
+
+
+def _get_grokking_ml_setup_from_dataset_path(dataset_path: str, dataset_type: Optional[DatasetType]) -> MLSetup:
+    override_dataset_type = dataset_type or DatasetType.arithmetic_exp_unknown
+    dataset_setup = _load_grokking_dataset_setup_from_folder(dataset_path, override_dataset_type)
+    return arithmetic_unknown_exp_grokking(override_dataset=dataset_setup)
 
 
 def get_files_to_process(start_folder: str, end_folder: str, mode: str) -> list[tuple[str, str]]:
@@ -996,12 +1055,24 @@ class FindHighAccuracyPathRunner:
             start_model_state, start_model_name, dataset_name_in_file = load_model_state_file(start_point)
             start_model_type = RuntimeParameters.coerce_model_type(start_model_name)
             assert(start_model_type is not None)
-            dataset_type_in_file = RuntimeParameters.coerce_dataset_type(dataset_name_in_file)
-            if dataset_type_in_file is None:
-                dataset_type_in_file = runtime_parameter.dataset_type
 
             child_logger.info("Loading start model from %s", start_point)
-            if runtime_parameter.dataset_type is not None:
+            grokking_dataset_path = getattr(runtime_parameter, "grokking_dataset_path", None)
+            if grokking_dataset_path is not None:
+                _ensure_transformer_for_grokking(start_model_type, grokking_dataset_path)
+                self.current_ml_setup = _get_grokking_ml_setup_from_dataset_path(
+                    grokking_dataset_path,
+                    runtime_parameter.dataset_type,
+                )
+                child_logger.info(
+                    "Using grokking dataset override from %s; ignoring model file dataset metadata %r",
+                    os.path.abspath(grokking_dataset_path),
+                    dataset_name_in_file,
+                )
+            elif runtime_parameter.dataset_type is not None:
+                dataset_type_in_file = RuntimeParameters.coerce_dataset_type(dataset_name_in_file)
+                if dataset_type_in_file is None:
+                    dataset_type_in_file = runtime_parameter.dataset_type
                 assert dataset_type_in_file == runtime_parameter.dataset_type
                 self.current_ml_setup = get_ml_setup_from_config(
                     start_model_type.name,
@@ -1011,6 +1082,7 @@ class FindHighAccuracyPathRunner:
                     dali_device_id=runtime_parameter.dali_device_id,
                 )
             else:
+                dataset_type_in_file = RuntimeParameters.coerce_dataset_type(dataset_name_in_file)
                 dataset_type_name = dataset_type_in_file.name if dataset_type_in_file is not None else "default"
                 self.current_ml_setup = get_ml_setup_from_config(
                     start_model_type.name,
@@ -1107,11 +1179,23 @@ class FindHighAccuracyPathRunner:
             if isinstance(runtime_parameter.save_ticks, str):
                 runtime_parameter.save_ticks = _parse_save_ticks(runtime_parameter.save_ticks)
 
-            self.current_ml_setup = get_ml_setup_from_config(
-                _require_model_type_name(runtime_parameter.model_type),
-                dataset_type=_require_dataset_type_name(runtime_parameter.dataset_type),
-                preset=runtime_parameter.pytorch_preset_version or 1,
-            )
+            grokking_dataset_path = getattr(runtime_parameter, "grokking_dataset_path", None)
+            if grokking_dataset_path is not None:
+                _ensure_transformer_for_grokking(runtime_parameter.model_type, grokking_dataset_path)
+                self.current_ml_setup = _get_grokking_ml_setup_from_dataset_path(
+                    grokking_dataset_path,
+                    runtime_parameter.dataset_type,
+                )
+                child_logger.info(
+                    "Using grokking dataset override from %s while resuming checkpoint",
+                    os.path.abspath(grokking_dataset_path),
+                )
+            else:
+                self.current_ml_setup = get_ml_setup_from_config(
+                    _require_model_type_name(runtime_parameter.model_type),
+                    dataset_type=_require_dataset_type_name(runtime_parameter.dataset_type),
+                    preset=runtime_parameter.pytorch_preset_version or 1,
+                )
             assert self.current_ml_setup is not None
             current_ml_setup = self.current_ml_setup
             _apply_ml_setup_compatibility(current_ml_setup)
@@ -2179,6 +2263,7 @@ def _build_runtime_parameters_from_args(args) -> RuntimeParameters:
     runtime_parameter.save_format = args.save_format
     runtime_parameter.config_file_path = args.config
     runtime_parameter.dataset_type = RuntimeParameters.coerce_dataset_type(args.dataset)
+    runtime_parameter.grokking_dataset_path = args.grokking_dataset_path
     runtime_parameter.debug_check_config_mode = args.check_config
     runtime_parameter.verbose = args.verbose
     runtime_parameter.service_test_accuracy_loss_interval = args.test_interval
@@ -2259,28 +2344,18 @@ def _create_output_folder(args, runtime_parameter: RuntimeParameters) -> str:
 
 
 def main(argv: Optional[list[str]] = None) -> None:
-    parser = argparse.ArgumentParser(
-        description="Move model weights toward a destination while maintaining accuracy",
-    )
+    parser = argparse.ArgumentParser(description="Move model weights toward a destination while maintaining accuracy",)
     parser.add_argument("start_folder", nargs="?", help="Folder with starting model(s)")
-    parser.add_argument(
-        "end_folder",
-        nargs="?",
-        help="Folder with destination model(s), or 'origin'/'inf'/'mean'/'to_vs'",
-    )
+    parser.add_argument("end_folder",nargs="?",help="Folder with destination model(s), or 'origin'/'inf'/'mean'/'to_vs'",)
 
     parser.add_argument("--variance_sphere", help="Variance-sphere model path for 'to_vs'")
     parser.add_argument("--config", default="find_high_accuracy_path_config.py", help="Config file")
-    parser.add_argument(
-        "--mapping_mode",
-        default="auto",
-        choices=["auto", "all_to_all", "each_to_each", "one_to_all", "all_to_one"],
-    )
+    parser.add_argument("--mapping_mode",default="auto",choices=["auto", "all_to_all", "each_to_each", "one_to_all", "all_to_one"],)
 
     parser.add_argument("-c", "--core", type=int, default=os.cpu_count(), help="CPU cores to use")
     parser.add_argument("-w", "--worker", type=int, default=1, help="Parallel workers")
     parser.add_argument("-d", "--dataset", default=None, help="Dataset override")
-
+    parser.add_argument("--grokking_dataset_path",dest="grokking_dataset_path",default=None,help=("For transformer_for_grokking, load train.txt/val.txt/tokenizer.txt from this folder and ignore dataset metadata stored in .model.pt files"))
     parser.add_argument("--save_ticks", help="Ticks to save models, e.g. '1,2,3,5-10'")
     parser.add_argument("--save_interval", type=int, default=1, help="Model save interval")
     parser.add_argument("--save_format", default="none", choices=["none", "file", "lmdb"])

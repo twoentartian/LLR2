@@ -3,7 +3,7 @@ import math
 import time
 import unittest
 from datetime import datetime
-from typing import List, Dict, Union, Optional, Literal
+from typing import List, Dict, Union, Optional, Literal, get_args
 
 from concurrent.futures import ProcessPoolExecutor
 
@@ -40,6 +40,20 @@ VALID_OPERATORS = {
     "copy": "copy",
     "unknown": "unknown",
 }
+TrainSplitType = Literal[
+    "random",
+    "chessboard",
+    "updown",
+    "leftright",
+    "tl_to_br",
+    "tr_to_bl",
+    "interlace_row",
+    "interlace_col",
+    "chessboard_random",
+    "chessboard_random_inv",
+]
+TRAIN_SPLIT_TYPES: tuple[TrainSplitType, ...] = get_args(TrainSplitType)
+
 EOS_TOKEN = "<|eos|>"
 EQ_TOKEN = "="
 # MODULUS = 97
@@ -170,7 +184,7 @@ class ArithmeticDataset:
         operator: str,
         modulus = 97,
         operand_length: Optional[int] = None,
-        train_split_type: Literal["random", "chessboard", "updown", "leftright", "tl_to_br", "tr_to_bl", "interlace_row", "interlace_col", "chessboard_random"] = "random",
+        train_split_type: TrainSplitType = "random",
         seed: Optional[int] = None,
     ):
         """
@@ -560,7 +574,7 @@ class ArithmeticDataset:
         elif train_split_type == "interlace_col":
             train_mask = j % 2 == 0  # even cols → train, odd cols → val
 
-        elif train_split_type == "chessboard_random":
+        elif train_split_type in ("chessboard_random", "chessboard_random_inv"):
             M = ((i + j) % 2 == 0).astype(np.int8)
 
             if rng is None:
@@ -590,6 +604,13 @@ class ArithmeticDataset:
                     swaps_done += 1
 
             train_mask = M.astype(bool)
+
+            if train_split_type == "chessboard_random_inv":
+                # Invert the upper-right quadrant: top 50% of rows and
+                # right 50% of columns. For odd-sized grids, the extra row
+                # and column stay in the lower/right halves respectively.
+                midpoint = n // 2
+                train_mask[:midpoint, midpoint:] = ~train_mask[:midpoint, midpoint:]
 
         else:
             raise ValueError(f"Unknown train_split_type: {train_split_type}")

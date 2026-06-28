@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import math
-from typing import Optional, Literal
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -11,7 +11,7 @@ from torch.utils.data import Dataset
 
 from py_src.adapters import CustomStepAdapter
 from py_src.ml_setup.ml_setup import ApplicationType, MLSetup
-from py_src.ml_setup_dataset import ArithmeticDataset, DatasetSetup, DatasetType
+from py_src.ml_setup_dataset import ArithmeticDataset, DatasetSetup, DatasetType, TrainSplitType
 from py_src.ml_setup_model import ModelType
 from py_src.ml_setup_model.transformer_for_grokking import TransformerForGrokking
 from py_src.types import StepOutput
@@ -63,17 +63,7 @@ def _build_arithmetic_dataset(
     train_percentage: float,
     modulus: int,
     operand_length: Optional[int],
-    train_split_type: Literal[
-        "random",
-        "chessboard",
-        "updown",
-        "leftright",
-        "tl_to_br",
-        "tr_to_bl",
-        "interlace_row",
-        "interlace_col",
-        "chessboard_random",
-    ],
+    train_split_type: TrainSplitType,
 ) -> DatasetSetup:
     train_data, val_data = ArithmeticDataset.splits(
         train_pct=train_percentage,
@@ -97,17 +87,7 @@ def _resolve_dataset_setup(
     train_percentage: float,
     modulus: int,
     operand_length: Optional[int],
-    train_split_type: Literal[
-        "random",
-        "chessboard",
-        "updown",
-        "leftright",
-        "tl_to_br",
-        "tr_to_bl",
-        "interlace_row",
-        "interlace_col",
-        "chessboard_random",
-    ],
+    train_split_type: TrainSplitType,
 ) -> DatasetSetup:
     if override_dataset is None:
         return _build_arithmetic_dataset(
@@ -240,17 +220,7 @@ def _make_grokking_setup(
     train_percentage: float,
     operand_length: Optional[int],
     modulus: int,
-    train_split_type: Literal[
-        "random",
-        "chessboard",
-        "updown",
-        "leftright",
-        "tl_to_br",
-        "tr_to_bl",
-        "interlace_row",
-        "interlace_col",
-        "chessboard_random",
-    ] = "random",
+    train_split_type: TrainSplitType = "random",
 ) -> MLSetup:
     dataset_setup = _resolve_dataset_setup(
         dataset_type=dataset_type,
@@ -292,17 +262,7 @@ def arithmetic_addition_grokking(
     train_percentage: float = 50,
     operand_length: Optional[int] = None,
     modulus: int = 97,
-    train_split_type: Literal[
-        "random",
-        "chessboard",
-        "updown",
-        "leftright",
-        "tl_to_br",
-        "tr_to_bl",
-        "interlace_row",
-        "interlace_col",
-        "chessboard_random",
-    ] = "random",
+    train_split_type: TrainSplitType = "random",
 ) -> MLSetup:
     return _make_grokking_setup(
         dataset_type=DatasetType.arithmetic_addition,
@@ -321,17 +281,7 @@ def arithmetic_cubepoly_grokking(
     train_percentage: float = 50,
     operand_length: Optional[int] = None,
     modulus: int = 97,
-    train_split_type: Literal[
-        "random",
-        "chessboard",
-        "updown",
-        "leftright",
-        "tl_to_br",
-        "tr_to_bl",
-        "interlace_row",
-        "interlace_col",
-        "chessboard_random",
-    ] = "random",
+    train_split_type: TrainSplitType = "random",
 ) -> MLSetup:
     return _make_grokking_setup(
         dataset_type=DatasetType.arithmetic_cubepoly,
@@ -350,17 +300,7 @@ def arithmetic_cube2_grokking(
     train_percentage: float = 50,
     operand_length: Optional[int] = None,
     modulus: int = 97,
-    train_split_type: Literal[
-        "random",
-        "chessboard",
-        "updown",
-        "leftright",
-        "tl_to_br",
-        "tr_to_bl",
-        "interlace_row",
-        "interlace_col",
-        "chessboard_random",
-    ] = "random",
+    train_split_type: TrainSplitType = "random",
 ) -> MLSetup:
     return _make_grokking_setup(
         dataset_type=DatasetType.arithmetic_cube2,
@@ -379,17 +319,7 @@ def arithmetic_unknown_exp_grokking(
     train_percentage: float = 50,
     operand_length: Optional[int] = None,
     modulus: int = 97,
-    train_split_type: Literal[
-        "random",
-        "chessboard",
-        "updown",
-        "leftright",
-        "tl_to_br",
-        "tr_to_bl",
-        "interlace_row",
-        "interlace_col",
-        "chessboard_random",
-    ] = "random",
+    train_split_type: TrainSplitType = "random",
 ) -> MLSetup:
     return _make_grokking_setup(
         dataset_type=DatasetType.arithmetic_exp_unknown,

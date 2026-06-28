@@ -1,5 +1,11 @@
 from .dataset_types import DatasetSetup, DatasetType
-from .dataset_modular import ArithmeticDataset, ArithmeticIterator, ArithmeticTokenizer
+from .dataset_modular import (
+    ArithmeticDataset,
+    ArithmeticIterator,
+    ArithmeticTokenizer,
+    TRAIN_SPLIT_TYPES,
+    TrainSplitType,
+)
 from .dataset_masked import MaskedImageDataset
 
 from .dataset_cifar import dataset_cifar10, dataset_cifar100
@@ -20,6 +26,7 @@ from .dataset_imagenet import (
 __all__ = [
     "DatasetSetup", "DatasetType",
     "ArithmeticDataset", "ArithmeticIterator", "ArithmeticTokenizer",
+    "TRAIN_SPLIT_TYPES", "TrainSplitType",
     "MaskedImageDataset",
     "dataset_cifar10", "dataset_cifar100",
     "dataset_flowers102",

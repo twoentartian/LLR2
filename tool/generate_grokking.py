@@ -21,7 +21,11 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from py_src.model_opti_save_load import load_model_state_file, save_model_state
 from py_src.ml_setup_dataset import DatasetType
-from py_src.ml_setup_dataset.dataset_modular import ArithmeticDataset, ArithmeticIterator
+from py_src.ml_setup_dataset.dataset_modular import (
+    ArithmeticDataset,
+    ArithmeticIterator,
+    TRAIN_SPLIT_TYPES,
+)
 from py_src.ml_setup.dataloader_util import cache_dataloader_on_device
 from py_src.ml_setup.grokking import build_grokking_model
 from py_src.service import record_model_stat
@@ -32,17 +36,7 @@ from py_src.util import re_initialize_model, set_seed, setup_logging
 logger = logging.getLogger("generate_grokking")
 SPEED_REPORT_INTERVAL = 100
 SAVED_MODEL_DATASET_NAME = DatasetType.arithmetic_exp_unknown.name
-SPLIT_CHOICES = [
-    "random",
-    "chessboard",
-    "updown",
-    "leftright",
-    "tl_to_br",
-    "tr_to_bl",
-    "interlace_row",
-    "interlace_col",
-    "chessboard_random",
-]
+SPLIT_CHOICES = TRAIN_SPLIT_TYPES
 
 
 @dataclass

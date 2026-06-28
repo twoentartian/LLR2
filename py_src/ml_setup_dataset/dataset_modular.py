@@ -606,11 +606,10 @@ class ArithmeticDataset:
             train_mask = M.astype(bool)
 
             if train_split_type == "chessboard_random_inv":
-                # Invert the upper-right quadrant: top 50% of rows and
-                # right 50% of columns. For odd-sized grids, the extra row
-                # and column stay in the lower/right halves respectively.
-                midpoint = n // 2
-                train_mask[:midpoint, midpoint:] = ~train_mask[:midpoint, midpoint:]
+                # Invert the upper-right triangular half of the grid. The
+                # main diagonal is left unchanged.
+                upper_right = j > i
+                train_mask[upper_right] = ~train_mask[upper_right]
 
         else:
             raise ValueError(f"Unknown train_split_type: {train_split_type}")

@@ -38,7 +38,7 @@ class ArithmeticDatasetSplitTests(unittest.TestCase):
         self.assertNotEqual(_dataset_members(train_a), _dataset_members(train_c))
         self.assertNotEqual(_dataset_members(val_a), _dataset_members(val_c))
 
-    def test_chessboard_random_inv_flips_only_upper_right_quadrant(self):
+    def test_chessboard_random_inv_flips_only_upper_right_half(self):
         modulus = 7
         seed = 123
         random_train, random_val = ArithmeticDataset._get_spatial_train_val_masks(
@@ -56,9 +56,8 @@ class ArithmeticDatasetSplitTests(unittest.TestCase):
             rng=np.random.default_rng(seed),
         )
 
-        midpoint = modulus // 2
-        upper_right = np.zeros((modulus, modulus), dtype=bool)
-        upper_right[:midpoint, midpoint:] = True
+        rows, cols = np.indices((modulus, modulus))
+        upper_right = cols > rows
 
         self.assertTrue((inverse_train[upper_right] == ~random_train[upper_right]).all())
         self.assertTrue((inverse_train[~upper_right] == random_train[~upper_right]).all())

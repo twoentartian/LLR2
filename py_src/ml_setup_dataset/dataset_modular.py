@@ -186,6 +186,7 @@ class ArithmeticDataset:
         operand_length: Optional[int] = None,
         train_split_type: TrainSplitType = "random",
         seed: Optional[int] = None,
+        chessboard_transpose_ratio: float = 100.0,
     ):
         """
         Creates training and validation datasets
@@ -194,13 +195,30 @@ class ArithmeticDataset:
         :param operator: The arithmetic operator for this dataset e.g. '+', '-', '*', '/', 'sort'
         :param operand_length: for list based datasets the length of the lists
         :param seed: random seed for randomized dataset generation; if None, use fresh entropy
+        :param chessboard_transpose_ratio: percentage of chessboard_random cells whose
+            transpose is assigned to the same partition
         :returns: (train_dataset, validation_dataset)
         """
 
         assert (0 < train_pct) and (train_pct <= 100)
 
-        ds_name = cls.get_dsname(modulus, operator, operand_length, train_pct, train_split_type)
-        eqs_train, eqs_val = cls.make_data(operator, modulus, operand_length, seed=seed, train_split_type=train_split_type, train_pct=train_pct)
+        ds_name = cls.get_dsname(
+            modulus,
+            operator,
+            operand_length,
+            train_pct,
+            train_split_type,
+            chessboard_transpose_ratio,
+        )
+        eqs_train, eqs_val = cls.make_data(
+            operator,
+            modulus,
+            operand_length,
+            seed=seed,
+            train_split_type=train_split_type,
+            train_pct=train_pct,
+            chessboard_transpose_ratio=chessboard_transpose_ratio,
+        )
 
         train_ds = cls(ds_name, eqs_train, modulus, train=True)
         val_ds = cls(ds_name, eqs_val, modulus, train=False)
@@ -413,7 +431,15 @@ class ArithmeticDataset:
     #    return eqs
 
     @classmethod
-    def get_dsname(cls, modulus, operator, operand_length, train_pct, split_type) -> str:
+    def get_dsname(
+        cls,
+        modulus,
+        operator,
+        operand_length,
+        train_pct,
+        split_type,
+        chessboard_transpose_ratio=100.0,
+    ) -> str:
         operator, noise_level = cls._get_operator_and_noise_level(operator)
         if operator in VALID_OPERATORS:
             ds_name = f"modulus{modulus}_{VALID_OPERATORS[operator]}_train{train_pct}_{split_type}"
@@ -421,6 +447,8 @@ class ArithmeticDataset:
             ds_name = f"modulus{modulus}_{operator}_train{train_pct}_{split_type}"
         if operand_length is not None:
             ds_name += f"_{operand_length}"
+        if split_type == "chessboard_random" and chessboard_transpose_ratio != 100.0:
+            ds_name += f"_transpose{chessboard_transpose_ratio:g}"
         if noise_level > 0:
             ds_name += f"_noise{noise_level}"
         ds_name += datetime.now().strftime("_%Y-%m-%d_%H-%M-%S")
@@ -437,7 +465,18 @@ class ArithmeticDataset:
             return operator, 0
 
     @classmethod
-    def make_data(cls, operator, modulus, operands=None, shuffle=True, seed=None, train_split_type="random", train_pct: float = 0.5) -> tuple[List[str], List[str]]:
+    def make_data(
+        cls,
+        operator,
+        modulus,
+        operands=None,
+        shuffle=True,
+        seed=None,
+        train_split_type="random",
+        train_pct: float = 0.5,
+        chessboard_transpose_ratio: float = 100.0,
+    ) -> tuple[List[str], List[str]]:
+        cls._validate_chessboard_transpose_ratio(train_split_type, chessboard_transpose_ratio)
         operator, noise_level = cls._get_operator_and_noise_level(operator)
         data, data_table = None, None
         if operator not in ["sort", "reverse", "copy"]:
@@ -453,7 +492,14 @@ class ArithmeticDataset:
             assert train_pct is not None, ("train_pct must be provided for spatial train_split_type")
             assert data_table is not None, ("Spatial splits are only supported for binary-operation datasets")
             assert noise_level == 0, ("noise level has to be 0 for non-random splits")
-            train_mask, val_mask = cls._get_spatial_train_val_masks(operator, modulus, train_pct, train_split_type, rng=rng)
+            train_mask, val_mask = cls._get_spatial_train_val_masks(
+                operator,
+                modulus,
+                train_pct,
+                train_split_type,
+                rng=rng,
+                chessboard_transpose_ratio=chessboard_transpose_ratio,
+            )
 
             elems_a = list(range(modulus))
             elems_b = list(range(modulus))
@@ -504,10 +550,80 @@ class ArithmeticDataset:
 
             return train_eqs, val_eqs
 
-
+    @classmethod
+    def _validate_chessboard_transpose_ratio(cls, train_split_type, chessboard_transpose_ratio):
+        if (
+            not math.isfinite(chessboard_transpose_ratio)
+            or not 0 <= chessboard_transpose_ratio <= 100
+        ):
+            raise ValueError("chessboard_transpose_ratio must be between 0 and 100")
+        if train_split_type != "chessboard_random" and chessboard_transpose_ratio != 100.0:
+            raise ValueError(
+                "chessboard_transpose_ratio can only be changed for the chessboard_random split"
+            )
 
     @classmethod
-    def _get_spatial_train_val_masks(cls, operator, modulus, train_pct, train_split_type, rng: Optional[np.random.Generator] = None):
+    def _apply_chessboard_transpose_ratio(
+        cls,
+        mask: np.ndarray,
+        chessboard_transpose_ratio: float,
+        rng: np.random.Generator,
+    ) -> None:
+        """Adjust a symmetric mask in-place while preserving its train-cell count."""
+        n = mask.shape[0]
+        mismatch_pair_count = round(
+            (1.0 - chessboard_transpose_ratio / 100.0) * mask.size / 2.0
+        )
+        off_diagonal_pair_count = n * (n - 1) // 2
+        mismatch_pair_count = min(mismatch_pair_count, off_diagonal_pair_count)
+        if mismatch_pair_count == 0:
+            return
+
+        upper_rows, upper_cols = np.triu_indices(n, k=1)
+        upper_values = mask[upper_rows, upper_cols]
+        train_pair_candidates = np.flatnonzero(upper_values == 1)
+        val_pair_candidates = np.flatnonzero(upper_values == 0)
+
+        # Turning one symmetric train pair and one symmetric validation pair into
+        # mismatched pairs keeps the partition sizes unchanged. For an odd target,
+        # use one extra validation pair and compensate with a diagonal train cell.
+        train_pair_count = min(mismatch_pair_count // 2, len(train_pair_candidates))
+        val_pair_count = mismatch_pair_count - train_pair_count
+        chosen_train_pairs = rng.choice(
+            train_pair_candidates, size=train_pair_count, replace=False
+        )
+        chosen_val_pairs = rng.choice(
+            val_pair_candidates, size=val_pair_count, replace=False
+        )
+        chosen_pairs = np.concatenate((chosen_train_pairs, chosen_val_pairs))
+
+        flip_rows = upper_rows[chosen_pairs].copy()
+        flip_cols = upper_cols[chosen_pairs].copy()
+        flip_transpose = rng.integers(0, 2, size=mismatch_pair_count).astype(bool)
+        flip_rows[flip_transpose], flip_cols[flip_transpose] = (
+            flip_cols[flip_transpose],
+            flip_rows[flip_transpose],
+        )
+        mask[flip_rows, flip_cols] = 1 - mask[flip_rows, flip_cols]
+
+        diagonal_compensation = val_pair_count - train_pair_count
+        if diagonal_compensation:
+            diagonal_candidates = np.flatnonzero(np.diag(mask) == 1)
+            chosen_diagonal = rng.choice(
+                diagonal_candidates, size=diagonal_compensation, replace=False
+            )
+            mask[chosen_diagonal, chosen_diagonal] = 0
+
+    @classmethod
+    def _get_spatial_train_val_masks(
+        cls,
+        operator,
+        modulus,
+        train_pct,
+        train_split_type,
+        rng: Optional[np.random.Generator] = None,
+        chessboard_transpose_ratio: float = 100.0,
+    ):
         """
         Build boolean train/val masks over the n×n grid of (a, b) operand pairs.
 
@@ -519,6 +635,9 @@ class ArithmeticDataset:
         train_mask : np.ndarray of bool, shape (n, n)
         val_mask   : np.ndarray of bool, shape (n, n)
         """
+        cls._validate_chessboard_transpose_ratio(
+            train_split_type, chessboard_transpose_ratio
+        )
         if operator in ["s5", "s5conj", "s5aba"]:
             import math as _math
             n = _math.factorial(5)  # 120
@@ -610,6 +729,10 @@ class ArithmeticDataset:
                 # main diagonal is left unchanged.
                 upper_right = j > i
                 train_mask[upper_right] = ~train_mask[upper_right]
+            else:
+                cls._apply_chessboard_transpose_ratio(
+                    train_mask, chessboard_transpose_ratio, rng
+                )
 
         else:
             raise ValueError(f"Unknown train_split_type: {train_split_type}")

@@ -157,7 +157,16 @@ def loading_dataset_from(path: str, modulus: Optional[int] = None):
     return train_dataset, val_dataset
 
 
-def generate_dataset(output_folder_path, train_pct, expression, modulus, train_split_type, operand_length, seed=None):
+def generate_dataset(
+    output_folder_path,
+    train_pct,
+    expression,
+    modulus,
+    train_split_type,
+    operand_length,
+    seed=None,
+    chessboard_transpose_ratio=100.0,
+):
     normalized_expression = normalize_expression(expression, modulus)
     train_dataset, val_dataset = ArithmeticDataset.splits(
         train_pct=train_pct,
@@ -166,6 +175,7 @@ def generate_dataset(output_folder_path, train_pct, expression, modulus, train_s
         modulus=modulus,
         operand_length=operand_length,
         seed=seed,
+        chessboard_transpose_ratio=chessboard_transpose_ratio,
     )
     name = train_dataset.name
     train_dataset.save_to_file(os.path.join(output_folder_path, name, "train.txt"))
@@ -538,6 +548,7 @@ def parse_args():
     parser.add_argument("--modulus", type=int, default=97)
     parser.add_argument("-tp", "--train_pct", type=float, default=50)
     parser.add_argument("-st", "--split_type", type=str, default="random", choices=SPLIT_CHOICES)
+    parser.add_argument("--chessboard_transpose_ratio",type=float,default=100.0,help=("percentage of chessboard_random samples whose (b,a) transpose is in the same partition; rounded to the nearest feasible cell count (default: 100)"),)
     parser.add_argument("-ol", "--operand_length", type=int, default=None)
     parser.add_argument("-lr", "--learning_rate", type=float, default=None)
     parser.add_argument("-minlr", "--min_lr", type=float, default=None)
@@ -595,7 +606,16 @@ def main():
     else:
         if args.dataset_exp is None:
             raise ValueError("--dataset_exp is required when --dataset_path is not provided")
-        train_ds, val_ds = generate_dataset(output_folder_path, args.train_pct, args.dataset_exp, args.modulus, args.split_type, args.operand_length, seed=args.random_seed)
+        train_ds, val_ds = generate_dataset(
+            output_folder_path,
+            args.train_pct,
+            args.dataset_exp,
+            args.modulus,
+            args.split_type,
+            args.operand_length,
+            seed=args.random_seed,
+            chessboard_transpose_ratio=args.chessboard_transpose_ratio,
+        )
 
     if args.inverse_train_val:
         logger.info("inverse training/validation mode enabled; forcing number_of_models to 2")

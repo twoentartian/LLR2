@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dali_device_id", type=int, default=0, help="CUDA device id used by DALI pipelines")
     parser.add_argument("-P", "--torch_preset_version", type=int, default=None, help="factory preset index")
-    parser.add_argument("-w", "--worker", type=int, default=0, help="dataloader worker count")
+    parser.add_argument("-c", "--core", type=int, default=8, help="dataloader worker count")
     parser.add_argument("--prefetch_factor", type=int, default=None, help="dataloader prefetch factor")
     return parser.parse_args()
 

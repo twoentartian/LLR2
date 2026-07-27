@@ -287,7 +287,7 @@ def _build_train_dataloader(ml_setup: MLSetup, args: argparse.Namespace):
     loader_setup.override_train_loader = None
     loader_config = DataloaderConfig(
         batch_size=args.batch_size or ml_setup.default_batch_size,
-        num_workers=args.worker,
+        num_workers=args.core,
         num_samples=args.train_dataset_size,
         shuffle=False,
         pin_memory=True,
@@ -304,7 +304,7 @@ def _build_val_dataloader(ml_setup: MLSetup, args: argparse.Namespace):
     loader_setup.override_test_loader = None
     loader_config = DataloaderConfig(
         batch_size=args.batch_size or ml_setup.default_batch_size,
-        num_workers=args.worker,
+        num_workers=args.core,
         num_samples=args.val_dataset_size,
         shuffle=False,
         pin_memory=True,

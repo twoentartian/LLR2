@@ -1,6 +1,6 @@
 """Execution engine – platform-aware train / val loops.
 
-Supports: single CUDA GPU, Apple MPS, CPU, and multi-GPU via
+Supports: single CUDA GPU, Intel XPU, Apple MPS, CPU, and multi-GPU via
 ``torch.nn.parallel.DistributedDataParallel``.
 
 Usage::
@@ -9,6 +9,7 @@ Usage::
 
     device = Device.auto()                          # picks best available
     # device = Device("cuda:0")
+    # device = Device("xpu:0")
     # device = Device("mps")
 
     train_loader = setup.train_dataloader()
@@ -53,6 +54,8 @@ class Device:
         """Pick the best single device available."""
         if torch.cuda.is_available():
             return cls("cuda:0")
+        if cls._is_xpu_available():
+            return cls("xpu:0")
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return cls("mps")
         return cls("cpu")
@@ -60,6 +63,10 @@ class Device:
     @classmethod
     def cuda(cls, index: int = 0) -> "Device":
         return cls(f"cuda:{index}")
+
+    @classmethod
+    def xpu(cls, index: int = 0) -> "Device":
+        return cls(f"xpu:{index}")
 
     @classmethod
     def mps(cls) -> "Device":
@@ -73,12 +80,22 @@ class Device:
 
     @property
     def supports_amp(self) -> bool:
-        return self.device.type in ("cuda",)
+        return self.device.type in ("cuda", "xpu")
 
     def make_scaler(self) -> Optional[torch.amp.GradScaler]: # type: ignore
         if self.supports_amp:
             return torch.amp.GradScaler(self.device.type) # type: ignore
         return None
+
+    @staticmethod
+    def _is_xpu_available() -> bool:
+        xpu = getattr(torch, "xpu", None)
+        if xpu is None or not hasattr(xpu, "is_available"):
+            return False
+        try:
+            return bool(xpu.is_available())
+        except RuntimeError:
+            return False
 
     # -- DDP helpers -------------------------------------------------------
 

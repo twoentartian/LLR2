@@ -31,6 +31,7 @@ class RuntimeParameters:
     average_on_cpu: bool
     performance_disable_training: bool
     performance_disable_communication: bool
+    shared_training_loader: Any
 
     def __init__(self):
         self.max_tick = 0
@@ -48,3 +49,4 @@ class RuntimeParameters:
 
         self.performance_disable_training = False
         self.performance_disable_communication = False
+        self.shared_training_loader = None

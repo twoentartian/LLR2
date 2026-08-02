@@ -1,7 +1,8 @@
-"""Dataset wrappers used to construct per-node simulator data loaders."""
+"""Dataset indexing and sampling helpers used by the simulator."""
 
 from __future__ import annotations
 
+import itertools
 from typing import Any, Iterable, Optional, TYPE_CHECKING
 
 import numpy as np
@@ -29,13 +30,21 @@ class LabelProbabilitySampler(Sampler[int]):
         self.labels_in_order = list(indices_by_label.keys())
 
     def __iter__(self):
-        for _ in range(self.num_samples):
-            label_index = np.random.choice(
-                len(self.labels_in_order),
-                p=self.label_probabilities,
+        label_indices = np.random.choice(
+            len(self.labels_in_order),
+            size=self.num_samples,
+            p=self.label_probabilities,
+        )
+        sampled_indices = np.empty(self.num_samples, dtype=np.int64)
+        for label_index, label in enumerate(self.labels_in_order):
+            positions = np.flatnonzero(label_indices == label_index)
+            if positions.size == 0:
+                continue
+            sampled_indices[positions] = np.random.choice(
+                self.indices_by_label[label],
+                size=positions.size,
             )
-            label = self.labels_in_order[label_index]
-            yield int(np.random.choice(self.indices_by_label[label]))
+        yield from (int(index) for index in sampled_indices)
 
     def __len__(self) -> int:
         return self.num_samples
@@ -109,22 +118,118 @@ def _build_dataloader_kwargs(
 
 
 class DatasetWithFastLabelSelection:
-    """Index a map-style dataset once and build label-weighted data loaders."""
+    """Index a map-style dataset once and sample node-specific indices."""
 
     def __init__(self, dataset: Any, ml_setup: MLSetup):
         self.raw_dataset = dataset
         self.ml_setup = ml_setup
+        if not hasattr(dataset, "__len__") or not hasattr(dataset, "__getitem__"):
+            raise ValueError("shared loading requires a map-style dataset")
+        self.dataset_size = len(dataset)
+        if self.dataset_size <= 0:
+            raise ValueError("training dataset must not be empty")
+
         self.labels = np.asarray(_infer_dataset_labels_for_indices(dataset))
-        if self.labels.size == 0:
+        self.indices_by_label: dict[int, np.ndarray] = {}
+        if self.labels.size:
+            if len(self.labels) != self.dataset_size:
+                raise ValueError("inferred dataset labels do not match dataset length")
+            indices = np.arange(len(self.labels))
+            for label in sorted(set(int(value) for value in self.labels.tolist())):
+                self.indices_by_label[label] = indices[self.labels == label]
+
+    @property
+    def supports_shared_loading(self) -> bool:
+        """Whether this dataset can be indexed by the shared worker pool."""
+
+        return (
+            not hasattr(self.raw_dataset, "build_dataloader")
+            and getattr(
+                self.ml_setup,
+                "override_training_dataset_loader",
+                getattr(self.ml_setup, "override_train_loader", None),
+            )
+            is None
+        )
+
+    def sample_indices(
+        self,
+        label_probabilities: Optional[np.ndarray],
+        num_samples: int,
+        *,
+        rng: Any = None,
+    ) -> list[int]:
+        """Generate one or more batches of indices for a node.
+
+        Sampling remains in the simulator process.  DataLoader workers only
+        fetch and transform the resulting indices, which allows one worker
+        pool to serve different node distributions.
+        """
+
+        sample_count = int(num_samples)
+        if sample_count < 0:
+            raise ValueError("num_samples must be non-negative")
+        if sample_count == 0:
+            return []
+
+        random_source = np.random if rng is None else rng
+        if label_probabilities is None:
+            sampler = _resolve_sampler(
+                self.raw_dataset,
+                getattr(
+                    self.ml_setup,
+                    "sampler_fn",
+                    getattr(self.ml_setup, "default_sampler_fn", None),
+                ),
+            )
+            if sampler is not None:
+                sampled = list(itertools.islice(iter(sampler), sample_count))
+                if len(sampled) != sample_count:
+                    raise ValueError(
+                        "configured sampler produced fewer indices than requested"
+                    )
+                return [int(index) for index in sampled]
+
+            sampled: list[int] = []
+            while len(sampled) < sample_count:
+                permutation = random_source.permutation(self.dataset_size)
+                remaining = sample_count - len(sampled)
+                sampled.extend(int(index) for index in permutation[:remaining])
+            return sampled
+
+        if not self.indices_by_label:
             raise ValueError(
-                "Dataset label selection requires a map-style dataset "
-                "with accessible labels"
+                "label-distribution sampling requires accessible dataset labels"
             )
 
-        indices = np.arange(len(self.labels))
-        self.indices_by_label: dict[int, np.ndarray] = {}
-        for label in sorted(set(int(value) for value in self.labels.tolist())):
-            self.indices_by_label[label] = indices[self.labels == label]
+        probabilities = np.asarray(label_probabilities, dtype=np.float64)
+        labels_in_order = list(self.indices_by_label)
+        if probabilities.shape != (len(labels_in_order),):
+            raise ValueError(
+                "label probability count does not match the dataset label count"
+            )
+        if np.any(probabilities < 0) or not np.isfinite(probabilities).all():
+            raise ValueError("label probabilities must be finite and non-negative")
+        probability_sum = probabilities.sum()
+        if probability_sum <= 0:
+            raise ValueError("label probabilities must have a positive sum")
+        probabilities = probabilities / probability_sum
+
+        sampled_label_indices = random_source.choice(
+            len(labels_in_order),
+            size=sample_count,
+            p=probabilities,
+        )
+        sampled_indices = np.empty(sample_count, dtype=np.int64)
+        for label_index, label in enumerate(labels_in_order):
+            positions = np.flatnonzero(sampled_label_indices == label_index)
+            if positions.size == 0:
+                continue
+            sampled_indices[positions] = random_source.choice(
+                self.indices_by_label[label],
+                size=positions.size,
+            )
+        return [int(index) for index in sampled_indices]
 
     def get_train_loader_by_label_prob(
         self,

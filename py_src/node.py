@@ -232,6 +232,7 @@ class Node:
         self.next_training_tick = 0
         self.normalized_dataset_label_distribution = None
         self.train_loader: Optional[Iterable] = None
+        self._dataloader_worker: Optional[int] = None
 
         self._dataset_label_distribution = None
         self._dataset_with_fast_label: Optional[DatasetWithFastLabelSelection] = None
@@ -309,6 +310,8 @@ class Node:
         worker: Optional[int] = None,
     ) -> None:
         self._dataset_label_distribution = dataset_label_distribution
+        self._dataloader_worker = worker
+        self.train_loader = None
         if dataset_with_fast_label is not None:
             self._dataset_with_fast_label = dataset_with_fast_label
         elif self._dataset_label_distribution is not None and self._dataset_with_fast_label is None:
@@ -318,13 +321,8 @@ class Node:
             )
 
         assert self._dataset_with_fast_label is not None
-        batch_size = self.ml_setup.training_batch_size
         if dataset_label_distribution is None:
             self.normalized_dataset_label_distribution = None
-            self.train_loader = self._dataset_with_fast_label.get_train_loader_default(
-                batch_size,
-                worker=worker,
-            )
         else:
             label_distribution = np.asarray(
                 dataset_label_distribution,
@@ -337,11 +335,6 @@ class Node:
                     "with non-positive sum"
                 )
             self.normalized_dataset_label_distribution = label_distribution / total
-            self.train_loader = self._dataset_with_fast_label.get_train_loader_by_label_prob(
-                self.normalized_dataset_label_distribution,
-                batch_size,
-                worker=worker,
-            )
 
     def set_model_stat(self, model_stat: dict) -> None:
         self.model.load_state_dict(model_stat, strict=True)
@@ -361,9 +354,41 @@ class Node:
         return self.normalized_dataset_label_distribution
 
     def get_data_loader(self) -> Iterable:
+        """Build a dedicated loader lazily for legacy callers.
+
+        The simulator uses ``sample_training_indices`` and its shared loader,
+        so this compatibility path does not create per-node worker pools during
+        normal simulation.
+        """
+
+        if self._dataset_with_fast_label is None:
+            raise ValueError(f"node {self.name} training dataset is not initialized")
         if self.train_loader is None:
-            raise ValueError(f"node {self.name} training loader is not initialized")
+            batch_size = self.ml_setup.training_batch_size
+            if self.normalized_dataset_label_distribution is None:
+                self.train_loader = (
+                    self._dataset_with_fast_label.get_train_loader_default(
+                        batch_size,
+                        worker=self._dataloader_worker,
+                    )
+                )
+            else:
+                self.train_loader = (
+                    self._dataset_with_fast_label.get_train_loader_by_label_prob(
+                        self.normalized_dataset_label_distribution,
+                        batch_size,
+                        worker=self._dataloader_worker,
+                    )
+                )
         return self.train_loader
+
+    def sample_training_indices(self, sample_count: int) -> list[int]:
+        if self._dataset_with_fast_label is None:
+            raise ValueError(f"node {self.name} training dataset is not initialized")
+        return self._dataset_with_fast_label.sample_indices(
+            self.normalized_dataset_label_distribution,
+            sample_count,
+        )
 
     def get_model_stat(self) -> dict:
         return {

@@ -21,7 +21,7 @@ from py_src.simulation_runtime_parameters import RuntimeParameters, SimulationPh
 config_name = "default_config"
 
 max_tick = 10000
-save_name = "LeNet4__GL_N50"
+# save_name = "LeNet4__GL_N50"
 force_use_cpu = False
 
 # Retained for compatibility with DFL_torch configs. LLR2 selects its execution
@@ -35,6 +35,11 @@ preset_network = "GL"
 preset_variance_correction = None  # None or "VC"
 preset_network_size = 50
 preset_network_degree = 8  # Only valid for GL.
+
+# One worker pool is shared by all node training batches.  This is a total
+# process count, not a per-node count.
+preset_shared_training_loader_workers = 4
+preset_shared_training_loader_prefetch_factor = 2
 
 
 _ml_setup: MLSetup | None = None

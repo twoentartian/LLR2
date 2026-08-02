@@ -22,6 +22,7 @@ from py_src.ml_setup_dataset.dataset_intermediate_layer import (
     DatasetWithFastLabelSelection,
 )
 from py_src.node import Node, ensure_ml_setup_compatibility
+from py_src.shared_dataloader import BatchRequest, SharedDataLoader
 from py_src.simulation_runtime_parameters import RuntimeParameters, SimulationPhase
 
 
@@ -100,6 +101,54 @@ def _slice_batches(loader: Iterable, batch_limit: int):
     return itertools.islice(iter(loader), max(0, int(batch_limit)))
 
 
+def _build_shared_batch_plan(nodes: Iterable[Node]) -> list[BatchRequest]:
+    requests = []
+    for node_target in nodes:
+        batch_count = max(0, int(node_target.num_of_batch_per_training))
+        batch_size = int(node_target.ml_setup.training_batch_size)
+        if batch_count == 0:
+            continue
+        if batch_size <= 0:
+            raise ValueError(f"node {node_target.name} has an invalid batch size")
+
+        indices = node_target.sample_training_indices(batch_count * batch_size)
+        for batch_index in range(batch_count):
+            start = batch_index * batch_size
+            requests.append(
+                BatchRequest.from_indices(
+                    node_target.name,
+                    batch_index,
+                    indices[start : start + batch_size],
+                )
+            )
+    return requests
+
+
+def _take_routed_node_batches(
+    routed_batch_iterator,
+    node_name: int,
+    batch_count: int,
+):
+    for expected_batch_index in range(max(0, int(batch_count))):
+        try:
+            routed_batch = next(routed_batch_iterator)
+        except StopIteration as error:
+            raise RuntimeError(
+                f"shared DataLoader stopped before producing batches for node {node_name}"
+            ) from error
+        if (
+            routed_batch.node_name != node_name
+            or routed_batch.batch_index != expected_batch_index
+        ):
+            raise RuntimeError(
+                "shared DataLoader returned a batch out of plan order: "
+                f"expected node {node_name} batch {expected_batch_index}, "
+                f"received node {routed_batch.node_name} "
+                f"batch {routed_batch.batch_index}"
+            )
+        yield routed_batch.batch
+
+
 def _refresh_label_distributions(runtime_parameters: RuntimeParameters, config_file) -> None:
     for single_node in runtime_parameters.node_container.values():
         new_label_distribution = config_file.get_label_distribution(single_node, runtime_parameters)
@@ -136,12 +185,32 @@ def simulation_phase_training(runtime_parameters: RuntimeParameters, config_file
 
     training_node_names = []
     for node_name, node_target in runtime_parameters.node_container.items():
-        if node_target.next_training_tick != runtime_parameters.current_tick:
-            continue
+        if node_target.next_training_tick == runtime_parameters.current_tick:
+            training_node_names.append(node_name)
 
-        training_node_names.append(node_name)
-        train_loader = node_target.get_data_loader()
-        batches = _slice_batches(train_loader, node_target.num_of_batch_per_training)
+    training_nodes = [
+        runtime_parameters.node_container[node_name]
+        for node_name in training_node_names
+    ]
+    shared_loader = runtime_parameters.shared_training_loader
+    routed_batch_iterator = None
+    if shared_loader is not None and training_nodes:
+        shared_loader.set_plan(_build_shared_batch_plan(training_nodes))
+        routed_batch_iterator = iter(shared_loader)
+
+    for node_name, node_target in zip(training_node_names, training_nodes):
+        if routed_batch_iterator is None:
+            train_loader = node_target.get_data_loader()
+            batches = _slice_batches(
+                train_loader,
+                node_target.num_of_batch_per_training,
+            )
+        else:
+            batches = _take_routed_node_batches(
+                routed_batch_iterator,
+                node_name,
+                node_target.num_of_batch_per_training,
+            )
         training_batch_count = 0
         if node_target.enable_training and not getattr(runtime_parameters, "performance_disable_training", False):
             result = engine_train(
@@ -373,6 +442,36 @@ def main(
 
     training_dataset = DatasetWithFastLabelSelection(config_ml_setup.training_data, config_ml_setup)
 
+    shared_worker_count = getattr(
+        config_file,
+        "preset_shared_training_loader_workers",
+        0,
+    )
+    shared_prefetch_factor = getattr(
+        config_file,
+        "preset_shared_training_loader_prefetch_factor",
+        2,
+    )
+    if training_dataset.supports_shared_loading:
+        runtime_parameters.shared_training_loader = SharedDataLoader(
+            training_dataset.raw_dataset,
+            num_workers=shared_worker_count,
+            collate_fn=config_ml_setup.collate_fn,
+            pin_memory=True,
+            prefetch_factor=shared_prefetch_factor,
+        )
+        SIMULATOR_LOGGER.info(
+            "shared training DataLoader workers: %s, prefetch factor: %s",
+            shared_worker_count,
+            shared_prefetch_factor,
+        )
+    else:
+        runtime_parameters.shared_training_loader = None
+        SIMULATOR_LOGGER.info(
+            "training dataset requires its dedicated loader backend; "
+            "shared DataLoader is disabled"
+        )
+
     runtime_parameters.node_container = {}
     for single_node in sorted(nodes_set):
         temp_node = Node(
@@ -393,8 +492,10 @@ def main(
         temp_node.set_average_buffer_size(config_file.get_average_buffer_size(temp_node, runtime_parameters))
 
         label_distribution = config_file.get_label_distribution(temp_node, runtime_parameters)
-        dataloader_worker = getattr(config_file, "preset_training_loader_worker", None)
-        temp_node.set_label_distribution(label_distribution, dataset_with_fast_label=training_dataset, worker=dataloader_worker)
+        temp_node.set_label_distribution(
+            label_distribution,
+            dataset_with_fast_label=training_dataset,
+        )
 
         runtime_parameters.node_container[single_node] = temp_node
 
@@ -419,7 +520,11 @@ def main(
         else:
             runtime_parameters.average_on_cpu = config_file.preset_averaging_on_cpu
 
-    begin_simulation(runtime_parameters, config_file)
+    try:
+        begin_simulation(runtime_parameters, config_file)
+    finally:
+        if runtime_parameters.shared_training_loader is not None:
+            runtime_parameters.shared_training_loader.close()
 
 
 if __name__ == "__main__":

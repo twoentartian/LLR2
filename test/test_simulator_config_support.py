@@ -7,11 +7,15 @@ from pathlib import Path
 import networkx as nx
 import numpy as np
 import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset
 
 import simulator
 import py_src.node as node_module
+from py_src.adapters import StandardAdapter
 from py_src.config_file_util import label_distribution
 from py_src.ml_setup import MLSetup
+from py_src.engine import Device
 from py_src.model_average import (
     ConservativeModelAverager,
     ModelAverager,
@@ -29,6 +33,7 @@ from py_src.nx_lib import (
     split_to_equal_size_communities,
 )
 from py_src.simulation_runtime_parameters import RuntimeParameters
+from py_src.shared_dataloader import SharedDataLoader
 
 
 class _DummyNode:
@@ -61,6 +66,63 @@ class SimulatorConfigSupportTest(unittest.TestCase):
         self.assertTrue(parameters.average_on_cpu)
         self.assertFalse(parameters.performance_disable_training)
         self.assertFalse(parameters.performance_disable_communication)
+        self.assertIsNone(parameters.shared_training_loader)
+
+    def test_simulator_training_uses_shared_loader_without_node_loaders(self):
+        features = torch.tensor([[-2.0], [-1.0], [1.0], [2.0]])
+        targets = torch.tensor([0, 0, 1, 1])
+        dataset = TensorDataset(features, targets)
+        dataset.targets = targets
+        model = nn.Linear(1, 2)
+        criterion = nn.CrossEntropyLoss()
+        setup = MLSetup(
+            model=model,
+            adapter=StandardAdapter(model, criterion),
+            training_data=dataset,
+            testing_data=dataset,
+            default_batch_size=2,
+            criterion=criterion,
+            dataset_label=[0, 1],
+        )
+        setup = node_module.ensure_ml_setup_compatibility(setup)
+        selector = DatasetWithFastLabelSelection(dataset, setup)
+
+        nodes = {}
+        for node_name in range(2):
+            target_node = Node(node_name, setup, device=Device.cpu())
+            target_node.set_optimizer(
+                torch.optim.SGD(target_node.model.parameters(), lr=0.01)
+            )
+            target_node.set_label_distribution(
+                np.ones(2),
+                dataset_with_fast_label=selector,
+            )
+            target_node.num_of_batch_per_training = node_name + 1
+            nodes[node_name] = target_node
+
+        parameters = RuntimeParameters()
+        parameters.current_tick = 0
+        parameters.node_container = nodes
+        parameters.shared_training_loader = SharedDataLoader(
+            dataset,
+            num_workers=0,
+            pin_memory=False,
+        )
+
+        class Config:
+            @staticmethod
+            def get_next_training_time(target_node, runtime_parameters):
+                del runtime_parameters
+                return target_node.next_training_tick + 10
+
+        try:
+            simulator.simulation_phase_training(parameters, Config)
+        finally:
+            parameters.shared_training_loader.close()
+
+        self.assertTrue(all(node.is_training_this_tick for node in nodes.values()))
+        self.assertTrue(all(node.next_training_tick == 10 for node in nodes.values()))
+        self.assertTrue(all(node.train_loader is None for node in nodes.values()))
 
     def test_simulator_classes_are_defined_in_py_src_modules(self):
         self.assertEqual(ModelAverager.__module__, "py_src.model_average")

@@ -415,6 +415,7 @@ class Node:
                 self_model=self.get_model_stat()
             )
             self.set_model_stat(averaged_model)
+            self.model_averager.on_after_averaging(self.optimizer)
             self.is_averaging_this_tick = True
             return True
         return False

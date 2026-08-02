@@ -18,6 +18,7 @@ from py_src.ml_setup import MLSetup
 from py_src.engine import Device
 from py_src.model_average import (
     ConservativeModelAverager,
+    DFedAvgMAverager,
     ModelAverager,
     StandardModelAverager,
 )
@@ -128,6 +129,7 @@ class SimulatorConfigSupportTest(unittest.TestCase):
         self.assertEqual(ModelAverager.__module__, "py_src.model_average")
         self.assertEqual(StandardModelAverager.__module__, "py_src.model_average")
         self.assertEqual(ConservativeModelAverager.__module__, "py_src.model_average")
+        self.assertEqual(DFedAvgMAverager.__module__, "py_src.model_average")
         self.assertEqual(Node.__module__, "py_src.node")
         self.assertIs(simulator.Node, Node)
 
@@ -180,6 +182,49 @@ class SimulatorConfigSupportTest(unittest.TestCase):
             conservative.get_model(self_model=self_model)["weight"].item(),
             3.5,
         )
+
+    def test_dfedavgm_reaches_consensus_from_independent_initial_weights(self):
+        independently_initialized_models = [
+            {"weight": torch.tensor([1.0])},
+            {"weight": torch.tensor([4.0])},
+            {"weight": torch.tensor([10.0])},
+        ]
+        outputs = []
+
+        for node_index, self_model in enumerate(independently_initialized_models):
+            averager = DFedAvgMAverager()
+            for neighbor_index, neighbor_model in enumerate(
+                independently_initialized_models
+            ):
+                if neighbor_index != node_index:
+                    averager.add_model(neighbor_model)
+            outputs.append(averager.get_model(self_model=self_model))
+
+        np.testing.assert_allclose(
+            [output["weight"].item() for output in outputs],
+            [5.0] * 3,
+        )
+
+    def test_dfedavgm_supports_a_fixed_self_weight(self):
+        averager = DFedAvgMAverager(self_weight=0.5)
+        averager.add_model({"weight": torch.tensor([4.0])})
+        averager.add_model({"weight": torch.tensor([6.0])})
+
+        output = averager.get_model(self_model={"weight": torch.tensor([2.0])})
+
+        self.assertEqual(output["weight"].item(), 3.5)
+        self.assertEqual(averager.get_model_count(), 0)
+
+    def test_dfedavgm_resets_local_sgd_momentum_after_averaging(self):
+        parameter = nn.Parameter(torch.tensor([1.0]))
+        optimizer = torch.optim.SGD([parameter], lr=0.1, momentum=0.9)
+        parameter.grad = torch.tensor([2.0])
+        optimizer.step()
+        self.assertIn("momentum_buffer", optimizer.state[parameter])
+
+        DFedAvgMAverager().on_after_averaging(optimizer)
+
+        self.assertNotIn("momentum_buffer", optimizer.state[parameter])
 
     def test_common_label_distributions(self):
         parameters = RuntimeParameters()

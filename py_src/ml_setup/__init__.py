@@ -33,8 +33,11 @@ from .grokking import (
 )
 from .nanoclip import nanoclip_flickr30k_default
 
+# Compatibility name used by DFL_torch simulator configuration files.
+MlSetup = MLSetup
+
 __all__ = [
-    "get_ml_setup_from_config", "MLSetup", "ApplicationType", "ModelType", "DatasetType",
+    "get_ml_setup_from_config", "MLSetup", "MlSetup", "ApplicationType", "ModelType", "DatasetType",
     "alexnet_imagenet1k",
     "conveNeXt_tiny_imagenet1k", "convnext_tiny_imagenet1k",
     "densenet121_cifar10", "densenet121_imagenet1k", "densenet_cifar_cifar10",

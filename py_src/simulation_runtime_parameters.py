@@ -1,13 +1,7 @@
-"""Minimal SimulationPhase enum and RuntimeParameters stub.
-
-These are kept for compatibility with the service interfaces originally
-designed for DFL_torch's simulator. The services use
-``initialize_without_runtime_parameters`` / ``trigger_without_runtime_parameters``
-in the stand-alone tool; the ``initialize`` / ``trigger`` variants remain for
-future simulator integration.
-"""
+"""Simulation phases and shared runtime state for the LLR2 simulator."""
 
 from enum import Enum
+from typing import Any
 
 
 class SimulationPhase(Enum):
@@ -25,14 +19,32 @@ class SimulationPhase(Enum):
 
 
 class RuntimeParameters:
+    max_tick: int
+    current_tick: int
+    node_container: dict[int, Any]
+    dataset_label: list[Any]
+    phase: SimulationPhase
+    topology: Any
+    service_container: dict[str, Any]
+    mpi_enabled: bool
+    output_path: str
+    average_on_cpu: bool
+    performance_disable_training: bool
+    performance_disable_communication: bool
+
     def __init__(self):
-        self.max_tick:int = 0
-        self.current_tick:int = 0
-        self.node_container = None
-        self.dataset_label = None
+        self.max_tick = 0
+        self.current_tick = 0
+        self.node_container = {}
+        self.dataset_label = []
         self.phase = SimulationPhase.INITIALIZING
         self.topology = None
 
         self.service_container = {}
-        self.mpi_enabled = None
-        self.output_path = None
+        self.mpi_enabled = False
+        self.output_path = ""
+
+        self.average_on_cpu = True
+
+        self.performance_disable_training = False
+        self.performance_disable_communication = False

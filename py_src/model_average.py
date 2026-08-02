@@ -1,8 +1,4 @@
-"""Weight-space movement utilities.
-
-Ported from DFL_torch/py_src/model_average.py — only the functions used by
-``find_high_accuracy_path.py`` are included.
-"""
+"""Model-state movement and simulator averaging utilities."""
 
 from __future__ import annotations
 
@@ -12,6 +8,8 @@ from typing import Dict, List, Optional
 import torch
 
 from py_src.special_torch_layers import is_ignored_layer_averaging
+from py_src.model_variance_correct import VarianceCorrectionType, VarianceCorrector
+from py_src.special_torch_layers import is_ignored_layer_variance_correction
 
 
 # ---------------------------------------------------------------------------
@@ -124,3 +122,171 @@ def move_model_state_toward(
             )
 
     return output
+
+
+class ModelAverager:
+    def __init__(self, variance_corrector: Optional[VarianceCorrector] = None):
+        self.variance_corrector = variance_corrector
+
+    def add_model(self, model_stat: dict) -> None:
+        raise NotImplementedError
+
+    def get_model(self, *args, **kwargs) -> dict:
+        raise NotImplementedError
+
+    def get_model_count(self) -> int:
+        raise NotImplementedError
+
+    @staticmethod
+    def _iadd_two_model(
+        src: dict,
+        addition: dict,
+        *,
+        weight_src: float = 1.0,
+        weight_addition: float = 1.0,
+        check_same_keys: bool = True,
+    ) -> dict:
+        with torch.no_grad():
+            assert (not check_same_keys) or (set(src.keys()) == set(addition.keys()))
+            for layer_name in src.keys():
+                addition_tensor = addition[layer_name]
+                if src[layer_name].device != addition_tensor.device:
+                    addition_tensor = addition_tensor.to(src[layer_name].device)
+                if weight_src == 1.0 and weight_addition == 1.0:
+                    src[layer_name] += addition_tensor
+                else:
+                    src[layer_name] = (
+                        src[layer_name] * weight_src + addition_tensor * weight_addition
+                    )
+        return src
+
+    @staticmethod
+    def _move_state_dict(state_dict: dict, device: torch.device) -> None:
+        for key, value in state_dict.items():
+            state_dict[key] = value.to(device)
+
+    @staticmethod
+    def _get_device_from_model_stat(state_dict: dict) -> torch.device:
+        return next(iter(state_dict.values())).device
+
+
+class StandardModelAverager(ModelAverager):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.variance_corrector is not None:
+            vc_type = self.variance_corrector.variance_correction_type
+            assert vc_type == VarianceCorrectionType.FollowOthers
+        self.model_buffer: Optional[dict] = None
+        self.model_counter = 0
+
+    def add_model(self, model_stat: dict) -> None:
+        with torch.no_grad():
+            if self.model_buffer is None:
+                self.model_buffer = copy.deepcopy(model_stat)
+                for layer_name in list(self.model_buffer.keys()):
+                    if is_ignored_layer_averaging(layer_name):
+                        del self.model_buffer[layer_name]
+            else:
+                self.model_buffer = ModelAverager._iadd_two_model(
+                    self.model_buffer,
+                    model_stat,
+                    check_same_keys=False,
+                )
+            self.model_counter += 1
+            if self.variance_corrector is not None:
+                self.variance_corrector.add_variance(model_stat)
+
+    def get_model(self, self_model: dict, *args, **kwargs) -> dict:
+        assert self.model_buffer is not None
+        with torch.no_grad():
+            device = ModelAverager._get_device_from_model_stat(self.model_buffer)
+            self_model = copy.deepcopy(self_model)
+            ModelAverager._move_state_dict(self_model, device)
+
+            output = copy.deepcopy(self_model)
+            for layer_name in output:
+                if layer_name not in self.model_buffer:
+                    continue
+                output[layer_name] = self.model_buffer[layer_name] / self.model_counter
+
+            if self.variance_corrector is not None:
+                target_variance = self.variance_corrector.get_variance()
+                for layer_name, single_layer_variance in target_variance.items():
+                    if is_ignored_layer_variance_correction(layer_name):
+                        continue
+                    output[layer_name] = VarianceCorrector.scale_tensor_to_variance(
+                        output[layer_name],
+                        single_layer_variance,
+                    )
+
+            self.model_buffer = None
+            self.model_counter = 0
+            return output
+
+    def get_model_count(self) -> int:
+        return self.model_counter
+
+
+class ConservativeModelAverager(ModelAverager):
+    def __init__(self, conservative: float, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert 0.0 <= conservative <= 1.0
+        self.conservative = conservative
+        self.model_buffer: Optional[dict] = None
+        self.model_counter = 0
+
+    def add_model(self, model_stat: dict) -> None:
+        with torch.no_grad():
+            if self.model_buffer is None:
+                self.model_buffer = copy.deepcopy(model_stat)
+                for layer_name in list(self.model_buffer.keys()):
+                    if is_ignored_layer_averaging(layer_name):
+                        del self.model_buffer[layer_name]
+            else:
+                self.model_buffer = ModelAverager._iadd_two_model(
+                    self.model_buffer,
+                    model_stat,
+                    check_same_keys=False,
+                )
+            self.model_counter += 1
+            if self.variance_corrector is not None:
+                self.variance_corrector.add_variance(model_stat)
+
+    def get_model(self, self_model: dict, *args, **kwargs) -> dict:
+        assert self.model_buffer is not None
+        with torch.no_grad():
+            device = ModelAverager._get_device_from_model_stat(self.model_buffer)
+            self_model = copy.deepcopy(self_model)
+            ModelAverager._move_state_dict(self_model, device)
+
+            averaged = copy.deepcopy(self_model)
+            for layer_name in averaged:
+                if layer_name not in self.model_buffer:
+                    continue
+                averaged[layer_name] = self.model_buffer[layer_name] / self.model_counter
+
+            output = ModelAverager._iadd_two_model(
+                self_model,
+                averaged,
+                weight_src=self.conservative,
+                weight_addition=1 - self.conservative,
+            )
+            if self.variance_corrector is not None:
+                target_variance = self.variance_corrector.get_variance(
+                    self_model,
+                    self.conservative,
+                )
+                for layer_name, single_layer_variance in target_variance.items():
+                    if is_ignored_layer_variance_correction(layer_name):
+                        continue
+                    output[layer_name] = VarianceCorrector.scale_tensor_to_variance(
+                        output[layer_name],
+                        single_layer_variance,
+                    )
+
+            self.model_buffer = None
+            self.model_counter = 0
+            return output
+
+    def get_model_count(self) -> int:
+        return self.model_counter

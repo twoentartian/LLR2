@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 from enum import Enum, auto
 
@@ -33,6 +33,7 @@ class MLSetup:
     training_data: Any = None                  # map-style Dataset, IterableDataset, or DataLoader
     testing_data: Any = None
     dataset_type: DatasetType = None          # type: ignore 
+    dataset_label: list[Any] = field(default_factory=list)
 
     # ---- training defaults ------------------------------------------------
     default_batch_size: int = 0

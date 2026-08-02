@@ -21,7 +21,6 @@ from py_src.simulation_runtime_parameters import RuntimeParameters, SimulationPh
 config_name = "default_config"
 
 max_tick = 10000
-preset_training_loader_worker = 1
 save_name = "LeNet4__GL_N50"
 force_use_cpu = False
 

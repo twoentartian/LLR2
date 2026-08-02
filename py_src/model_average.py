@@ -245,17 +245,26 @@ class DFedAvgMAverager(ModelAverager):
 
     The equal-weight default is a symmetric mixing matrix for regular graphs.
     A fixed self weight is also symmetric when every node uses the same value
-    on a regular graph.  Momentum must be configured on the node's local SGD
-    optimizer; it is intentionally not applied to model deltas here.
+    on a regular graph. Momentum must be configured on the node's local SGD
+    optimizer; it is intentionally not applied to model deltas here. Set
+    ``enforce_heavy_ball_sgd=False`` to use only DFedAvgM's mixing step with a
+    different local training recipe. In that mode, optimizer state is kept.
     """
 
-    def __init__(self, self_weight: Optional[float] = None, *args, **kwargs):
+    def __init__(
+        self,
+        self_weight: Optional[float] = None,
+        *args,
+        enforce_heavy_ball_sgd: bool = True,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         if self.variance_corrector is not None:
             raise ValueError("DFedAvgM does not include variance correction")
         if self_weight is not None and not 0.0 <= self_weight <= 1.0:
             raise ValueError("self_weight must be between 0 and 1")
         self.self_weight = self_weight
+        self.enforce_heavy_ball_sgd = enforce_heavy_ball_sgd
         self.model_buffer: Optional[dict] = None
         self.model_counter = 0
 
@@ -310,6 +319,8 @@ class DFedAvgMAverager(ModelAverager):
         """Reset heavy-ball velocity for the next local-training round."""
 
         if optimizer is None:
+            return
+        if not self.enforce_heavy_ball_sgd:
             return
         if not isinstance(optimizer, torch.optim.SGD):
             raise TypeError("DFedAvgM local training requires torch.optim.SGD")

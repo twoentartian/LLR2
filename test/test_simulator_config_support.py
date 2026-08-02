@@ -226,6 +226,20 @@ class SimulatorConfigSupportTest(unittest.TestCase):
 
         self.assertNotIn("momentum_buffer", optimizer.state[parameter])
 
+    def test_dfedavgm_can_keep_a_non_sgd_optimizer_state_when_requested(self):
+        parameter = nn.Parameter(torch.tensor([1.0]))
+        optimizer = torch.optim.AdamW([parameter], lr=0.1)
+        parameter.grad = torch.tensor([2.0])
+        optimizer.step()
+        optimizer_state = optimizer.state[parameter]
+        self.assertIn("exp_avg", optimizer_state)
+
+        DFedAvgMAverager(
+            enforce_heavy_ball_sgd=False,
+        ).on_after_averaging(optimizer)
+
+        self.assertIn("exp_avg", optimizer_state)
+
     def test_common_label_distributions(self):
         parameters = RuntimeParameters()
         parameters.dataset_label = list(range(5))

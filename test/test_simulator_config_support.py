@@ -22,6 +22,7 @@ from py_src.model_average import (
     ModelAverager,
     StandardModelAverager,
 )
+from py_src.model_variance_correct import VarianceCorrectionType, VarianceCorrector
 from py_src.ml_setup_dataset.dataset_intermediate_layer import (
     DatasetWithFastLabelSelection,
     LabelProbabilitySampler,
@@ -214,6 +215,31 @@ class SimulatorConfigSupportTest(unittest.TestCase):
 
         self.assertEqual(output["weight"].item(), 3.5)
         self.assertEqual(averager.get_model_count(), 0)
+
+    def test_dfedavgm_supports_variance_correction(self):
+        corrector = VarianceCorrector(VarianceCorrectionType.FollowOthers)
+        averager = DFedAvgMAverager(variance_corrector=corrector)
+        averager.add_model({"weight": torch.tensor([-3.0, 3.0])})
+        averager.add_model({"weight": torch.tensor([-5.0, 5.0])})
+
+        output = averager.get_model(
+            self_model={"weight": torch.tensor([-1.0, 1.0])},
+        )
+
+        mixed = torch.tensor([-3.0, 3.0])
+        neighbor_variances = [
+            torch.var(torch.tensor([-3.0, 3.0])).item(),
+            torch.var(torch.tensor([-5.0, 5.0])).item(),
+        ]
+        target_variance = sum(neighbor_variances) / len(neighbor_variances)
+        expected = VarianceCorrector.scale_tensor_to_variance(
+            mixed,
+            target_variance,
+        )
+        torch.testing.assert_close(output["weight"], expected)
+        self.assertEqual(averager.get_model_count(), 0)
+        self.assertEqual(corrector.model_counter, 0)
+        self.assertIsNone(corrector.variance_record)
 
     def test_dfedavgm_resets_local_sgd_momentum_after_averaging(self):
         parameter = nn.Parameter(torch.tensor([1.0]))

@@ -249,6 +249,10 @@ class DFedAvgMAverager(ModelAverager):
     optimizer; it is intentionally not applied to model deltas here. Set
     ``enforce_heavy_ball_sgd=False`` to use only DFedAvgM's mixing step with a
     different local training recipe. In that mode, optimizer state is kept.
+
+    When a variance corrector is supplied, correction is applied after mixing.
+    Correction modes that include the local model use DFedAvgM's effective
+    local mixing weight.
     """
 
     def __init__(
@@ -259,8 +263,6 @@ class DFedAvgMAverager(ModelAverager):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        if self.variance_corrector is not None:
-            raise ValueError("DFedAvgM does not include variance correction")
         if self_weight is not None and not 0.0 <= self_weight <= 1.0:
             raise ValueError("self_weight must be between 0 and 1")
         self.self_weight = self_weight
@@ -282,14 +284,17 @@ class DFedAvgMAverager(ModelAverager):
                     check_same_keys=False,
                 )
             self.model_counter += 1
+            if self.variance_corrector is not None:
+                self.variance_corrector.add_variance(model_stat)
 
     def get_model(self, self_model: dict, *args, **kwargs) -> dict:
         assert self.model_buffer is not None
         assert self.model_counter > 0
         with torch.no_grad():
             device = ModelAverager._get_device_from_model_stat(self.model_buffer)
+            self_model = copy.deepcopy(self_model)
+            ModelAverager._move_state_dict(self_model, device)
             output = copy.deepcopy(self_model)
-            ModelAverager._move_state_dict(output, device)
 
             if self.self_weight is None:
                 local_weight = 1.0 / (self.model_counter + 1)
@@ -304,6 +309,21 @@ class DFedAvgMAverager(ModelAverager):
                     output[layer_name] * local_weight
                     + self.model_buffer[layer_name] * neighbor_weight
                 )
+
+            if self.variance_corrector is not None:
+                target_variance = self.variance_corrector.get_variance(
+                    self_model,
+                    local_weight,
+                )
+                for layer_name, single_layer_variance in target_variance.items():
+                    if is_ignored_layer_variance_correction(layer_name):
+                        continue
+                    if layer_name not in output:
+                        continue
+                    output[layer_name] = VarianceCorrector.scale_tensor_to_variance(
+                        output[layer_name],
+                        single_layer_variance,
+                    )
 
             self.model_buffer = None
             self.model_counter = 0

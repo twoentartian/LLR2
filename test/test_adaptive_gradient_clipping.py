@@ -101,6 +101,11 @@ class AdaptiveGradientClippingTest(unittest.TestCase):
         )
 
         self.assertIsInstance(averager, DFedAvgMAverager)
+        self.assertIsNotNone(averager.variance_corrector)
+        self.assertEqual(
+            averager.variance_corrector.variance_correction_type,
+            cct_agc_config.preset_variance_correction,
+        )
         model.weight.grad = torch.full_like(model.weight, 10.0)
         optimizer.step()
         torch.testing.assert_close(

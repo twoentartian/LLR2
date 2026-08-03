@@ -152,6 +152,19 @@ class DSGTTest(unittest.TestCase):
                 torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9),
             )
 
+    def test_alternate_optimizer_can_be_enabled_explicitly(self):
+        model = _ScalarModel(1.0)
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=0.1,
+            weight_decay=0.5,
+        )
+        DSGTModelAverager(enforce_plain_sgd=False).attach(model, optimizer)
+
+        # Initial exchange suppression must also suppress AdamW weight decay.
+        _step_with_gradient(model, optimizer, [[99.0]])
+        torch.testing.assert_close(model.weight, torch.tensor([[1.0]]))
+
     def test_multiple_local_steps_before_communication_are_rejected(self):
         model = _ScalarModel(1.0)
         optimizer, _ = _make_dsgt_node(model)

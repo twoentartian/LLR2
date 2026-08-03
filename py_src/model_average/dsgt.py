@@ -39,7 +39,11 @@ class DSGTModelAverager(ModelAverager):
     Each node starts with an independently initialized model and zero tracker.
     The first optimizer step is suppressed so the first communication computes
     ``X[1] = W X[0]``. Subsequent task gradients are converted to
-    ``Y[k] = W Y[k-1] + G[k] - G[k-1]`` immediately before the plain-SGD step.
+    ``Y[k] = W Y[k-1] + G[k] - G[k-1]`` immediately before the optimizer step.
+    Plain SGD is enforced by default, which gives the ordinary DSGT model
+    recursion. Set ``enforce_plain_sgd=False`` to retain the tracker recursion
+    while applying it through another local optimizer. That is an empirical
+    optimizer variant and does not implement the paper's exact model update.
 
     If a variance corrector is supplied, it is applied only to the mixed model.
     The tracker is always mixed linearly and is never variance-corrected.
@@ -52,12 +56,14 @@ class DSGTModelAverager(ModelAverager):
         self,
         self_weight: Optional[float] = None,
         *args,
+        enforce_plain_sgd: bool = True,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         if self_weight is not None and not 0.0 <= self_weight <= 1.0:
             raise ValueError("self_weight must be between 0 and 1")
         self.self_weight = self_weight
+        self.enforce_plain_sgd = enforce_plain_sgd
 
         self.model_buffer: Optional[dict] = None
         self.tracker_buffer: Optional[dict] = None
@@ -77,9 +83,10 @@ class DSGTModelAverager(ModelAverager):
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
     ) -> "DSGTModelAverager":
-        """Attach DSGT to one model and its plain-SGD optimizer."""
+        """Attach DSGT to one model and its local optimizer."""
 
-        self._validate_optimizer(optimizer)
+        if self.enforce_plain_sgd:
+            self._validate_optimizer(optimizer)
         self.detach()
 
         optimizer_parameter_ids = {
@@ -251,8 +258,10 @@ class DSGTModelAverager(ModelAverager):
             )
         if self._initial_exchange_pending:
             for parameter in self._parameters.values():
-                if parameter.grad is not None:
-                    parameter.grad.zero_()
+                # ``grad = None`` suppresses the complete optimizer update,
+                # including AdamW's decoupled weight decay. A zero gradient
+                # would still change independently initialized model weights.
+                parameter.grad = None
             self._initial_exchange_pending = False
             self._has_stepped_since_communication = True
             return

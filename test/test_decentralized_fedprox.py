@@ -5,8 +5,11 @@ import unittest
 import torch
 from torch import nn
 
-from py_src.decentralized_fedprox import DecentralizedFedProxAverager
-from py_src.model_variance_correct import VarianceCorrectionType, VarianceCorrector
+from py_src.model_average import (
+    DecentralizedFedProxAverager,
+    VarianceCorrectionType,
+    VarianceCorrector,
+)
 
 
 class _ScalarModel(nn.Module):

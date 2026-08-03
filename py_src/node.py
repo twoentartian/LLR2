@@ -396,6 +396,14 @@ class Node:
             for key, value in self.model.state_dict().items()
         }
 
+    def get_communication_payload(self) -> dict:
+        """Return model state plus any algorithm-specific auxiliary state."""
+
+        model_stat = self.get_model_stat()
+        if self.model_averager is None:
+            return model_stat
+        return self.model_averager.get_communication_payload(model_stat)
+
     def add_model_to_buffer(self, model_stat: dict) -> None:
         if self.enable_receiving and self.model_averager is not None:
             self.model_averager.add_model(model_stat)

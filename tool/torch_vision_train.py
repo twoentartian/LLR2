@@ -16,7 +16,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from py_src import model_variance_correct
+from py_src.model_average import VarianceCorrectionType, VarianceCorrector
 from py_src import special_torch_layers
 from py_src.ml_setup_dataset.dataset_default import imagenet1k_path
 from py_src.model_opti_save_load import load_model_state_file
@@ -71,9 +71,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, arg
 
     target_variance = None
     if variance_correction:
-        variance_record = model_variance_correct.VarianceCorrector(
-            model_variance_correct.VarianceCorrectionType.FollowOthers
-        )
+        variance_record = VarianceCorrector(VarianceCorrectionType.FollowOthers)
         variance_record.add_variance(model.state_dict())
         target_variance = variance_record.get_variance()
 
@@ -101,7 +99,7 @@ def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, arg
 
         if variance_correction and target_variance is not None:
             ignore_layer_list = [] if variance_correction_on_norm else train_one_epoch.all_norm_layer_names
-            target_model_state_dict = model_variance_correct.VarianceCorrector.scale_model_stat_to_variance(
+            target_model_state_dict = VarianceCorrector.scale_model_stat_to_variance(
                 model.state_dict(), target_variance, ignore_layer_list=ignore_layer_list
             )
             model.load_state_dict(target_model_state_dict)

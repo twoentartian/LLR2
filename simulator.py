@@ -280,7 +280,7 @@ def simulation_phase_averaging(runtime_parameters: RuntimeParameters) -> None:
         if not node_target.is_sending_model():
             continue
 
-        model_stat = node_target.get_model_stat()
+        model_stat = node_target.get_communication_payload()
         if getattr(runtime_parameters, "average_on_cpu", False):
             model_stat = {
                 key: value.detach().cpu()

@@ -1,4 +1,4 @@
-"""Variance correction utilities.
+"""Variance correction utilities for model averaging.
 
 Ported from DFL_torch/py_src/model_variance_correct.py.
 """

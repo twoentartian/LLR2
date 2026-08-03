@@ -20,7 +20,7 @@ import torch
 from torch import nn
 from torch.utils.hooks import RemovableHandle
 
-from py_src.model_average import DFedAvgMAverager
+from .dfedavgm import DFedAvgMAverager
 
 
 class DecentralizedFedProxAverager(DFedAvgMAverager):

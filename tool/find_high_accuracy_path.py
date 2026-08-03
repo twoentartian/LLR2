@@ -55,7 +55,7 @@ from py_src.model_opti_save_load import (
     save_model_state,
     save_optimizer_state,
 )
-from py_src.model_variance_correct import VarianceCorrectionType, VarianceCorrector
+from py_src.model_average import VarianceCorrectionType, VarianceCorrector
 from py_src.service import (
     record_consecutive_linear_interpolation,
     record_cosine_similarity,

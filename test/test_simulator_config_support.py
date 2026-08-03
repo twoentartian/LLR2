@@ -21,8 +21,9 @@ from py_src.model_average import (
     DFedAvgMAverager,
     ModelAverager,
     StandardModelAverager,
+    VarianceCorrectionType,
+    VarianceCorrector,
 )
-from py_src.model_variance_correct import VarianceCorrectionType, VarianceCorrector
 from py_src.ml_setup_dataset.dataset_intermediate_layer import (
     DatasetWithFastLabelSelection,
     LabelProbabilitySampler,

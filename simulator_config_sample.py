@@ -8,7 +8,7 @@ import torch
 from py_src import ml_setup, model_average, node
 from py_src.config_file_util import label_distribution
 from py_src.ml_setup import MLSetup
-from py_src.model_variance_correct import VarianceCorrectionType, VarianceCorrector
+from py_src.model_average import VarianceCorrectionType, VarianceCorrector
 from py_src.service.record_test_accuracy_loss import ServiceTestAccuracyLossRecorder
 from py_src.service.record_training_loss_accuracy import (
     ServiceTrainingLossAccuracyRecorder,

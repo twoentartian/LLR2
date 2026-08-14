@@ -392,12 +392,99 @@ def _create_device(device_name: str, force_use_cpu: bool) -> Device:
     return Device(device_name)
 
 
+def _create_shared_training_loader(
+    training_dataset: DatasetWithFastLabelSelection,
+    ml_setup: MLSetup,
+    config_file,
+    device: Device,
+    *,
+    use_dali: bool,
+    dali_device_id: int,
+):
+    """Create the simulator's common PyTorch or DALI training loader."""
+
+    shared_worker_count = getattr(
+        config_file,
+        "preset_shared_training_loader_workers",
+        0,
+    )
+    shared_prefetch_factor = getattr(
+        config_file,
+        "preset_shared_training_loader_prefetch_factor",
+        2,
+    )
+
+    if use_dali:
+        if device.device.type != "cuda":
+            raise ValueError("DALI simulator loading requires a CUDA device")
+        torch_device_id = (
+            device.device.index
+            if device.device.index is not None
+            else torch.cuda.current_device()
+        )
+        if int(dali_device_id) != int(torch_device_id):
+            raise ValueError(
+                f"DALI device cuda:{dali_device_id} must match the simulation "
+                f"device cuda:{torch_device_id}"
+            )
+        if not training_dataset.supports_shared_loading:
+            raise ValueError(
+                "DALI simulator loading requires a map-style training dataset "
+                "without an override loader"
+            )
+
+        from py_src.shared_dataloader_dali import DaliSharedDataLoader
+
+        dali_threads = getattr(
+            config_file,
+            "preset_dali_num_threads",
+            max(1, int(shared_worker_count)),
+        )
+        dali_seed = getattr(config_file, "preset_dali_seed", -1)
+        loader = DaliSharedDataLoader(
+            training_dataset.raw_dataset,
+            ml_setup,
+            device_id=int(dali_device_id),
+            num_threads=int(dali_threads),
+            seed=int(dali_seed),
+        )
+        SIMULATOR_LOGGER.info(
+            "NVIDIA DALI shared training loader enabled on cuda:%s with %s thread(s)",
+            dali_device_id,
+            dali_threads,
+        )
+        return loader
+
+    if training_dataset.supports_shared_loading:
+        loader = SharedDataLoader(
+            training_dataset.raw_dataset,
+            num_workers=shared_worker_count,
+            collate_fn=ml_setup.collate_fn,
+            pin_memory=True,
+            prefetch_factor=shared_prefetch_factor,
+        )
+        SIMULATOR_LOGGER.info(
+            "shared training DataLoader workers: %s, prefetch factor: %s",
+            shared_worker_count,
+            shared_prefetch_factor,
+        )
+        return loader
+
+    SIMULATOR_LOGGER.info(
+        "training dataset requires its dedicated loader backend; "
+        "shared DataLoader is disabled"
+    )
+    return None
+
+
 def main(
     config_file_path: str,
     output_folder_name: Optional[str] = None,
     *,
     device_name: str = DEFAULT_DEVICE,
     enable_amp: bool = False,
+    use_dali: bool = False,
+    dali_device_id: int = 0,
 ) -> None:
     config_file = load_configuration(config_file_path)
     output_folder_path = _resolve_output_folder(config_file, output_folder_name)
@@ -442,35 +529,14 @@ def main(
 
     training_dataset = DatasetWithFastLabelSelection(config_ml_setup.training_data, config_ml_setup)
 
-    shared_worker_count = getattr(
+    runtime_parameters.shared_training_loader = _create_shared_training_loader(
+        training_dataset,
+        config_ml_setup,
         config_file,
-        "preset_shared_training_loader_workers",
-        0,
+        device,
+        use_dali=use_dali,
+        dali_device_id=dali_device_id,
     )
-    shared_prefetch_factor = getattr(
-        config_file,
-        "preset_shared_training_loader_prefetch_factor",
-        2,
-    )
-    if training_dataset.supports_shared_loading:
-        runtime_parameters.shared_training_loader = SharedDataLoader(
-            training_dataset.raw_dataset,
-            num_workers=shared_worker_count,
-            collate_fn=config_ml_setup.collate_fn,
-            pin_memory=True,
-            prefetch_factor=shared_prefetch_factor,
-        )
-        SIMULATOR_LOGGER.info(
-            "shared training DataLoader workers: %s, prefetch factor: %s",
-            shared_worker_count,
-            shared_prefetch_factor,
-        )
-    else:
-        runtime_parameters.shared_training_loader = None
-        SIMULATOR_LOGGER.info(
-            "training dataset requires its dedicated loader backend; "
-            "shared DataLoader is disabled"
-        )
 
     runtime_parameters.node_container = {}
     for single_node in sorted(nodes_set):
@@ -536,7 +602,28 @@ if __name__ == "__main__":
     parser.add_argument("-T", "--thread", default=1, type=int, help="specify the number of thread for pytorch")
     parser.add_argument("--device", default=DEFAULT_DEVICE, help='device to use: "auto", "cpu", "cuda", or "cuda:0"')
     parser.add_argument("--amp", action="store_true", help="enable automatic mixed precision on CUDA")
+    parser.add_argument(
+        "--dali",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="cache supported MNIST/CIFAR training images on GPU and augment with NVIDIA DALI",
+    )
+    parser.add_argument(
+        "--dali-device-id",
+        "--dali_device_id",
+        dest="dali_device_id",
+        type=int,
+        default=0,
+        help="CUDA device id used by the simulator DALI pipeline",
+    )
     args = parser.parse_args()
 
     torch.set_num_threads(args.thread)
-    main(args.config, args.output_folder_name, device_name=args.device, enable_amp=args.amp)
+    main(
+        args.config,
+        args.output_folder_name,
+        device_name=args.device,
+        enable_amp=args.amp,
+        use_dali=args.dali,
+        dali_device_id=args.dali_device_id,
+    )

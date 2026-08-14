@@ -42,7 +42,7 @@ def resnet18_cifar10(override_dataset:Optional[DatasetSetup]=None, use_gn=False)
 def resnet18_cifar100(override_dataset:Optional[DatasetSetup]=None, use_gn=False) -> MLSetup:
     ds = dataset_cifar100() if override_dataset is None else override_dataset
     mt = ModelType.resnet18_bn if use_gn is False else ModelType.resnet18_gn
-    return _resnet18_cifar(10, ds, mt, use_gn)
+    return _resnet18_cifar(100, ds, mt, use_gn)
 
 
 

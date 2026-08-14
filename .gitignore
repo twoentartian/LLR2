@@ -14,3 +14,5 @@ imagenet1k_adversarial
 imagenet1k_latent_adversarial
 find_high_accuracy_path_config.py
 tool/print_layer_order_output/*
+config/*
+simulator_config_*.py

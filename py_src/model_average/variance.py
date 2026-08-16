@@ -23,16 +23,18 @@ class VarianceCorrectionType(enum.Enum):
 class VarianceCorrector:
     def __init__(self, variance_correction_type: VarianceCorrectionType):
         self.variance_correction_type = variance_correction_type
-        self.variance_record: Optional[Dict[str, float]] = None
+        self.variance_record: Optional[Dict[str, torch.Tensor]] = None
         self.model_counter: int = 0
 
     # ------------------------------------------------------------------
 
     @staticmethod
-    def calculate_variance_for_tensor(tensor: torch.Tensor) -> float:
-        if tensor.numel() == 1:
-            return 0.0
-        return torch.var(tensor).item()
+    def calculate_variance_for_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        """Return variance without synchronizing a CUDA tensor with the CPU."""
+        with torch.no_grad():
+            if tensor.numel() == 1:
+                return tensor.new_zeros(())
+            return torch.var(tensor)
 
     def add_variance(self, model_stat: dict) -> None:
         if self.variance_correction_type in (
@@ -40,19 +42,21 @@ class VarianceCorrector:
             VarianceCorrectionType.FollowOthers,
         ):
             if self.variance_record is None:
-                self.variance_record = {name: 0.0 for name in model_stat}
+                self.variance_record = {
+                    name: param.new_zeros(()) for name, param in model_stat.items()
+                }
             for name, param in model_stat.items():
                 if is_ignored_layer_variance_correction(name):
                     continue
-                self.variance_record[name] += self.calculate_variance_for_tensor(param)
+                self.variance_record[name].add_(self.calculate_variance_for_tensor(param))
             self.model_counter += 1
 
     def get_variance(
         self,
         self_model_stat: Optional[dict] = None,
         conservative: Optional[float] = None,
-    ) -> Dict[str, float]:
-        output: Dict[str, float] = {}
+    ) -> Dict[str, torch.Tensor]:
+        output: Dict[str, torch.Tensor] = {}
 
         if self.variance_correction_type == VarianceCorrectionType.FollowSelfVariance:
             assert self_model_stat is not None and conservative is not None
@@ -79,7 +83,10 @@ class VarianceCorrector:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def scale_tensor_to_variance(layer_tensor: torch.Tensor, target_variance: float) -> torch.Tensor:
+    def scale_tensor_to_variance(
+        layer_tensor: torch.Tensor,
+        target_variance: float | torch.Tensor,
+    ) -> torch.Tensor:
         epsilon = 1e-4
         with torch.no_grad():
             if layer_tensor.numel() == 1:
@@ -92,7 +99,7 @@ class VarianceCorrector:
     @staticmethod
     def scale_model_stat_to_variance(
         model_stat: dict,
-        target_variance: Dict[str, float],
+        target_variance: Dict[str, float | torch.Tensor],
         ignore_layer_list: Optional[list] = None,
     ) -> dict:
         out = copy.deepcopy(model_stat)

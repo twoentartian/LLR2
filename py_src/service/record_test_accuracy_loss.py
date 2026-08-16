@@ -217,9 +217,15 @@ class ServiceTestAccuracyLossRecorder(Service):
         )
 
     def trigger(self, parameters: RuntimeParameters, *args, **kwargs):
-        if parameters.phase in self.phase_to_record:
-            stats = {n: parameters.node_container[n].get_model_stat() for n in self.node_order}  # type: ignore
-            self.trigger_without_runtime_parameters(parameters.current_tick, stats, parameters.phase.name)
+        if parameters.phase not in self.phase_to_record:
+            return
+        # get_model_stat() clones every tensor in a node's state dict.  Check the
+        # recording interval before doing that work so non-recording ticks do not
+        # copy every model on the GPU only to discard the copies immediately.
+        if parameters.current_tick % self.interval != 0:
+            return
+        stats = {n: parameters.node_container[n].get_model_stat() for n in self.node_order}  # type: ignore
+        self.trigger_without_runtime_parameters(parameters.current_tick, stats, parameters.phase.name)
 
     # ---- standalone interface -----------------------------------------------
 

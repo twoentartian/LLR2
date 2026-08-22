@@ -278,6 +278,12 @@ def _build(mt: ModelType, dt, preset: int, device, *, use_dali: bool = False, da
             return cct_7_3x1_cifar100()
         raise _nie(mt, dt)
 
+    elif mt == ModelType.cct_14_7x2_224:
+        from .cct import cct14_7x2_imagenet1k
+        if _default or dt == DatasetType.imagenet1k:
+            return cct14_7x2_imagenet1k()
+        raise _nie(mt, dt)
+    
     elif mt == ModelType.dla_46_c:
         from .dla import dla46c_imagenet10
         if _default or dt == DatasetType.imagenet10:

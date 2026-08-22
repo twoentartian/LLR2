@@ -1350,7 +1350,8 @@ class FindHighAccuracyPathRunner:
             child_logger.info("record_model_service is disabled")
 
         if not runtime_parameter.service_test_accuracy_loss_disable:
-            test_dataset_interval = max(1, general_parameter.test_dataset_interval or 10)
+            test_dataset_interval = runtime_parameter.service_test_accuracy_loss_interval
+            test_dataset_interval = max(1, general_parameter.test_dataset_interval or 10) if test_dataset_interval is None else test_dataset_interval
             self.record_test_accuracy_loss_service = record_test_accuracy_loss.ServiceTestAccuracyLossRecorder(
                 interval=test_dataset_interval,
                 test_batch_size=runtime_parameter.service_test_accuracy_loss_batch_size,

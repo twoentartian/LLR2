@@ -11,6 +11,20 @@ from .dataset_types import DatasetSetup
 _type_mean_std = Optional[tuple[tuple[float, float, float], tuple[float, float, float]]]
 _type_transform = Callable[[Any], Any]
 
+
+def dataset_cifar10_bnn():
+    """Use all 50k training images with upstream BinaryNet preprocessing."""
+    train_transforms = [
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(32, padding=4, padding_mode="edge"),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ]
+    return dataset_cifar10(
+        transforms_training=train_transforms,
+        mean_std=((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    )
+
 """ CIFAR10 """
 def dataset_cifar10(rescale_to_224=False, transforms_training:Optional[List[_type_transform]]=None, transforms_testing:Optional[List[_type_transform]]=None, 
                     mean_std:_type_mean_std =None, augmentation=True, *args, **kwargs):

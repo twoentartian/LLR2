@@ -43,3 +43,4 @@ class ModelType(Enum):
     ddpm_flowers102 = auto()
     nanoclip_default = auto()
     transformer_for_grokking = auto()
+    bnn = auto()

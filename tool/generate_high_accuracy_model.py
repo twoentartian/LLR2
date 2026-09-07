@@ -7,7 +7,6 @@ import math
 import os
 import random
 import sys
-from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Optional, TypeAlias, cast
 
@@ -16,7 +15,6 @@ import numpy.typing as npt
 import torch
 from PIL import Image
 import lightning as L
-from tqdm.auto import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -121,25 +119,6 @@ def maybe_enable_torch_compile(
             child_logger.info("torch.compile returned a non-Module wrapper; using the original module")
     except Exception as exc:
         child_logger.info("torch.compile skipped: %s", exc)
-
-
-class _ProgressIterable:
-    def __init__(self, iterable, progress_bar):
-        self._iterable = iterable
-        self._progress_bar = progress_bar
-
-    def __iter__(self):
-        for batch in self._iterable:
-            yield batch
-            self._progress_bar.update(1)
-
-
-def _should_enable_progress_bar(arg_worker_count: int) -> bool:
-    if arg_worker_count != 1:
-        return False
-    # sbatch and redirected logs are typically non-interactive; avoid
-    # emitting tqdm control characters into those outputs.
-    return sys.stderr.isatty()
 
 
 def _move_nested_tensors_to_cpu(value: Any) -> Any:
@@ -262,52 +241,6 @@ def save_training_checkpoint(
     temp_path = f"{path}.tmp"
     torch.save(checkpoint, temp_path)
     os.replace(temp_path, path)
-
-
-def maybe_save_best_training_models(
-    *,
-    output_folder: str,
-    index: int,
-    digit_width: int,
-    model: torch.nn.Module,
-    model_type_name: str,
-    dataset_type_name: str,
-    epoch: int,
-    training_loss: float,
-    training_accuracy: Optional[float],
-    best_training_loss: Optional[float],
-    best_training_accuracy: Optional[float],
-    child_logger: logging.Logger,
-) -> tuple[Optional[float], Optional[float]]:
-    if best_training_loss is None or training_loss < best_training_loss:
-        best_loss_path = os.path.join(
-            output_folder,
-            f"{str(index).zfill(digit_width)}.best_training_loss.model.pt",
-        )
-        save_model_state(best_loss_path, model.state_dict(), model_type_name, dataset_type_name)
-        best_training_loss = training_loss
-        child_logger.info(
-            "saved best-training-loss model at epoch %d with loss %.6f",
-            epoch,
-            training_loss,
-        )
-
-    if training_accuracy is not None and (
-        best_training_accuracy is None or training_accuracy > best_training_accuracy
-    ):
-        best_accuracy_path = os.path.join(
-            output_folder,
-            f"{str(index).zfill(digit_width)}.best_training_accuracy.model.pt",
-        )
-        save_model_state(best_accuracy_path, model.state_dict(), model_type_name, dataset_type_name)
-        best_training_accuracy = training_accuracy
-        child_logger.info(
-            "saved best-training-accuracy model at epoch %d with accuracy %.6f",
-            epoch,
-            training_accuracy,
-        )
-
-    return best_training_loss, best_training_accuracy
 
 
 def load_training_checkpoint(path: str) -> dict[str, Any]:
@@ -575,43 +508,24 @@ def training_model(
 
     maybe_enable_torch_compile(model, adapter, device, child_logger, arg_compile)
 
-    progress_enabled = _should_enable_progress_bar(arg_worker_count)
-    if arg_worker_count == 1 and not progress_enabled:
-        child_logger.info("progress bar disabled for non-interactive output")
-
     checkpoint_run_config = copy.deepcopy(run_config)
     checkpoint_run_config["epoch_override"] = arg_epoch_override
-    best_training_loss: Optional[float] = None
-    best_training_accuracy: Optional[float] = None
 
     for epoch in range(start_epoch, epochs):
         train_sampler = getattr(dataloader, "sampler", None)
         if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
 
-        progress_context = tqdm(
-            total=steps_per_epoch,
-            desc=f"epoch {epoch + 1}/{epochs}",
-            unit="batch",
-            dynamic_ncols=True,
-            leave=True,
-        ) if progress_enabled else nullcontext()
-        with progress_context as progress_bar:
-            train_iterable = (
-                _ProgressIterable(dataloader, progress_bar)
-                if progress_enabled and progress_bar is not None
-                else dataloader
-            )
-            train_result = train(
-                adapter,
-                train_iterable,
-                optimizer, # type: ignore
-                lr_scheduler, # type: ignore
-                device=device,
-                scaler=scaler,
-                gradient_accumulate_every=arg_ml_setup.gradient_accumulate_every,
-                max_grad_norm=arg_ml_setup.max_grad_norm,
-            ) # type: ignore
+        train_result = train(
+            adapter,
+            dataloader,
+            optimizer, # type: ignore
+            lr_scheduler, # type: ignore
+            device=device,
+            scaler=scaler,
+            gradient_accumulate_every=arg_ml_setup.gradient_accumulate_every,
+            max_grad_norm=arg_ml_setup.max_grad_norm,
+        ) # type: ignore
 
         lrs = [pg["lr"] for pg in optimizer.param_groups] # type: ignore
 
@@ -641,21 +555,6 @@ def training_model(
                 f"{val_result.avg_loss:.3e},{val_acc:.4e},{lrs}\n"
             )
         log_csv.flush()
-
-        best_training_loss, best_training_accuracy = maybe_save_best_training_models(
-            output_folder=output_folder,
-            index=index,
-            digit_width=digit_width,
-            model=model,
-            model_type_name=arg_ml_setup.model_type.name,
-            dataset_type_name=arg_ml_setup.dataset_type.name,
-            epoch=epoch,
-            training_loss=train_result.avg_loss,
-            training_accuracy=train_result.accuracy,
-            best_training_loss=best_training_loss,
-            best_training_accuracy=best_training_accuracy,
-            child_logger=child_logger,
-        )
 
         if ckpt_folder is not None and epoch % arg_save_interval == 0:
             ckpt_path = os.path.join(ckpt_folder, f"epoch{epoch}.pt")

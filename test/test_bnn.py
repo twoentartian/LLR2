@@ -159,8 +159,9 @@ class TestBNN(unittest.TestCase):
             path = str(Path(folder) / "0/training_checkpoint.pt")
             first = load_training_checkpoint(path)
             self.assertEqual(first["next_epoch"], 1)
-            self.assertIn("best_validation_accuracy", first["run_config"])
-            self.assertTrue((Path(folder) / "0.best_validation_accuracy.model.pt").is_file())
+            self.assertTrue((Path(folder) / "0.model.pt").is_file())
+            self.assertTrue((Path(folder) / "0.optimizer.pt").is_file())
+            self.assertFalse(list(Path(folder).glob("*.best_training_*.model.pt")))
             latent = first["state_dict"]["conv1.weight"]
             self.assertTrue(((latent != -1) & (latent != 1)).any())
 

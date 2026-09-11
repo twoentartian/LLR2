@@ -58,6 +58,12 @@ def _build(mt: ModelType, dt, preset: int, device, *, use_dali: bool = False, da
             return bnn_cifar10()
         raise _nie(mt, dt)
 
+    elif mt == ModelType.bnn_floating:
+        from .bnn import bnn_floating_cifar10
+        if _default or dt == DatasetType.cifar10:
+            return bnn_floating_cifar10()
+        raise _nie(mt, dt)
+
     elif mt == ModelType.lenet5:
         from .lenet import lenet5_mnist
         if _default or dt == DatasetType.mnist:

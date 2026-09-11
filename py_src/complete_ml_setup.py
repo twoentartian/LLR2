@@ -48,6 +48,16 @@ class FastTrainingSetup:
             scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=0.1)
             return optimizer, scheduler, 500
 
+        if mt == ModelType.bnn_floating:
+            if dt != DatasetType.cifar10 or preset not in (0, 1):
+                raise err
+            if override_steps_per_epoch is None:
+                steps_per_epoch = math.ceil(len(training_data) / batch_size)
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.001, betas=(0.9, 0.999), weight_decay=0)
+            milestones = [(epoch - 1) * steps_per_epoch for epoch in (100, 200, 300, 400)]
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones, gamma=0.1)
+            return optimizer, scheduler, 500
+
         elif mt in (ModelType.lenet5, ModelType.lenet4):
             if dt == DatasetType.mnist:
                 optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)

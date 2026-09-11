@@ -44,3 +44,4 @@ class ModelType(Enum):
     nanoclip_default = auto()
     transformer_for_grokking = auto()
     bnn = auto()
+    bnn_floating = auto()

@@ -52,6 +52,29 @@ class BinaryLinear(nn.Linear):
         return F.linear(value, binarize(self.weight), self.bias)
 
 
+class FloatingConv2d(nn.Conv2d):
+    """Floating-point convolution with the BNN layer's edge padding."""
+
+    def reset_parameters(self):
+        nn.init.xavier_normal_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+    def forward(self, value):
+        if self.padding != (0, 0):
+            value = F.pad(value, self._reversed_padding_repeated_twice, mode="replicate")
+        return F.conv2d(value, self.weight, self.bias, self.stride, 0, self.dilation, self.groups)
+
+
+class FloatingLinear(nn.Linear):
+    """Floating-point counterpart of :class:`BinaryLinear`."""
+
+    def reset_parameters(self):
+        nn.init.xavier_normal_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
 class VGGNet7Binary(nn.Module):
     """Six binary convolutions and three binary linear layers, no biases."""
 
@@ -66,6 +89,36 @@ class VGGNet7Binary(nn.Module):
         self.fc1 = BinaryLinear(512 * 3 * 3, 1024, bias=False)
         self.fc2 = BinaryLinear(1024, 1024, bias=False)
         self.fc3 = BinaryLinear(1024, 10, bias=False)
+        self.bn7 = nn.BatchNorm1d(1024)
+        self.bn8 = nn.BatchNorm1d(1024)
+        self.bn9 = nn.BatchNorm1d(10, affine=False)
+
+    def forward(self, value):
+        for i in range(1, 7):
+            value = getattr(self, f"conv{i}")(value)
+            if i in (2, 4, 6):
+                value = F.max_pool2d(value, 2)
+            value = binarize(F.hardtanh(getattr(self, f"bn{i}")(value)))
+        value = value.flatten(1)
+        value = binarize(F.hardtanh(self.bn7(self.fc1(value))))
+        value = binarize(F.hardtanh(self.bn8(self.fc2(value))))
+        return self.bn9(self.fc3(value))
+
+
+class VGGNet7Floating(nn.Module):
+    """VGGNet7 with floating-point weights and BNN binary activations."""
+
+    def __init__(self):
+        super().__init__()
+        channels = (3, 128, 128, 256, 256, 512, 512)
+        for i in range(1, 7):
+            setattr(self, f"conv{i}", FloatingConv2d(
+                channels[i - 1], channels[i], 3, padding=0 if i == 1 else 1, bias=False,
+            ))
+            setattr(self, f"bn{i}", nn.BatchNorm2d(channels[i]))
+        self.fc1 = FloatingLinear(512 * 3 * 3, 1024, bias=False)
+        self.fc2 = FloatingLinear(1024, 1024, bias=False)
+        self.fc3 = FloatingLinear(1024, 10, bias=False)
         self.bn7 = nn.BatchNorm1d(1024)
         self.bn8 = nn.BatchNorm1d(1024)
         self.bn9 = nn.BatchNorm1d(10, affine=False)

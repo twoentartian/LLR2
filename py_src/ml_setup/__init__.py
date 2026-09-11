@@ -4,7 +4,7 @@ from py_src.ml_setup_model import ModelType
 from py_src.ml_setup_dataset import DatasetType
 
 from .alexnet import alexnet_imagenet1k
-from .bnn import bnn_cifar10
+from .bnn import bnn_cifar10, bnn_floating_cifar10
 from .convnext import conveNeXt_tiny_imagenet1k, convnext_tiny_imagenet1k
 from .densenet import densenet121_cifar10, densenet121_imagenet1k, densenet_cifar_cifar10
 from .dla import dla_cifar10, dla_cifar100, dla46c_imagenet10
@@ -41,6 +41,7 @@ __all__ = [
     "get_ml_setup_from_config", "MLSetup", "MlSetup", "ApplicationType", "ModelType", "DatasetType",
     "alexnet_imagenet1k",
     "bnn_cifar10",
+    "bnn_floating_cifar10",
     "conveNeXt_tiny_imagenet1k", "convnext_tiny_imagenet1k",
     "densenet121_cifar10", "densenet121_imagenet1k", "densenet_cifar_cifar10",
     "dla_cifar10", "dla_cifar100", "dla46c_imagenet10",

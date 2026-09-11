@@ -12,15 +12,19 @@ from torch.nn import functional as F
 from torch.utils.data import TensorDataset
 
 from py_src.complete_ml_setup import FastTrainingSetup
-from py_src.ml_setup import bnn_cifar10, get_ml_setup_from_config
+from py_src.ml_setup import bnn_cifar10, bnn_floating_cifar10, get_ml_setup_from_config
 from py_src.ml_setup.dataloader_util import DataloaderConfig
 from py_src.ml_setup_dataset import DatasetSetup, DatasetType
 from py_src.ml_setup_dataset.dataset_cifar import dataset_cifar10_bnn
+from py_src.ml_setup_model import ModelType
 from py_src.ml_setup_model.bnn import (
     BinaryAdam,
     BinaryConv2d,
     BinaryLinear,
+    FloatingConv2d,
+    FloatingLinear,
     VGGNet7Binary,
+    VGGNet7Floating,
     binarize,
 )
 from py_src.util import re_initialize_model
@@ -104,6 +108,29 @@ class TestBNN(unittest.TestCase):
             setup, BinaryLinear(2, 2, bias=False), override_dataset=range(50000),
         )
         self.assertEqual(sorted(scheduler.milestones), [99000, 199000, 299000, 399000])
+
+    def test_floating_model_factory_and_weights(self):
+        data = TensorDataset(torch.randn(4, 3, 32, 32), torch.arange(4))
+        setup = bnn_floating_cifar10(DatasetSetup(DatasetType.cifar10, data, data))
+        self.assertIsInstance(setup.model, VGGNet7Floating)
+        self.assertEqual(setup.model_type, ModelType.bnn_floating)
+        self.assertEqual(setup.default_batch_size, 50)
+        self.assertEqual(len(setup.training_data), 4)
+        self.assertTrue(all(isinstance(module, FloatingConv2d | FloatingLinear)
+                            for module in setup.model.modules()
+                            if isinstance(module, (FloatingConv2d, FloatingLinear))))
+        self.assertFalse(any(isinstance(module, (BinaryConv2d, BinaryLinear))
+                             for module in setup.model.modules()))
+        self.assertTrue(all(not torch.all((parameter == -1) | (parameter == 1))
+                            for name, parameter in setup.model.named_parameters()
+                            if name.startswith(("conv", "fc"))))
+        optimizer, scheduler, epochs = FastTrainingSetup.get_optimizer_lr_scheduler_epoch(
+            setup, setup.model, override_steps_per_epoch=2,
+        )
+        self.assertIsInstance(optimizer, torch.optim.Adam)
+        self.assertNotIsInstance(optimizer, BinaryAdam)
+        self.assertEqual(epochs, 500)
+        self.assertEqual(sorted(scheduler.milestones), [198, 398, 598, 798])
 
     def test_dataset_uses_full_training_set_and_upstream_augmentation(self):
         train_data, test_data = range(50000), range(10000)

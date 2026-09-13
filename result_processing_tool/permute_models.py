@@ -7,7 +7,8 @@ Examples (from the repository root):
   python3 result_processing_tool/permute_models.py --reference A.model.pt \
       --models MODELS_DIRECTORY --output-dir aligned
 
-Built-in architecture specifications: bnn, lenet4, lenet5, lenet5_large_fc.
+Built-in architecture specifications: bnn, bnn_floating, lenet4, lenet5,
+lenet5_large_fc.
 They reuse the model classes used by ml_setup, without constructing datasets.
 Other architectures require --spec JSON; see README_model_comparison.md.
 
@@ -48,13 +49,14 @@ from result_processing_tool.model_weight_utils import (
 # reorder contiguous blocks on this axis with the named permutation.
 Axis = tuple[str, int] | None
 Spec = dict[str, list[Axis]]
-BUILTINS = ("bnn", "lenet4", "lenet5", "lenet5_large_fc")
+BUILTINS = ("bnn", "bnn_floating", "lenet4", "lenet5", "lenet5_large_fc")
 
 
 def make_model(model_type: str):
-    if model_type == "bnn":
-        from py_src.ml_setup_model.bnn import VGGNet7Binary
-        return VGGNet7Binary(), (3, 32, 32)
+    if model_type in ("bnn", "bnn_floating"):
+        from py_src.ml_setup_model.bnn import VGGNet7Binary, VGGNet7Floating
+        model_class = VGGNet7Binary if model_type == "bnn" else VGGNet7Floating
+        return model_class(), (3, 32, 32)
     from py_src.ml_setup_model.lenet import LeNet4, LeNet5, LeNet5LargeFc
     constructors = {"lenet4": LeNet4, "lenet5": LeNet5, "lenet5_large_fc": LeNet5LargeFc}
     if model_type not in constructors:
@@ -68,7 +70,7 @@ def builtin_spec(model_type: str, state: dict) -> Spec:
     if set(state) != set(expected) or any(state[k].shape != expected[k].shape for k in expected):
         raise ValueError(f"Checkpoint does not match the project's {model_type} architecture")
     spec = {key: [None] * value.ndim for key, value in state.items()}
-    if model_type == "bnn":
+    if model_type in ("bnn", "bnn_floating"):
         chain = [f"conv{i}" for i in range(1, 7)] + ["fc1", "fc2", "fc3"]
     else:
         chain = ["conv1", "conv2", "fc1", "fc2"]
@@ -85,7 +87,7 @@ def builtin_spec(model_type: str, state: dict) -> Spec:
             spec[f"{name}.weight"][1] = (previous, block)
         if f"{name}.bias" in spec:
             spec[f"{name}.bias"][0] = (group, 1) if group else None
-        if model_type == "bnn":
+        if model_type in ("bnn", "bnn_floating"):
             bn = f"bn{index + 1}"
             for suffix in ("weight", "bias", "running_mean", "running_var"):
                 key = f"{bn}.{suffix}"

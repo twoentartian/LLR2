@@ -71,7 +71,7 @@ python3 result_processing_tool/permute_models.py \
 每个 C 旁边有 `.model.json` 报告，包含来源、排列索引、迭代次数、是否收敛、
 对齐前后全模型参数 cosine，以及内置模型的 B/C 前向输出检查结果。
 
-内置支持 `bnn`、`lenet4`、`lenet5`、`lenet5_large_fc`，自动读取 checkpoint 的
+内置支持 `bnn`、`bnn_floating`、`lenet4`、`lenet5`、`lenet5_large_fc`，自动读取 checkpoint 的
 `model_name`。只有元信息缺失时才需 `--model-type`。
 构建模型时复用 `ml_setup` 使用的模型类，不构建完整数据集 setup。
 

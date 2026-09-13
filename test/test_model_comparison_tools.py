@@ -102,7 +102,7 @@ def test_matching_identity_and_monotonicity():
     assert report["parameter_cosine_after"] >= report["parameter_cosine_before"]
 
 
-@pytest.mark.parametrize("model_type", ["bnn", "lenet4", "lenet5", "lenet5_large_fc"])
+@pytest.mark.parametrize("model_type", ["bnn", "bnn_floating", "lenet4", "lenet5", "lenet5_large_fc"])
 def test_builtin_permutations_preserve_outputs(model_type):
     torch.manual_seed(5)
     model, _ = make_model(model_type)

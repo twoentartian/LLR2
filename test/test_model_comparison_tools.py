@@ -50,6 +50,8 @@ def test_pairwise_cli_means_and_pair_counts(tmp_path):
         }, "toy", "toy_data")
     pairs = tmp_path / "pairs.csv"
     cosine_main([str(tmp_path), "--pairs-file", str(pairs), "--block-size", "1"])
+    distribution = tmp_path / "layer_cosine_distribution.pdf"
+    assert distribution.read_bytes().startswith(b"%PDF")
     with (tmp_path / "layer_cosine_summary.csv").open() as handle:
         rows = list(csv.DictReader(handle))
     assert [row["layer"] for row in rows] == ["fc", "zero"]

@@ -32,6 +32,13 @@ def cct_7_3x1_cifar10(override_dataset:Optional[DatasetSetup]=None) -> MLSetup:
     return make_setup(model, ModelType.cct_7_3x1_32, ds, 128)
 
 
+def binary_attention_cct_7_3x1_cifar10(override_dataset:Optional[DatasetSetup]=None) -> MLSetup:
+    from py_src.ml_setup_model.bnn.binary_cct import binary_cct_7_3x1_32
+    ds = dataset_cifar10() if override_dataset is None else override_dataset
+    model = binary_cct_7_3x1_32()
+    return make_setup(model, ModelType.binary_attention_cct_7_3x1_32, ds, 128)
+
+
 def cct_7_3x1_cifar100(override_dataset:Optional[DatasetSetup]=None) -> MLSetup:
     import py_src.third_party.compact_transformers.src.cct as cct
     ds = dataset_cifar100() if override_dataset is None else override_dataset

@@ -12,20 +12,18 @@ python3 result_processing_tool/calculate_pairwise_layer_cosine.py \
   tool/high_accuracy_BNN
 ```
 
-默认输出 `tool/high_accuracy_BNN/layer_cosine_summary.csv`，一层一行。
+默认在输入目录输出以下三个文件：`layer_cosine_summary.csv`（一层一行的统计）、
+`layer_cosine_pairs.csv`（每一层、每一个模型 pair 的明细）和
+`layer_cosine_distribution.pdf`（一页 PDF，每个 layer 一个 histogram subplot）。
 N 个模型计算 N(N−1)/2 个不重复模型对：20 个模型为 190 对。
 `mean_cosine` 为这些 pair-wise cosine 的算术平均值，不是平均权重的 cosine。
 同时记录模型数、参数数、总 pair 数、有效/未定义 pair 数、总体标准差、最小值、最大值。
 任一模型该层范数为零时，该 pair 的 cosine 为 NaN，排除出平均值并计数；
 没有有效 pair 时统计值为 NaN。
 
-```bash
-python3 result_processing_tool/calculate_pairwise_layer_cosine.py \
-  tool/high_accuracy_BNN -o result_processing_tool/bnn_layer_cosine.csv \
-  --pairs-file result_processing_tool/bnn_all_pairs.csv
-```
-
-`--pairs-file` 可选，将每个 pair、每一层的结果另外记录下来。
+也可以用 `-o`、`--pairs-file`、`--distribution-file` 指定输出路径；未指定的输出仍然
+使用输入目录中的上述固定文件名。默认输出可以重复运行并覆盖，显式指定的已存在路径
+仍会被拒绝，以避免误覆盖其他结果。
 默认将同一模块的 weight 和 bias 拼接成一个向量，排除 BatchNorm 的运行统计量。
 这与 `plot_layer_weight_pca.py` 的分组规则一致。
 

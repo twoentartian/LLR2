@@ -164,7 +164,7 @@ class FastTrainingSetup:
             else:
                 raise err
 
-        elif mt == ModelType.cct_7_3x1_32:
+        elif mt in (ModelType.cct_7_3x1_32, ModelType.binary_attention_cct_7_3x1_32):
             if dt in (DatasetType.cifar10,):
                 if preset == 0:
                     weight_decay, initial_lr = 6e-2, 55e-5

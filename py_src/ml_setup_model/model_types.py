@@ -45,3 +45,4 @@ class ModelType(Enum):
     transformer_for_grokking = auto()
     bnn = auto()
     bnn_floating = auto()
+    binary_attention_cct_7_3x1_32 = auto()

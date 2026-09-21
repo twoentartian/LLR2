@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLR2 Weight Viewer</title>
+  <link rel="stylesheet" href="/model_weight_viewer.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="brand-mark">W</div>
+    <div>
+      <p class="eyebrow">LLR2 result tools</p>
+      <h1>Model Weight Viewer</h1>
+    </div>
+    <div class="local-badge"><span></span> Local session</div>
+  </header>
+
+  <main>
+    <section class="upload-panel" id="uploadPanel">
+      <div class="upload-copy">
+        <p class="eyebrow">Checkpoint input</p>
+        <h2>Inspect every stored tensor.</h2>
+        <p>Drop an LLR2 <code>.model.pt</code> file here. The model is loaded on CPU and values are shown in bounded pages.</p>
+      </div>
+      <button class="drop-zone" id="dropZone" type="button">
+        <span class="upload-icon" aria-hidden="true">↑</span>
+        <strong>Drop checkpoint or browse</strong>
+        <small>Any model type · Any dataset type</small>
+      </button>
+      <input id="fileInput" type="file" accept=".pt,.model.pt,application/octet-stream" hidden>
+      <div class="load-status" id="loadStatus" role="status" aria-live="polite"></div>
+    </section>
+
+    <section id="workspace" class="workspace" hidden>
+      <div class="summary-heading">
+        <div>
+          <p class="eyebrow">Loaded checkpoint</p>
+          <h2 id="filename">—</h2>
+        </div>
+        <button id="loadAnother" class="secondary-button" type="button">Load another file</button>
+      </div>
+
+      <div class="metric-grid">
+        <article class="metric-card accent"><span>Model type</span><strong id="modelType">—</strong></article>
+        <article class="metric-card"><span>Dataset type</span><strong id="datasetType">—</strong></article>
+        <article class="metric-card"><span>Tensors</span><strong id="tensorCount">—</strong></article>
+        <article class="metric-card"><span>Stored values</span><strong id="totalValues">—</strong></article>
+        <article class="metric-card"><span>Tensor storage</span><strong id="totalBytes">—</strong></article>
+      </div>
+
+      <div class="browser-grid">
+        <section class="tensor-browser">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">State dictionary</p>
+              <h3>Tensor index</h3>
+            </div>
+            <div class="format-chip" id="sourceFormat">—</div>
+          </div>
+          <div class="toolbar">
+            <label class="search-field">
+              <span aria-hidden="true">⌕</span>
+              <input id="searchInput" type="search" placeholder="Filter by tensor name or dtype">
+            </label>
+            <span id="visibleCount" class="visible-count"></span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Tensor</th><th>Shape</th><th>Dtype</th><th>Values</th></tr></thead>
+              <tbody id="tensorRows"></tbody>
+            </table>
+            <div id="emptyState" class="empty-state" hidden>No tensors match this filter.</div>
+          </div>
+        </section>
+
+        <aside class="inspector" id="inspector">
+          <div class="inspector-placeholder" id="inspectorPlaceholder">
+            <span>↖</span>
+            <h3>Select a tensor</h3>
+            <p>Its dimensions, statistics, coordinates, and raw values will appear here.</p>
+          </div>
+          <div id="inspectorContent" hidden>
+            <p class="eyebrow">Selected tensor</p>
+            <h3 id="selectedName">—</h3>
+            <div class="detail-grid">
+              <div><span>Shape</span><strong id="selectedShape">—</strong></div>
+              <div><span>Dtype</span><strong id="selectedDtype">—</strong></div>
+              <div><span>Dimensions</span><strong id="selectedNdim">—</strong></div>
+              <div><span>Values</span><strong id="selectedNumel">—</strong></div>
+            </div>
+
+            <div class="stats-block">
+              <div class="subheading-row"><h4>Statistics</h4><button id="statsButton" type="button">Compute</button></div>
+              <div id="statistics" class="statistics muted">Computed only when requested.</div>
+            </div>
+
+            <div class="values-block">
+              <div class="subheading-row">
+                <h4>Raw values</h4>
+                <button id="copyButton" type="button">Copy page</button>
+              </div>
+              <div class="pagination">
+                <button id="previousPage" type="button" aria-label="Previous page">←</button>
+                <label>Offset <input id="offsetInput" type="number" min="0" value="0"></label>
+                <label>Page <select id="pageSize"><option>50</option><option selected>100</option><option>250</option><option>1000</option></select></label>
+                <button id="nextPage" type="button" aria-label="Next page">→</button>
+              </div>
+              <p id="pageRange" class="page-range"></p>
+              <div class="value-table-wrap">
+                <table class="value-table">
+                  <thead><tr><th>Flat index</th><th>Coordinate</th><th>Raw value</th></tr></thead>
+                  <tbody id="valueRows"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </section>
+  </main>
+
+  <footer>Checkpoint data stays in this local Python process and is discarded when the server stops.</footer>
+  <script src="/model_weight_viewer.js"></script>
+</body>
+</html>

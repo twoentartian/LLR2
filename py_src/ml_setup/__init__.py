@@ -26,12 +26,7 @@ from .cct import (binary_attention_cct_7_3x1_cifar10,cct_7_3x1_cifar10,cct_7_3x1
 
 from .ddpm_cifar import ddpm_cifar10
 from .ddpm_flowers import ddpm_flowers102
-from .grokking import (
-    arithmetic_addition_grokking,
-    arithmetic_cubepoly_grokking,
-    arithmetic_cube2_grokking,
-    arithmetic_unknown_exp_grokking,
-)
+from .grokking import (arithmetic_addition_grokking,arithmetic_cubepoly_grokking,arithmetic_cube2_grokking,arithmetic_unknown_exp_grokking)
 from .nanoclip import nanoclip_flickr30k_default
 
 # Compatibility name used by DFL_torch simulator configuration files.

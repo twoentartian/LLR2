@@ -1,5 +1,31 @@
 # 模型权重比较与排列对齐
 
+## 查看或覆盖 checkpoint 的模型/数据集名称
+
+旧 checkpoint 如果保存了已经从新代码移除的名称，可以用
+`override_model_pt_info.py` 只修改顶层 metadata，不改变任何权重：
+
+```bash
+# 打印当前名称，然后交互式询问是否修改（回答 n 会保持不变）
+python3 result_processing_tool/override_model_pt_info.py MODELS
+
+# 原地覆盖模型名和数据集名
+python3 result_processing_tool/override_model_pt_info.py MODELS \
+  --model-name bnn_floating --dataset-name cifar10 --in-place
+
+# 保留原目录，写入另一个目录；支持递归目录
+python3 result_processing_tool/override_model_pt_info.py MODELS \
+  --recursive --model-name binary_attention_cct_7_3x1_32 \
+  --output-dir MODELS_RETAGGED
+```
+
+目标名称使用当前代码中定义的 `ModelType` 和 `DatasetType`，输入旧名称可以不存在。
+不指定 `--model-name` / `--dataset-name` 时，脚本会在打印后交互式询问是否修改模型名或数据集名，
+再询问原地覆盖还是写到新目录；两个修改问题都回答 `n`，或者取消输出目录时，不会改动文件。
+如果连输入目录参数也省略，脚本会先交互式询问目录。
+使用 `--model-name` / `--dataset-name` 时仍可通过 `--in-place` 或 `--output-dir` 非交互式执行。
+显式输出目录中已有文件会被拒绝覆盖。
+
 在项目根目录运行以下命令。使用生成模型时的 Python 环境，依赖为
 `torch`、`numpy`；PCA 另需 `matplotlib`，排列对齐另需 `scipy` 和项目的模型依赖。
 只读取 checkpoint，不下载或加载训练数据集。文件格式复用
@@ -26,6 +52,10 @@ N 个模型计算 N(N−1)/2 个不重复模型对：20 个模型为 190 对。
 仍会被拒绝，以避免误覆盖其他结果。
 默认将同一模块的 weight 和 bias 拼接成一个向量，排除 BatchNorm 的运行统计量。
 这与 `plot_layer_weight_pca.py` 的分组规则一致。
+当 checkpoint 的 `model_name` 为 `bnn` 时，卷积层和全连接层的 latent weight 会先按
+训练时的规则转换为 `-1/+1`（零值也转换为 `-1`），再计算 cosine；BatchNorm 参数仍使用
+原始浮点值。`bnn_floating` 和 `binary_attention_cct_7_3x1_32` 的 checkpoint 权重保持浮点计算，
+因为它们的权重本身不是二值权重。
 
 常用选项：
 
@@ -69,11 +99,23 @@ python3 result_processing_tool/permute_models.py \
 每个 C 旁边有 `.model.json` 报告，包含来源、排列索引、迭代次数、是否收敛、
 对齐前后全模型参数 cosine，以及内置模型的 B/C 前向输出检查结果。
 
-内置支持 `bnn`、`bnn_floating`、`lenet4`、`lenet5`、`lenet5_large_fc`，自动读取 checkpoint 的
+内置支持 `bnn`、`bnn_floating`、`lenet4`、`lenet5`、`lenet5_large_fc`、
+`cct_7_3x1_32`、`binary_attention_cct_7_3x1_32`，自动读取 checkpoint 的
 `model_name`。只有元信息缺失时才需 `--model-type`。
 构建模型时复用 `ml_setup` 使用的模型类，不构建完整数据集 setup。
 
-算法使用 [Git Re-Basin 的 weight matching 思路](https://arxiv.org/abs/2209.04836)：
+算法默认使用 `--method auto`：CNN/MLP 使用
+[Git Re-Basin 的 weight matching 思路](https://arxiv.org/abs/2209.04836)，
+Binary CCT7 使用下面的 signed matcher。也可以显式传 `--method git_rebasin`
+或 `--method signed`；后者目前只支持 `binary_attention_cct_7_3x1_32`。
+两种方法都只变换 checkpoint，不重新训练模型：
+
+```bash
+python3 result_processing_tool/permute_models.py \
+  -a MODELS/00.model.pt -b MODELS -o ALIGNED --method signed
+```
+
+Git Re-Basin 方法：
 对每个隐藏通道组做 Hungarian assignment，交替更新，最大化全模型参数的点积。
 因为通道排列保持参数范数，该目标等价于最大化全模型参数 cosine、最小化 L2 距离。
 迭代可能停在局部最优；不保证每一层单独的 cosine 都提高，也不改变 B 的模型能力。
@@ -86,6 +128,34 @@ BN 运行统计量不参与匹配目标，但应用排列时随通道一起变�
 例如 BNN 的 `fc1` 输入每个通道对应 9 个连续特征。
 分析和排列的都是 BNN checkpoint 保存的浮点隐权重，不做额外二值化。
 内置模型保存前会用 4 个固定随机输入在 float64 eval 下比较 B/C 输出；这不是准确率评估。
+
+Binary CCT7 使用 `py_src/ml_setup_model/bnn/binary_cct.py` 中的
+`binary_cct_7_3x1_32` 工厂，支持项目默认的 32×32、10 类、learnable positional embedding 配置：
+
+```bash
+python3 result_processing_tool/permute_models.py \
+  -a MODELS/00.model.pt -b MODELS -o ALIGNED
+```
+
+当 checkpoint 元信息缺失时，可加 `--model-type binary_attention_cct_7_3x1_32`。
+signed matcher 先用普通的合法通道排列做基础匹配，然后在每个 attention block 内优化
+signed Q/K 和 V/projection 对称性。Q/K 使用耦合的 feature sign，V 的 sign 同步补偿
+projection column；Q/K feature permutation 与 V feature permutation 独立，避免把
+transformer 的两种 feature 对称性错误地绑在一起。它有 22 个普通排列组：一个贯穿 tokenizer、位置编码、LayerNorm、所有残差分支、
+attention pooling 和分类器输入的 embedding 排列，以及每个 transformer block 的
+MLP hidden 和 attention heads 排列；signed 阶段另外对每个 head 的 Q/K 与 V feature
+分别做 signed assignment。这些变换是 attention 的合法对称性，
+不进行会改变函数的任意独立 Q/K/V 行排列。
+注意力偏置的 head 轴与 attention heads 同步，token/空间位置及输出类别顺序固定。
+匹配时把 packed QKV 和 attention projection 临时视为带 head 轴的张量；
+保存时恢复原始 state_dict 的 key、shape 和 dtype，可直接加载到 BinaryCCT7_3x1。
+不同类别数、图像尺寸或缺少位置编码的变体不属于此内置配置。
+
+标准 CCT7 使用 `py_src/third_party/compact_transformers/src/cct.py` 中的
+`cct_7_3x1_32` 工厂，同样支持项目默认的 32×32、10 类、learnable positional embedding 配置。
+它使用 Git Re-Basin 方法；CCT 的 tokenizer、残差 embedding、attention heads/head features、
+MLP hidden units 会按合法的网络对称性同步排列。元信息缺失时可加
+`--model-type cct_7_3x1_32`。
 
 ## 扩展其他模型
 

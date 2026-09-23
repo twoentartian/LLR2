@@ -18,6 +18,11 @@ histogram subplot per layer on one page.
 Uses temporary disk caching and feature-blocked N x N Gram matrices: O(N**2)
 matrix memory, plus one checkpoint and an N x block-size working block.
 Dependencies: torch, numpy, matplotlib. No dataset or GPU required.
+
+For ``model_name == bnn``, convolution and linear latent weights are converted
+to the model's binary ``-1/+1`` values before cosine computation; BatchNorm
+parameters remain floating point. Other model types use their stored floating
+point weights.
 """
 
 import argparse
@@ -31,7 +36,9 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from result_processing_tool.model_weight_utils import cached_weights, natural_key
+from result_processing_tool.model_weight_utils import (
+    cached_weights, is_binary_weight_model, natural_key,
+)
 
 import matplotlib
 matplotlib.use("Agg")
@@ -88,7 +95,13 @@ def calculate(args) -> Path:
     distribution_path.parent.mkdir(parents=True, exist_ok=True)
     with cached_weights(files, key_regex=args.key_regex, exclude_regex=args.exclude_regex,
                         layer_level=args.layer_level, exclude_bias=args.exclude_bias,
-                        cache_dir=args.cache_dir) as (cache, layers, slices, metadata):
+                        cache_dir=args.cache_dir, binary_weights=True) as (
+                            cache, layers, slices, metadata):
+        if is_binary_weight_model(metadata[0]):
+            print("Weight representation: binary values (-1/+1) for bnn convolution/linear weights",
+                  flush=True)
+        else:
+            print("Weight representation: stored floating-point values", flush=True)
         rows, cols = np.triu_indices(len(files), k=1)
         with ExitStack() as stack:
             summary_mode = "w" if output_is_default else "x"

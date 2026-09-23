@@ -68,6 +68,26 @@ def test_pairwise_cli_means_and_pair_counts(tmp_path):
     assert fc_pairs == [("0.model.pt", "1.model.pt"), ("0.model.pt", "2.model.pt"), ("1.model.pt", "2.model.pt")]
 
 
+def test_pairwise_cli_binarizes_bnn_weight_layers_only(tmp_path):
+    states = [
+        {"conv1.weight": torch.tensor([0.2, -0.1, 0.0, 0.8]),
+         "bn1.weight": torch.tensor([1.0, 2.0])},
+        {"conv1.weight": torch.tensor([-0.7, -0.4, 0.3, 0.2]),
+         "bn1.weight": torch.tensor([1.0, 3.0])},
+    ]
+    for index, state in enumerate(states):
+        save_model_state(str(tmp_path / f"{index}.model.pt"), state, "bnn", "cifar10")
+
+    cosine_main([str(tmp_path)])
+
+    with (tmp_path / "layer_cosine_summary.csv").open() as handle:
+        rows = {row["layer"]: row for row in csv.DictReader(handle)}
+    # BNN binarization is [1, -1, -1, 1] and [-1, -1, 1, 1], whose cosine is 0.
+    assert float(rows["conv1"]["mean_cosine"]) == pytest.approx(0.0)
+    # BatchNorm affine parameters remain floating point.
+    assert float(rows["bn1"]["mean_cosine"]) == pytest.approx(7 / np.sqrt(50))
+
+
 def toy_state():
     rng = torch.Generator().manual_seed(7)
     return {"fc1.weight": torch.randn(6, 3, generator=rng),
@@ -104,7 +124,8 @@ def test_matching_identity_and_monotonicity():
     assert report["parameter_cosine_after"] >= report["parameter_cosine_before"]
 
 
-@pytest.mark.parametrize("model_type", ["bnn", "bnn_floating", "lenet4", "lenet5", "lenet5_large_fc"])
+@pytest.mark.parametrize("model_type", ["bnn", "bnn_floating", "lenet4", "lenet5", "lenet5_large_fc",
+                                        "cct_7_3x1_32", "binary_attention_cct_7_3x1_32"])
 def test_builtin_permutations_preserve_outputs(model_type):
     torch.manual_seed(5)
     model, _ = make_model(model_type)
@@ -115,6 +136,11 @@ def test_builtin_permutations_preserve_outputs(model_type):
             value.copy_(torch.randn_like(value) * 0.1)
         elif key.endswith("running_var"):
             value.copy_(torch.rand_like(value) + 0.5)
+        elif key.endswith("attention_bias"):
+            # Default zeros would hide a missing attention-head bias permutation.
+            value.copy_(torch.randn_like(value) * 0.03)
+        elif "norm" in key and model_type == "binary_attention_cct_7_3x1_32":
+            value.add_(torch.randn_like(value) * 0.03)
     spec = builtin_spec(model_type, state)
     sizes = validate_spec(spec, state)
     permutations = {group: torch.randperm(size) for group, size in sizes.items()}
@@ -124,6 +150,95 @@ def test_builtin_permutations_preserve_outputs(model_type):
         assert spec["fc1.weight"][1] == ("conv6", 9)
         assert torch.equal(c["bn9.running_mean"], state["bn9.running_mean"])
         torch.testing.assert_close(c["bn1.running_mean"], state["bn1.running_mean"][permutations["conv1"]])
+    if model_type == "binary_attention_cct_7_3x1_32":
+        assert len(sizes) == 22  # Global embedding plus three groups per block.
+        assert torch.equal(c["classifier.fc.bias"], state["classifier.fc.bias"])
+        prefix = "classifier.blocks.0"
+        torch.testing.assert_close(c[f"{prefix}.self_attn.attention_bias"],
+                                   state[f"{prefix}.self_attn.attention_bias"][permutations[f"{prefix}.heads"]])
+        inverse = {group: indices.argsort() for group, indices in permutations.items()}
+        restored = apply_permutations(c, spec, inverse)
+        for key, value in state.items():
+            assert c[key].shape == value.shape
+            assert torch.equal(restored[key], value)
+
+
+def test_binary_cct_matching_and_batch_save(tmp_path):
+    model_type = "binary_attention_cct_7_3x1_32"
+    torch.manual_seed(23)
+    model, _ = make_model(model_type)
+    a = model.state_dict()
+    for key, value in a.items():
+        if key.endswith("attention_bias"):
+            value.copy_(torch.randn_like(value) * 0.03)
+    spec = builtin_spec(model_type, a)
+    sizes = validate_spec(spec, a)
+    reference = tmp_path / "a.model.pt"
+    save_model_state(str(reference), a, model_type, "cifar10")
+    sources = []
+    for index in range(2):
+        permutations = {group: torch.arange(size) for group, size in sizes.items()}
+        # Exercise the packed QKV head/features axes and MLP for every block.
+        # Keep embedding fixed so this known correspondence is easy to recover.
+        for group, size in sizes.items():
+            if group != "embedding":
+                permutations[group] = torch.randperm(size)
+        b = apply_permutations(a, spec, permutations)
+        source = tmp_path / f"b{index}.model.pt"
+        save_model_state(str(source), b, model_type, "cifar10")
+        sources.append(str(source))
+    output = tmp_path / "aligned"
+    permute_main(["-a", str(reference), "-b", *sources, "-o", str(output),
+                  "--model-type", model_type, "--max-iter", "5", "--threads", "2"])
+    results = sorted(output.glob("*.model.pt"))
+    assert len(results) == 2
+    for path in results:
+        c, metadata = load_checkpoint(path)
+        assert metadata == (model_type, "cifar10")
+        model.load_state_dict(c, strict=True)
+        report = json.loads(path.with_suffix(".json").read_text())
+        assert report["verification"]["passed"]
+        assert report["parameter_cosine_after"] >= report["parameter_cosine_before"]
+        assert report["spec"] == f"builtin:{model_type}"
+        assert report["method"] == "signed"
+
+
+def test_cct_matching_and_batch_save(tmp_path):
+    model_type = "cct_7_3x1_32"
+    torch.manual_seed(29)
+    model, _ = make_model(model_type)
+    a = model.state_dict()
+    spec = builtin_spec(model_type, a)
+    sizes = validate_spec(spec, a)
+    reference = tmp_path / "a.model.pt"
+    save_model_state(str(reference), a, model_type, "cifar10")
+    permutations = {group: torch.arange(size) for group, size in sizes.items()}
+    for group, size in sizes.items():
+        if group != "embedding":
+            permutations[group] = torch.randperm(size)
+    b = apply_permutations(a, spec, permutations)
+    source = tmp_path / "b.model.pt"
+    save_model_state(str(source), b, model_type, "cifar10")
+    output = tmp_path / "aligned"
+
+    permute_main(["-a", str(reference), "-b", str(source), "-o", str(output),
+                  "--model-type", model_type, "--max-iter", "3", "--threads", "2"])
+
+    result = output / "b.permuted.model.pt"
+    c, metadata = load_checkpoint(result)
+    assert metadata == (model_type, "cifar10")
+    report = json.loads(result.with_suffix(".json").read_text())
+    assert report["verification"]["passed"]
+    assert report["parameter_cosine_after"] >= report["parameter_cosine_before"]
+    assert report["method"] == "git_rebasin"
+
+
+def test_binary_cct_rejects_incompatible_architecture():
+    from py_src.ml_setup_model.bnn.binary_cct import BinaryCCT7_3x1
+    # Built-in follows the project's 32x32, 10-class, learned-position recipe.
+    for options in ({"num_classes": 100}, {"positional_embedding": "none"}):
+        with pytest.raises(ValueError, match="architecture"):
+            builtin_spec("binary_attention_cct_7_3x1_32", BinaryCCT7_3x1(**options).state_dict())
 
 
 def test_invalid_specs_and_permutations():

@@ -18,6 +18,25 @@ from result_processing_tool.calculate_cosine_similarity import (
 )
 
 
+def is_binary_weight_model(model_type: str | None) -> bool:
+    """Return whether checkpoints use binary convolution/linear weights."""
+    # ``bnn_floating`` has binary activations but intentionally keeps floating
+    # weights. Binary CCT has binary Q/K attention activations, while its
+    # checkpoint weights are also floating point. Only ``bnn`` has binary
+    # convolution and linear weights in the forward pass.
+    return model_type == "bnn"
+
+
+def is_binary_weight_key(key: str) -> bool:
+    """Return whether a normalized BNN key is a binary layer weight."""
+    return bool(re.fullmatch(r"(?:conv|fc)\d+\.weight", key))
+
+
+def binarize_weight(value: torch.Tensor) -> torch.Tensor:
+    """Match the project's BNN binarization, including zero -> -1."""
+    return value.add(1).div(2).clamp(0, 1).round().mul(2).sub(1)
+
+
 def natural_key(path: Path) -> list:
     return [int(part) if part.isdigit() else part.lower()
             for part in re.split(r"(\d+)", path.as_posix())]
@@ -73,7 +92,8 @@ def validate_states(reference: dict, other: dict, context: str = "checkpoint") -
 
 @contextmanager
 def cached_weights(files: list[Path], *, key_regex=None, exclude_regex=None,
-                   layer_level=None, exclude_bias=False, cache_dir=None):
+                   layer_level=None, exclude_bias=False, cache_dir=None,
+                   binary_weights: bool = False):
     """Yield (N x P memmap, layers, layer slices, metadata); clean up on exit.
 
     Loads one checkpoint at a time; cache consumes 8*N*P bytes of temporary disk.
@@ -83,6 +103,7 @@ def cached_weights(files: list[Path], *, key_regex=None, exclude_regex=None,
         raise ValueError("No checkpoints supplied")
     selection = (key_regex, exclude_regex, layer_level, exclude_bias)
     first, metadata = load_checkpoint(files[0])
+    use_binary_weights = binary_weights and is_binary_weight_model(metadata[0])
     layers = select_layers(first, *selection)
     if not layers:
         raise ValueError("No floating parameter tensors matched the selection")
@@ -112,7 +133,10 @@ def cached_weights(files: list[Path], *, key_regex=None, exclude_regex=None,
                         value = state[key]
                         if value.shape != shapes[key]:
                             raise ValueError(f"{path}: shape mismatch for {key}")
-                        flat = value.detach().reshape(-1).to(dtype=torch.float64).numpy()
+                        transformed = (binarize_weight(value)
+                                       if use_binary_weights and is_binary_weight_key(key)
+                                       else value)
+                        flat = transformed.detach().reshape(-1).to(dtype=torch.float64).numpy()
                         if not np.isfinite(flat).all():
                             raise ValueError(f"{path}: {key} contains NaN or infinity")
                         cache[row, offset:offset + flat.size] = flat

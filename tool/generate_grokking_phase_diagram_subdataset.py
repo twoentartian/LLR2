@@ -551,8 +551,36 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--m_d_model", type=int, default=None)
     parser.add_argument("--m_context_len", type=int, default=None)
     parser.add_argument("--m_pos_encoding", choices=["default", "trainable"], default=None)
-    parser.add_argument("--enable-ineffective-training-stop", action="store_true")
-    parser.add_argument("--enable-skip-larger-wd-after-confusion", action="store_true")
+    parser.set_defaults(
+        enable_ineffective_training_stop=True,
+        enable_skip_larger_wd_after_confusion=True,
+    )
+    parser.add_argument(
+        "--enable-ineffective-training-stop",
+        "--enable_ineffective_training_stop",
+        dest="enable_ineffective_training_stop",
+        action="store_true",
+        help="Enable ineffective/high-loss early stopping (enabled by default)",
+    )
+    parser.add_argument(
+        "--disable-ineffective-training-stop",
+        dest="enable_ineffective_training_stop",
+        action="store_false",
+        help="Do not add --enable_ineffective_training_stop to generated runs",
+    )
+    parser.add_argument(
+        "--enable-skip-larger-wd-after-confusion",
+        "--enable_skip_larger_wd_after_confusion",
+        dest="enable_skip_larger_wd_after_confusion",
+        action="store_true",
+        help="Skip larger WD values after repeated confusion (enabled by default)",
+    )
+    parser.add_argument(
+        "--disable-skip-larger-wd-after-confusion",
+        dest="enable_skip_larger_wd_after_confusion",
+        action="store_false",
+        help="Do not add --enable_skip_larger_wd_after_confusion to generated runs",
+    )
     parser.add_argument(
         "--phase-extra-arg",
         action="append",

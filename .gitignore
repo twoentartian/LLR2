@@ -16,3 +16,4 @@ find_high_accuracy_path_config.py
 tool/print_layer_order_output/*
 config/*
 simulator_config_*.py
+tool/work

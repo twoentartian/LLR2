@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import csv
 import logging
+import math
 import os
 import re
 import sys
@@ -63,6 +64,11 @@ class GrokkingParameters:
         self.min_lr = None
         self.ineffective_train_stop = None
         self.ineffective_train_stop_window = None
+        self.training_loss_plateau_stop = False
+        self.training_loss_plateau_window_ratio = 0.01
+        self.training_loss_plateau_consecutive_windows = 2
+        self.training_loss_plateau_min_epoch = 0
+        self.training_loss_plateau_min_relative_improvement = 0.01
         self.high_loss_train_stop = None
         self.train_dataloader = None
         self.val_dataloader = None
@@ -123,6 +129,36 @@ class GrokkingParameters:
     def set_ineffective_train_stop(self, enabled=True, window=1000):
         self.ineffective_train_stop = enabled
         self.ineffective_train_stop_window = window
+
+    def set_training_loss_plateau_stop(
+        self,
+        enabled=True,
+        window_ratio=0.01,
+        consecutive_windows=2,
+        min_epoch=0,
+        min_relative_improvement=0.01,
+    ):
+        """Stop a low-progress run while it is still in the confusion regime.
+
+        The window is ``ceil(total_epoch * window_ratio)`` and the same low
+        improvement must be observed in ``consecutive_windows`` windows. The
+        training-accuracy guard in the training loop prevents a memorizing
+        cell from being mislabeled as confusion.
+        """
+
+        if window_ratio <= 0:
+            raise ValueError("training-loss plateau window ratio must be positive")
+        if consecutive_windows < 1:
+            raise ValueError("training-loss plateau consecutive windows must be positive")
+        if min_epoch < 0:
+            raise ValueError("training-loss plateau minimum epoch must be non-negative")
+        if min_relative_improvement < 0:
+            raise ValueError("training-loss plateau relative improvement must be non-negative")
+        self.training_loss_plateau_stop = enabled
+        self.training_loss_plateau_window_ratio = float(window_ratio)
+        self.training_loss_plateau_consecutive_windows = int(consecutive_windows)
+        self.training_loss_plateau_min_epoch = int(min_epoch)
+        self.training_loss_plateau_min_relative_improvement = float(min_relative_improvement)
 
     def set_high_loss_train_stop(self, enabled=True):
         self.high_loss_train_stop = enabled
@@ -197,6 +233,36 @@ def _check_ineffective_train_stop(train_loss_history: deque, current_epoch: int,
         return False
     variance = sum((value - mean) ** 2 for value in history) / len(history)
     return ((variance ** 0.5) / mean) < cv_threshold
+
+
+def _check_training_loss_plateau_stop(
+    train_loss_history: deque,
+    current_epoch: int,
+    *,
+    window,
+    consecutive_windows=2,
+    min_epoch=0,
+    min_relative_improvement=0.01,
+) -> bool:
+    """Return true when loss has made too little progress twice in a row."""
+
+    required_history = window * consecutive_windows
+    if current_epoch < min_epoch or len(train_loss_history) < required_history:
+        return False
+    history = list(train_loss_history)[-required_history:]
+    for offset in range(0, required_history, window):
+        window_history = history[offset : offset + window]
+        midpoint = max(1, window // 2)
+        first_half = window_history[:midpoint]
+        second_half = window_history[midpoint:]
+        if not second_half:
+            return False
+        first_mean = sum(first_half) / len(first_half)
+        second_mean = sum(second_half) / len(second_half)
+        relative_improvement = (first_mean - second_mean) / max(abs(first_mean), 1e-12)
+        if relative_improvement >= min_relative_improvement:
+            return False
+    return True
 
 
 def _check_loss_above_initial(loss_above_initial_counter, initial_loss, current_loss, current_epoch, total_epoch, *, initial_loss_multiplier=1.1, lookback_ratio=0.1):
@@ -386,7 +452,20 @@ def train_grokking(parameters: GrokkingParameters):
 
     speed_window_start_time = time.time()
     speed_window_start_epoch = 0
-    train_loss_history = deque(maxlen=parameters.ineffective_train_stop_window if parameters.ineffective_train_stop else 1)
+    plateau_window = max(
+        2,
+        math.ceil(parameters.total_epoch * parameters.training_loss_plateau_window_ratio),
+    )
+    plateau_history_window = (
+        plateau_window * parameters.training_loss_plateau_consecutive_windows
+        if parameters.training_loss_plateau_stop
+        else 1
+    )
+    history_windows = [
+        parameters.ineffective_train_stop_window if parameters.ineffective_train_stop else 1,
+        plateau_history_window,
+    ]
+    train_loss_history = deque(maxlen=max(history_windows))
     initial_train_loss = None
     loss_above_initial_counter = 0
 
@@ -482,6 +561,32 @@ def train_grokking(parameters: GrokkingParameters):
                     epoch,
                     parameters.ineffective_train_stop_window,
                     sum(train_loss_history) / len(train_loss_history),
+                )
+            break
+
+        if (
+            parameters.training_loss_plateau_stop
+            and train_accuracy < 0.95
+            and val_accuracy < 0.95
+            and _check_training_loss_plateau_stop(
+                train_loss_history,
+                epoch,
+                window=plateau_window,
+                consecutive_windows=parameters.training_loss_plateau_consecutive_windows,
+                min_epoch=parameters.training_loss_plateau_min_epoch,
+                min_relative_improvement=parameters.training_loss_plateau_min_relative_improvement,
+            )
+        ):
+            if parameters.logger is not None:
+                parameters.logger.info(
+                    "training_loss_plateau_stop triggered at epoch %d: "
+                    "relative improvement below %.4g for %d consecutive windows "
+                    "of %d epochs (train accuracy %.4f)",
+                    epoch,
+                    parameters.training_loss_plateau_min_relative_improvement,
+                    parameters.training_loss_plateau_consecutive_windows,
+                    plateau_window,
+                    train_accuracy,
                 )
             break
 

@@ -126,6 +126,13 @@ def train_cell(args, lr, wd, train_ds, val_ds, device):
     if args.enable_ineffective_training_stop:
         params.set_ineffective_train_stop()
         params.set_high_loss_train_stop()
+    if args.enable_training_loss_plateau_stop:
+        params.set_training_loss_plateau_stop(
+            window_ratio=args.training_loss_plateau_window_ratio,
+            consecutive_windows=args.training_loss_plateau_consecutive_windows,
+            min_epoch=args.training_loss_plateau_min_epoch,
+            min_relative_improvement=args.training_loss_plateau_min_relative_improvement,
+        )
     logger.info("  -> training cell lr=%.4e wd=%.4e", lr, wd)
     train_grokking(params)
 
@@ -144,7 +151,7 @@ def parse_args():
     parser.add_argument("-tp", "--train_pct", type=float, default=50)
     parser.add_argument("-st", "--split_type", type=str, default="random", choices=SPLIT_CHOICES)
     parser.add_argument("-ol", "--operand_length", type=int, default=None)
-    parser.add_argument("-epoch", "--epoch", type=int, default=100000)
+    parser.add_argument("-epoch", "--epoch", type=int, default=150000)
     parser.add_argument("-bs", "--batchsize", type=int, default=None)
     parser.add_argument("-m", "--model_type", type=str, default="transformer_for_grokking")
     parser.add_argument("--m_nlayer", default=None, type=int)
@@ -156,6 +163,7 @@ def parse_args():
     parser.set_defaults(
         enable_ineffective_training_stop=True,
         enable_skip_larger_wd_after_confusion=True,
+        enable_training_loss_plateau_stop=True,
     )
     parser.add_argument(
         "--enable_ineffective_training_stop",
@@ -179,6 +187,26 @@ def parse_args():
         dest="enable_skip_larger_wd_after_confusion",
         help="Disable confusion-based WD skipping",
     )
+    parser.add_argument(
+        "--enable_training_loss_plateau_stop",
+        action="store_true",
+        help="Stop a low-accuracy run when training loss makes too little progress (enabled by default)",
+    )
+    parser.add_argument(
+        "--disable_training_loss_plateau_stop",
+        action="store_false",
+        dest="enable_training_loss_plateau_stop",
+        help="Disable training-loss plateau stopping",
+    )
+    parser.add_argument("--training_loss_plateau_window_ratio", type=float, default=0.01)
+    parser.add_argument("--training_loss_plateau_consecutive_windows", type=int, default=2)
+    parser.add_argument("--training_loss_plateau_min_epoch", type=int, default=0)
+    parser.add_argument(
+        "--training_loss_plateau_min_relative_improvement",
+        type=float,
+        default=0.01,
+        help="Minimum relative loss improvement over the plateau window",
+    )
     return parser.parse_args()
 
 
@@ -186,6 +214,14 @@ def main():
     args = parse_args()
     if args.model_type != "transformer_for_grokking":
         raise ValueError("generate_grokking_phase_diagram.py only supports --model_type transformer_for_grokking")
+    if args.training_loss_plateau_window_ratio <= 0:
+        raise ValueError("--training_loss_plateau_window_ratio must be positive")
+    if args.training_loss_plateau_consecutive_windows < 1:
+        raise ValueError("--training_loss_plateau_consecutive_windows must be positive")
+    if args.training_loss_plateau_min_epoch < 0:
+        raise ValueError("--training_loss_plateau_min_epoch must be non-negative")
+    if args.training_loss_plateau_min_relative_improvement < 0:
+        raise ValueError("--training_loss_plateau_min_relative_improvement must be non-negative")
 
     setup_logging(logger, "main")
     logger.info("phase diagram sweep starting")

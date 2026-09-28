@@ -43,7 +43,7 @@ DEFAULT_PHASE_SCRIPT = SCRIPT_DIR / "generate_grokking_phase_diagram.py"
 DEFAULT_SIZES = (97, 197, 297, 397, 497, 597, 697, 797, 897, 997, 1997)
 DEFAULT_BASE_SIZE = 97
 DEFAULT_BASE_EPOCH = 150_000
-DEFAULT_EPOCH_POWER = 1.2
+DEFAULT_EPOCH_POWER = 1.5
 MIN_EPOCH = 2_000
 DEFAULT_BATCHSIZE_CAP = 65_536
 
@@ -320,6 +320,22 @@ def _phase_args(args: argparse.Namespace) -> list[str]:
         options.append("--enable_ineffective_training_stop")
     if args.enable_skip_larger_wd_after_confusion:
         options.append("--enable_skip_larger_wd_after_confusion")
+    if args.enable_training_loss_plateau_stop:
+        options.extend(
+            [
+                "--enable_training_loss_plateau_stop",
+                "--training_loss_plateau_window_ratio",
+                str(args.training_loss_plateau_window_ratio),
+                "--training_loss_plateau_consecutive_windows",
+                str(args.training_loss_plateau_consecutive_windows),
+                "--training_loss_plateau_min_epoch",
+                str(args.training_loss_plateau_min_epoch),
+                "--training_loss_plateau_min_relative_improvement",
+                str(args.training_loss_plateau_min_relative_improvement),
+            ]
+        )
+    else:
+        options.append("--disable_training_loss_plateau_stop")
     options.extend(args.phase_extra_arg)
     return options
 
@@ -554,6 +570,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.set_defaults(
         enable_ineffective_training_stop=True,
         enable_skip_larger_wd_after_confusion=True,
+        enable_training_loss_plateau_stop=True,
     )
     parser.add_argument(
         "--enable-ineffective-training-stop",
@@ -581,6 +598,21 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         help="Do not add --enable_skip_larger_wd_after_confusion to generated runs",
     )
+    parser.add_argument(
+        "--enable-training-loss-plateau-stop",
+        action="store_true",
+        help="Add the training-loss plateau stop to generated phase-diagram runs (enabled by default)",
+    )
+    parser.add_argument(
+        "--disable-training-loss-plateau-stop",
+        action="store_false",
+        dest="enable_training_loss_plateau_stop",
+        help="Do not add training-loss plateau stopping to generated runs",
+    )
+    parser.add_argument("--training-loss-plateau-window-ratio", type=float, default=0.01)
+    parser.add_argument("--training-loss-plateau-consecutive-windows", type=int, default=2)
+    parser.add_argument("--training-loss-plateau-min-epoch", type=int, default=0)
+    parser.add_argument("--training-loss-plateau-min-relative-improvement", type=float, default=0.01)
     parser.add_argument(
         "--phase-extra-arg",
         action="append",
@@ -611,6 +643,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(f"--base-size must be positive and --base-epoch must be at least {MIN_EPOCH}")
     if args.epoch_power < 0:
         parser.error("--epoch-power must be non-negative")
+    if args.training_loss_plateau_window_ratio <= 0:
+        parser.error("--training-loss-plateau-window-ratio must be positive")
+    if args.training_loss_plateau_consecutive_windows < 1:
+        parser.error("--training-loss-plateau-consecutive-windows must be positive")
+    if args.training_loss_plateau_min_epoch < 0:
+        parser.error("--training-loss-plateau-min-epoch must be non-negative")
+    if args.training_loss_plateau_min_relative_improvement < 0:
+        parser.error("--training-loss-plateau-min-relative-improvement must be non-negative")
     try:
         batchsize_by_size = parse_size_overrides(args.batchsize_for, "--batchsize-for")
         epoch_by_size = parse_size_overrides(args.epoch_for, "--epoch-for", minimum=MIN_EPOCH)

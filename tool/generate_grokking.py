@@ -227,7 +227,9 @@ def default_batch_size(dataset):
 def _check_ineffective_train_stop(train_loss_history: deque, current_epoch: int, *, window=1000, min_epoch=1000, loss_threshold=1.5, cv_threshold=0.02) -> bool:
     if current_epoch < min_epoch or len(train_loss_history) < window:
         return False
-    history = list(train_loss_history)
+    # The queue can be larger when the plateau detector is enabled; this
+    # detector is defined over its own most-recent ``window`` only.
+    history = list(train_loss_history)[-window:]
     mean = sum(history) / len(history)
     if mean <= loss_threshold:
         return False
@@ -556,11 +558,13 @@ def train_grokking(parameters: GrokkingParameters):
             window=parameters.ineffective_train_stop_window or 1000,
         ):
             if parameters.logger is not None:
+                ineffective_window = parameters.ineffective_train_stop_window or 1000
+                ineffective_history = list(train_loss_history)[-ineffective_window:]
                 parameters.logger.info(
                     "ineffective_train_stop triggered at epoch %d: mean loss over last %d epochs = %.4f",
                     epoch,
-                    parameters.ineffective_train_stop_window,
-                    sum(train_loss_history) / len(train_loss_history),
+                    ineffective_window,
+                    sum(ineffective_history) / len(ineffective_history),
                 )
             break
 

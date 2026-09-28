@@ -68,7 +68,7 @@ class GrokkingParameters:
         self.training_loss_plateau_window_ratio = 0.01
         self.training_loss_plateau_consecutive_windows = 2
         self.training_loss_plateau_min_epoch = 0
-        self.training_loss_plateau_min_relative_improvement = 0.01
+        self.training_loss_plateau_min_relative_improvement = 0.0001
         self.high_loss_train_stop = None
         self.train_dataloader = None
         self.val_dataloader = None
@@ -136,7 +136,7 @@ class GrokkingParameters:
         window_ratio=0.01,
         consecutive_windows=2,
         min_epoch=0,
-        min_relative_improvement=0.01,
+        min_relative_improvement=0.0001,
     ):
         """Stop a low-progress run while it is still in the confusion regime.
 
@@ -242,7 +242,7 @@ def _check_training_loss_plateau_stop(
     window,
     consecutive_windows=2,
     min_epoch=0,
-    min_relative_improvement=0.01,
+    min_relative_improvement=0.0001,
 ) -> bool:
     """Return true when loss has made too little progress twice in a row."""
 

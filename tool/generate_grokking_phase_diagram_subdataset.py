@@ -612,7 +612,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--training-loss-plateau-window-ratio", type=float, default=0.01)
     parser.add_argument("--training-loss-plateau-consecutive-windows", type=int, default=2)
     parser.add_argument("--training-loss-plateau-min-epoch", type=int, default=0)
-    parser.add_argument("--training-loss-plateau-min-relative-improvement", type=float, default=0.01)
+    parser.add_argument("--training-loss-plateau-min-relative-improvement", type=float, default=0.0001)
     parser.add_argument(
         "--phase-extra-arg",
         action="append",

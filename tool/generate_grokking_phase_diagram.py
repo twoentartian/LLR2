@@ -204,7 +204,7 @@ def parse_args():
     parser.add_argument(
         "--training_loss_plateau_min_relative_improvement",
         type=float,
-        default=0.01,
+        default=0.0001,
         help="Minimum relative loss improvement over the plateau window",
     )
     return parser.parse_args()

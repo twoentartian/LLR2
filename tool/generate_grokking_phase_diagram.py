@@ -153,8 +153,32 @@ def parse_args():
     parser.add_argument("--m_context_len", default=None, type=int)
     parser.add_argument("--m_pos_encoding", default=None, type=str, choices=["default", "trainable"])
     parser.add_argument("-rs", "--random_seed", type=int, default=None)
-    parser.add_argument("--enable_ineffective_training_stop", action="store_true")
-    parser.add_argument("--enable_skip_larger_wd_after_confusion", action="store_true")
+    parser.set_defaults(
+        enable_ineffective_training_stop=True,
+        enable_skip_larger_wd_after_confusion=True,
+    )
+    parser.add_argument(
+        "--enable_ineffective_training_stop",
+        action="store_true",
+        help="Enable ineffective/high-loss early stopping (enabled by default)",
+    )
+    parser.add_argument(
+        "--disable_ineffective_training_stop",
+        action="store_false",
+        dest="enable_ineffective_training_stop",
+        help="Disable ineffective/high-loss early stopping",
+    )
+    parser.add_argument(
+        "--enable_skip_larger_wd_after_confusion",
+        action="store_true",
+        help="Skip larger WD values after two consecutive confusion cells (enabled by default)",
+    )
+    parser.add_argument(
+        "--disable_skip_larger_wd_after_confusion",
+        action="store_false",
+        dest="enable_skip_larger_wd_after_confusion",
+        help="Disable confusion-based WD skipping",
+    )
     return parser.parse_args()
 
 

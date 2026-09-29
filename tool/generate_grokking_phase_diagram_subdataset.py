@@ -18,6 +18,10 @@ The default scaling is based on the number of training batches:
 ``batchsize(n) = min(n*n, 65536)``.  Both policies are command-line
 configurable and the generated manifest records the resolved values for every
 dataset.
+
+sample config:
+BATCH_SIZE_BY_SIZE = {97: 9409, 197: 38809, 297: 65536, 397: 65536, 497: 65536, 597: 65536, 697: 65536, 797: 65536, 897: 65536, 997: 65536, 1997: 65536}
+EPOCH_BY_SIZE = {97: 150000, 197: 150000, 297: 20000, 397: 15000, 497: 10000, 597: 7500, 697: 5000, 797: 5000, 897: 5000, 997: 5000, 1997: 2000}
 """
 
 from __future__ import annotations
@@ -570,7 +574,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.set_defaults(
         enable_ineffective_training_stop=True,
         enable_skip_larger_wd_after_confusion=True,
-        enable_training_loss_plateau_stop=True,
+        enable_training_loss_plateau_stop=False,
     )
     parser.add_argument(
         "--enable-ineffective-training-stop",

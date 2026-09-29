@@ -163,7 +163,7 @@ def parse_args():
     parser.set_defaults(
         enable_ineffective_training_stop=True,
         enable_skip_larger_wd_after_confusion=True,
-        enable_training_loss_plateau_stop=True,
+        enable_training_loss_plateau_stop=False,
     )
     parser.add_argument(
         "--enable_ineffective_training_stop",

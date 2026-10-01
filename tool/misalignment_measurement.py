@@ -573,9 +573,31 @@ def search_nearest_overlap(
         objective.backward()
         optimizer.step()
 
-        if epoch % max(1, report_interval) == 0 or epoch == epochs - 1:
-            train_metrics = _metrics(model, train_batch, tokenizer, train_threshold)
-            val_metrics = _metrics(model, val_batch, tokenizer, val_threshold)
+        # Check the updated parameters every epoch. In particular, do not
+        # wait for ``report_interval``: with a large reporting interval the
+        # optimizer can enter the overlap region thousands of steps before
+        # the old loop notices it. These are inference-only passes, so the
+        # stopping check does not affect the overlap-search gradients.
+        updated_train_loss, updated_train_accuracy = _loss_and_accuracy(
+            model, train_batch, tokenizer, enable_grad=False
+        )
+        updated_val_loss, updated_val_accuracy = _loss_and_accuracy(
+            model, val_batch, tokenizer, enable_grad=False
+        )
+        train_metrics = DatasetMetrics(
+            loss=float(updated_train_loss.item()),
+            accuracy=float(updated_train_accuracy.item()),
+            low_loss=float(updated_train_loss.item()) <= train_threshold,
+        )
+        val_metrics = DatasetMetrics(
+            loss=float(updated_val_loss.item()),
+            accuracy=float(updated_val_accuracy.item()),
+            low_loss=float(updated_val_loss.item()) <= val_threshold,
+        )
+        feasible_now = train_metrics.low_loss and val_metrics.low_loss
+        should_report = epoch % max(1, report_interval) == 0 or epoch == epochs - 1
+
+        if should_report or feasible_now:
             state = _clone_state(model)
             distance = _normalized_distance(train_state, state, normalization_floor)
             violation = max(0.0, train_metrics.loss / max(train_threshold, normalization_floor) - 1.0) ** 2
@@ -596,6 +618,17 @@ def search_nearest_overlap(
                     distance,
                     train_metrics.low_loss and val_metrics.low_loss,
                 )
+
+            if feasible_now:
+                logger.info(
+                    "overlap entered at epoch %d: train_loss=%.4g val_loss=%.4g distance=%.4g; "
+                    "stopping overlap search and proceeding to flatness measurement",
+                    epoch,
+                    train_metrics.loss,
+                    val_metrics.loss,
+                    distance,
+                )
+                break
 
     selected_state = best_feasible_state if best_feasible_state is not None else best_violation_state
     _load_state(model, selected_state)

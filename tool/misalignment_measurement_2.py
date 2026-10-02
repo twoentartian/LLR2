@@ -951,7 +951,14 @@ def main() -> None:
     bundle = load_dataset_bundle(args)
     model = bundle.ml_setup.model.to(device)
     criterion = bundle.ml_setup.criterion or nn.CrossEntropyLoss()
-    batch_size = args.batch_size or int(getattr(bundle.ml_setup, "default_batch_size", 64) or 64)
+    if args.batch_size is not None:
+        batch_size = args.batch_size
+    elif bundle.modular:
+        # The shuffled partitions are equal-sized; use a capped full batch
+        # for modular data, matching the grokking experiment scripts.
+        batch_size = min(len(bundle.partition_a), 65536)
+    else:
+        batch_size = int(getattr(bundle.ml_setup, "default_batch_size", 64) or 64)
     loader_a = _build_loader(bundle.partition_a, batch_size, device=device, num_workers=args.num_workers, seed=args.random_seed + 101)
     loader_b = _build_loader(bundle.partition_b, batch_size, device=device, num_workers=args.num_workers, seed=args.random_seed + 202)
     model_type_name = bundle.ml_setup.model_type.name

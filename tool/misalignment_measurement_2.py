@@ -12,6 +12,9 @@ available with ``--objective difference`` and
 ``--objective mean_relative_gap``.  The relative-flatness report is computed
 separately on the two original losses and then averaged.
 
+Each invocation evaluates both orientations from the same initial model:
+partition A as train/B as val, then B as train/A as val.
+
 Supported datasets are MNIST, CIFAR-10, CIFAR-100, ImageNet-1k, and a modular
 dataset folder containing train.txt/val.txt (and optionally test.txt).
 """
@@ -937,6 +940,212 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _run_direction(
+    *,
+    direction_name: str,
+    train_partition_name: str,
+    val_partition_name: str,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    bundle: DatasetBundle,
+    model: nn.Module,
+    initial_state: dict[str, torch.Tensor],
+    criterion: nn.Module,
+    device: torch.device,
+    batch_size: int,
+    epochs: int,
+    args: argparse.Namespace,
+    output_folder: Path,
+    model_type_name: str,
+    dataset_type_name: str,
+) -> dict[str, Any]:
+    """Run one train/val orientation from the same initial state."""
+    set_seed(args.random_seed)
+    model.load_state_dict(initial_state, strict=True)
+    optimizer, scheduler, _ = build_optimizer_and_scheduler(
+        bundle.ml_setup,
+        model,
+        bundle.partition_a,
+        batch_size=batch_size,
+        preset=args.optimizer_preset,
+        epochs=epochs,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        optimizer=args.optimizer,
+        scheduler=args.scheduler,
+    )
+    logger.info(
+        "starting direction=%s: train=partition_%s val=partition_%s",
+        direction_name,
+        train_partition_name,
+        val_partition_name,
+    )
+    optimization_path = output_folder / f"optimization_{direction_name}.csv"
+    geometry_path = output_folder / f"gradient_geometry_{direction_name}.csv"
+    flatness_path = output_folder / f"relative_flatness_{direction_name}.csv"
+    initial_model_path = output_folder / f"initial_{direction_name}.model.pt"
+    final_model_path = output_folder / f"final_{direction_name}.model.pt"
+    save_model_state(
+        str(initial_model_path),
+        {name: value.detach().cpu().clone() for name, value in initial_state.items()},
+        model_type_name,
+        dataset_type_name,
+    )
+
+    if args.objective == "normalized_two_sided":
+        rows = train_normalized_two_sided(
+            model,
+            train_loader,
+            val_loader,
+            criterion,
+            device=device,
+            modular=bundle.modular,
+            eq_position=bundle.eq_position,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epochs=epochs,
+            report_interval=args.report_interval,
+            csv_path=str(optimization_path),
+            gradient_geometry_csv_path=str(geometry_path),
+        )
+    else:
+        rows = train_symmetric_objective(
+            model,
+            train_loader,
+            val_loader,
+            criterion,
+            device=device,
+            modular=bundle.modular,
+            eq_position=bundle.eq_position,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epochs=epochs,
+            report_interval=args.report_interval,
+            csv_path=str(optimization_path),
+            objective_mode=args.objective,
+        )
+    save_model_state(str(final_model_path), model.state_dict(), model_type_name, dataset_type_name)
+
+    final_train = evaluate_partition(
+        model, train_loader, criterion, device=device, modular=bundle.modular, eq_position=bundle.eq_position
+    )
+    final_val = evaluate_partition(
+        model, val_loader, criterion, device=device, modular=bundle.modular, eq_position=bundle.eq_position
+    )
+    layers = _resolve_flatness_layers(model, args.relative_flatness_layers)
+    flatness_train = measure_relative_flatness(
+        model,
+        train_loader,
+        criterion,
+        device=device,
+        modular=bundle.modular,
+        eq_position=bundle.eq_position,
+        layer_names=layers,
+        hutchinson_samples=args.relative_flatness_samples,
+        max_batches=args.relative_flatness_batches,
+        seed=args.relative_flatness_seed + 11,
+    )
+    flatness_val = measure_relative_flatness(
+        model,
+        val_loader,
+        criterion,
+        device=device,
+        modular=bundle.modular,
+        eq_position=bundle.eq_position,
+        layer_names=layers,
+        hutchinson_samples=args.relative_flatness_samples,
+        max_batches=args.relative_flatness_batches,
+        seed=args.relative_flatness_seed + 29,
+    )
+    flatness_rows = []
+    for role, partition_name, values in (
+        ("train", train_partition_name, flatness_train),
+        ("val", val_partition_name, flatness_val),
+    ):
+        for value in values:
+            flatness_rows.append({"partition": partition_name, "role": role, **value})
+    _write_csv_rows(
+        str(flatness_path),
+        flatness_rows,
+        list(flatness_rows[0].keys()) if flatness_rows else [],
+    )
+
+    flatness_by_partition = {
+        train_partition_name: flatness_train,
+        val_partition_name: flatness_val,
+    }
+    by_layer = {}
+    for name in layers:
+        value_train = next(item for item in flatness_train if item["layer"] == name)
+        value_val = next(item for item in flatness_val if item["layer"] == name)
+        by_layer[name] = {
+            "mean_signed_estimate": (value_train["signed_estimate"] + value_val["signed_estimate"]) / 2,
+            "mean_positive_part": (value_train["positive_part"] + value_val["positive_part"]) / 2,
+        }
+    final_objective, final_relative_gap, _, _, final_mean_loss = _objective_value_and_coefficients(
+        final_train.loss, final_val.loss, objective_mode=args.objective
+    )
+    final_by_partition = {
+        "a": asdict(final_train if train_partition_name == "a" else final_val),
+        "b": asdict(final_train if train_partition_name == "b" else final_val),
+    }
+    return {
+        "direction": direction_name,
+        "train_partition": train_partition_name,
+        "val_partition": val_partition_name,
+        "dataset": bundle.dataset_name,
+        "dataset_type": dataset_type_name,
+        "source_examples": bundle.source_examples,
+        "half_examples": len(bundle.partition_a),
+        "split_seed": args.split_seed,
+        "random_seed": args.random_seed,
+        "augmentation": _parse_augmentation(args.augmentation),
+        "augmentation_config": describe_augmentation(args.dataset, args.augmentation),
+        "excluded_source_indices": bundle.excluded_indices.tolist(),
+        "model_type": model_type_name,
+        "device": str(device),
+        "batch_size": batch_size,
+        "epochs": epochs,
+        "objective_mode": args.objective,
+        "optimizer": getattr(optimizer, "misalignment_config", None),
+        "files": {
+            "optimization": optimization_path.name,
+            "gradient_geometry": geometry_path.name if args.objective == "normalized_two_sided" else None,
+            "relative_flatness": flatness_path.name,
+            "initial_model": initial_model_path.name,
+            "final_model": final_model_path.name,
+        },
+        "final": {
+            "train": asdict(final_train),
+            "val": asdict(final_val),
+            "partition_a": final_by_partition["a"],
+            "partition_b": final_by_partition["b"],
+            "mean_loss": final_mean_loss,
+            "absolute_loss_gap": abs(final_train.loss - final_val.loss),
+            "relative_gap": final_relative_gap,
+            "objective": final_objective,
+        },
+        "relative_flatness": {
+            "layers": layers,
+            "samples": args.relative_flatness_samples,
+            "batches": args.relative_flatness_batches,
+            "symmetric_by_layer": by_layer,
+            "partitions": {
+                "train": flatness_train,
+                "val": flatness_val,
+                "a": flatness_by_partition["a"],
+                "b": flatness_by_partition["b"],
+            },
+        },
+        "misalignment_measure": {
+            "definition": "mean_positive_relative_flatness_across_the_two_equal_halves",
+            "by_layer": {name: values["mean_positive_part"] for name, values in by_layer.items()},
+            "overall_mean": sum(values["mean_positive_part"] for values in by_layer.values()) / max(1, len(by_layer)),
+        },
+        "optimization_last_row": rows[-1] if rows else None,
+    }
+
+
 def main() -> None:
     args = parse_args()
     if args.dataset == "modular" and not args.dataset_path:
@@ -973,7 +1182,7 @@ def main() -> None:
     loader_b = _build_loader(bundle.partition_b, batch_size, device=device, num_workers=args.num_workers, seed=args.random_seed + 202)
     model_type_name = bundle.ml_setup.model_type.name
     dataset_type_name = bundle.dataset_type_name
-    optimizer, scheduler, default_epochs = build_optimizer_and_scheduler(
+    _, _, default_epochs = build_optimizer_and_scheduler(
         bundle.ml_setup,
         model,
         bundle.partition_a,
@@ -995,12 +1204,7 @@ def main() -> None:
     output_folder.mkdir(parents=True, exist_ok=False)
     (output_folder / "command.txt").write_text(" ".join([sys.executable, *sys.argv]), encoding="utf-8")
     torch.save(bundle.permutation, output_folder / "split_permutation.pt")
-    save_model_state(
-        str(output_folder / "initial.model.pt"),
-        {name: value.detach().cpu().clone() for name, value in model.state_dict().items()},
-        model_type_name,
-        dataset_type_name,
-    )
+    initial_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
     logger.info(
         "dataset=%s source_examples=%d half_size=%d augmentation=%s batch_size=%d epochs=%d",
         bundle.dataset_name,
@@ -1010,114 +1214,53 @@ def main() -> None:
         batch_size,
         epochs,
     )
-    logger.info("objective mode = %s (partition A=train, partition B=val)", args.objective)
-
-    if args.objective == "normalized_two_sided":
-        rows = train_normalized_two_sided(
-            model,
-            loader_a,
-            loader_b,
-            criterion,
+    logger.info("objective mode = %s; running both train/val orientations", args.objective)
+    run_specs = (
+        ("a_as_train_b_as_val", "a", "b", loader_a, loader_b),
+        ("b_as_train_a_as_val", "b", "a", loader_b, loader_a),
+    )
+    runs = {}
+    for direction_name, train_partition_name, val_partition_name, train_loader, val_loader in run_specs:
+        runs[direction_name] = _run_direction(
+            direction_name=direction_name,
+            train_partition_name=train_partition_name,
+            val_partition_name=val_partition_name,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            bundle=bundle,
+            model=model,
+            initial_state=initial_state,
+            criterion=criterion,
             device=device,
-            modular=bundle.modular,
-            eq_position=bundle.eq_position,
-            optimizer=optimizer,
-            scheduler=scheduler,
+            batch_size=batch_size,
             epochs=epochs,
-            report_interval=args.report_interval,
-            csv_path=str(output_folder / "optimization.csv"),
-            gradient_geometry_csv_path=str(output_folder / "gradient_geometry.csv"),
+            args=args,
+            output_folder=output_folder,
+            model_type_name=model_type_name,
+            dataset_type_name=dataset_type_name,
         )
-    else:
-        rows = train_symmetric_objective(
-            model,
-            loader_a,
-            loader_b,
-            criterion,
-            device=device,
-            modular=bundle.modular,
-            eq_position=bundle.eq_position,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            epochs=epochs,
-            report_interval=args.report_interval,
-            csv_path=str(output_folder / "optimization.csv"),
-            objective_mode=args.objective,
-        )
-    save_model_state(str(output_folder / "final.model.pt"), model.state_dict(), model_type_name, dataset_type_name)
-
-    final_a = evaluate_partition(model, loader_a, criterion, device=device, modular=bundle.modular, eq_position=bundle.eq_position)
-    final_b = evaluate_partition(model, loader_b, criterion, device=device, modular=bundle.modular, eq_position=bundle.eq_position)
-    layers = _resolve_flatness_layers(model, args.relative_flatness_layers)
-    flatness_a = measure_relative_flatness(
-        model, loader_a, criterion, device=device, modular=bundle.modular, eq_position=bundle.eq_position,
-        layer_names=layers, hutchinson_samples=args.relative_flatness_samples,
-        max_batches=args.relative_flatness_batches, seed=args.relative_flatness_seed + 11,
-    )
-    flatness_b = measure_relative_flatness(
-        model, loader_b, criterion, device=device, modular=bundle.modular, eq_position=bundle.eq_position,
-        layer_names=layers, hutchinson_samples=args.relative_flatness_samples,
-        max_batches=args.relative_flatness_batches, seed=args.relative_flatness_seed + 29,
-    )
-    flatness_rows = []
-    for partition, values in (("a", flatness_a), ("b", flatness_b)):
-        for value in values:
-            flatness_rows.append({"partition": partition, **value})
-    by_layer = {}
-    for name in layers:
-        value_a = next(item for item in flatness_a if item["layer"] == name)
-        value_b = next(item for item in flatness_b if item["layer"] == name)
-        by_layer[name] = {
-            "mean_signed_estimate": (value_a["signed_estimate"] + value_b["signed_estimate"]) / 2,
-            "mean_positive_part": (value_a["positive_part"] + value_b["positive_part"]) / 2,
-        }
-    with open(output_folder / "relative_flatness.csv", "w", newline="", encoding="utf-8") as outfile:
-        fieldnames = list(flatness_rows[0].keys()) if flatness_rows else []
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(flatness_rows)
-    final_objective, final_relative_gap, _, _, final_mean_loss = _objective_value_and_coefficients(
-        final_a.loss, final_b.loss, objective_mode=args.objective
-    )
-    summary = {
+    measure_values = {
+        name: run["misalignment_measure"]["overall_mean"] for name, run in runs.items()
+    }
+    measure_items = list(measure_values.values())
+    aggregate = {
+        "schema_version": 2,
         "dataset": bundle.dataset_name,
         "dataset_type": dataset_type_name,
         "source_examples": bundle.source_examples,
         "half_examples": len(bundle.partition_a),
         "split_seed": args.split_seed,
         "random_seed": args.random_seed,
-        "augmentation": _parse_augmentation(args.augmentation),
-        "augmentation_config": describe_augmentation(args.dataset, args.augmentation),
-        "excluded_source_indices": bundle.excluded_indices.tolist(),
-        "model_type": model_type_name,
-        "device": str(device),
-        "batch_size": batch_size,
-        "epochs": epochs,
-        "objective_mode": args.objective,
-        "optimizer": getattr(optimizer, "misalignment_config", None),
-        "final": {
-            "partition_a": asdict(final_a),
-            "partition_b": asdict(final_b),
-            "mean_loss": final_mean_loss,
-            "absolute_loss_gap": abs(final_a.loss - final_b.loss),
-            "relative_gap": final_relative_gap,
-            "objective": final_objective,
+        "permutation_file": "split_permutation.pt",
+        "run_order": list(runs),
+        "runs": runs,
+        "aggregate": {
+            "misalignment_measure_by_direction": measure_values,
+            "mean_misalignment_measure": sum(measure_items) / max(1, len(measure_items)),
+            "absolute_direction_difference": abs(measure_items[0] - measure_items[1]),
         },
-        "relative_flatness": {
-            "layers": layers,
-            "samples": args.relative_flatness_samples,
-            "batches": args.relative_flatness_batches,
-            "symmetric_by_layer": by_layer,
-            "partitions": {"a": flatness_a, "b": flatness_b},
-        },
-        "misalignment_measure": {
-            "definition": "mean_positive_relative_flatness_across_the_two_equal_halves",
-            "by_layer": {name: values["mean_positive_part"] for name, values in by_layer.items()},
-            "overall_mean": sum(values["mean_positive_part"] for values in by_layer.values()) / max(1, len(by_layer)),
-        },
-        "optimization_last_row": rows[-1] if rows else None,
     }
-    _write_json(str(output_folder / "summary.json"), summary)
+    _write_json(str(output_folder / "summary.json"), aggregate)
     logger.info("finished; results written to %s", output_folder)
 
 

@@ -923,11 +923,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scheduler", choices=["auto", "none", "cosine", "onecycle"], default="auto")
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=None)
-    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--report_interval", type=int, default=1)
     parser.add_argument("--relative_flatness_layers", default="last_matrix_weight")
-    parser.add_argument("--relative_flatness_samples", type=int, default=4)
-    parser.add_argument("--relative_flatness_batches", type=int, default=1)
+    parser.add_argument("--relative_flatness_samples", type=int, default=8)
+    parser.add_argument(
+        "--relative_flatness_batches",
+        type=int,
+        default=-1,
+        help="number of batches for relative flatness; -1 uses all batches",
+    )
     parser.add_argument("--relative_flatness_seed", type=int, default=2718)
     parser.add_argument("--output_folder_name", "-o", default=None)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")

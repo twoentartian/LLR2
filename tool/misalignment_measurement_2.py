@@ -2,14 +2,18 @@
 """Symmetric train/validation misalignment measurement.
 
 The input data are combined, shuffled once, and split into two equally sized
-halves A and B.  The optimization objective is the symmetric cross-entropy
-gap
+halves A and B.  The optimization objective combines symmetric average loss
+with a bounded relative cross-entropy gap
 
-    J(theta) = -tanh((L_A(theta) - L_B(theta)) / 2)^2.
+    J(theta) = log((L_A(theta) + L_B(theta) + 1) / 2)
+               - |L_A(theta) - L_B(theta)|
+                 / (L_A(theta) + L_B(theta) + 1).
 
-It is invariant to exchanging A and B and is bounded below by -1.  The
-relative-flatness report is computed separately on the two original losses
-and then averaged, so the reported geometry is invariant to the names of the
+It is invariant to exchanging A and B.  The logarithmic average-loss term
+prevents the optimizer from increasing one partition's loss without bound,
+while the relative-gap term prefers a mismatch at a fixed average loss.  The
+relative-flatness report is computed separately on the two original losses and
+then averaged, so the reported geometry is invariant to the names of the
 halves as well.
 
 Supported datasets are MNIST, CIFAR-10, CIFAR-100, ImageNet-1k, and a modular
@@ -53,6 +57,12 @@ from py_src.model_opti_save_load import save_model_state
 from py_src.util import set_seed, setup_logging
 
 logger = logging.getLogger("misalignment_measurement_2")
+
+# The objective is expressed in terms of non-negative losses.  The unit offset
+# makes the logarithm and relative-gap denominator well behaved as a loss
+# approaches zero; it is fixed rather than exposed as a task-specific
+# hyperparameter.
+OBJECTIVE_OFFSET = 1.0
 
 
 @dataclass
@@ -321,7 +331,56 @@ def evaluate_partition(
 
 
 def _symmetric_objective(loss_a: torch.Tensor, loss_b: torch.Tensor) -> torch.Tensor:
-    return -torch.tanh(0.5 * (loss_a - loss_b)).square()
+    """Return the bounded, exchange-symmetric objective used for training.
+
+    The mean-loss term prevents the optimizer from making one partition's
+    cross-entropy arbitrarily large merely to increase the mismatch.  The
+    relative-gap term still prefers unequal losses at a fixed mean loss.
+    """
+    total_loss = loss_a + loss_b
+    relative_gap = torch.abs(loss_a - loss_b) / (total_loss + OBJECTIVE_OFFSET)
+    # log((LA + LB + 1) / 2) is a stable log-mean surrogate.  Using the same
+    # denominator as relative_gap keeps the analytic dataset-level gradient
+    # exact and bounded near zero loss.
+    return torch.log((total_loss + OBJECTIVE_OFFSET) / 2.0) - relative_gap
+
+
+def _objective_value_and_coefficients(
+    loss_a: float,
+    loss_b: float,
+    *,
+    offset: float = OBJECTIVE_OFFSET,
+) -> tuple[float, float, float, float, float]:
+    """Evaluate the scalar objective and its derivatives w.r.t. A/B losses.
+
+    ``train_symmetric_objective`` first evaluates each complete partition and
+    then accumulates mini-batch gradients.  These analytic coefficients make
+    that accumulation exactly match the gradient of the dataset-level
+    objective without retaining the evaluation graph.
+    """
+    if loss_a < 0.0 or loss_b < 0.0:
+        raise ValueError("the symmetric objective requires non-negative losses")
+    if offset <= 0.0:
+        raise ValueError("objective offset must be positive")
+    total = loss_a + loss_b
+    denominator = total + offset
+    absolute_difference = abs(loss_a - loss_b)
+    relative_gap = absolute_difference / denominator
+    objective = math.log(denominator / 2.0) - relative_gap
+    mean_coefficient = 1.0 / denominator
+    if loss_a > loss_b:
+        gap_coefficient_a = (2.0 * loss_b + offset) / (denominator * denominator)
+        gap_coefficient_b = -(2.0 * loss_a + offset) / (denominator * denominator)
+    elif loss_a < loss_b:
+        gap_coefficient_a = -(2.0 * loss_b + offset) / (denominator * denominator)
+        gap_coefficient_b = (2.0 * loss_a + offset) / (denominator * denominator)
+    else:
+        # Use the symmetric zero subgradient of abs(x) at x=0.
+        gap_coefficient_a = 0.0
+        gap_coefficient_b = 0.0
+    coefficient_a = mean_coefficient - gap_coefficient_a
+    coefficient_b = mean_coefficient - gap_coefficient_b
+    return objective, relative_gap, coefficient_a, coefficient_b, 0.5 * total
 
 
 def train_symmetric_objective(
@@ -356,10 +415,9 @@ def train_symmetric_objective(
         baseline_b = evaluate_partition(
             model, loader_b, criterion, device=device, modular=modular, eq_position=eq_position
         )
-        difference = 0.5 * (baseline_a.loss - baseline_b.loss)
-        tanh_difference = math.tanh(difference)
-        coefficient_a = -tanh_difference * (1.0 - tanh_difference * tanh_difference)
-        coefficient_b = -coefficient_a
+        _, _, coefficient_a, coefficient_b, _ = (
+            _objective_value_and_coefficients(baseline_a.loss, baseline_b.loss)
+        )
         optimizer.zero_grad(set_to_none=True)
         batches = 0
         for raw_a, raw_b in zip(loader_a, loader_b, strict=True):
@@ -392,14 +450,20 @@ def train_symmetric_objective(
         )
         mean_a = current_a.loss
         mean_b = current_b.loss
-        score = math.tanh(0.5 * (mean_a - mean_b)) ** 2
-        mean_objective = -score
+        (
+            mean_objective,
+            relative_gap_current,
+            _,
+            _,
+            mean_loss_current,
+        ) = _objective_value_and_coefficients(mean_a, mean_b)
         row = {
             "epoch": float(epoch),
             "loss_a": mean_a,
             "loss_b": mean_b,
+            "mean_loss": mean_loss_current,
             "abs_loss_gap": abs(mean_a - mean_b),
-            "symmetry_score": score,
+            "relative_gap": relative_gap_current,
             "objective": mean_objective,
             "batches": float(batches),
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
@@ -407,13 +471,14 @@ def train_symmetric_objective(
         rows.append(row)
         if epoch % max(1, report_interval) == 0 or epoch == epochs - 1:
             logger.info(
-                "epoch %d/%d: loss_a=%.6g loss_b=%.6g abs_gap=%.6g symmetry_score=%.6g objective=%.6g",
+                "epoch %d/%d: loss_a=%.6g loss_b=%.6g mean_loss=%.6g abs_gap=%.6g relative_gap=%.6g objective=%.6g",
                 epoch,
                 epochs,
                 mean_a,
                 mean_b,
+                mean_loss_current,
                 abs(mean_a - mean_b),
-                score,
+                relative_gap_current,
                 mean_objective,
             )
     with open(csv_path, "w", newline="", encoding="utf-8") as outfile:
@@ -708,7 +773,9 @@ def main() -> None:
         writer = csv.DictWriter(outfile, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(flatness_rows)
-    final_gap = abs(final_a.loss - final_b.loss)
+    final_objective, final_relative_gap, _, _, final_mean_loss = _objective_value_and_coefficients(
+        final_a.loss, final_b.loss
+    )
     summary = {
         "dataset": bundle.dataset_name,
         "dataset_type": dataset_type_name,
@@ -727,9 +794,10 @@ def main() -> None:
         "final": {
             "partition_a": asdict(final_a),
             "partition_b": asdict(final_b),
-            "absolute_loss_gap": final_gap,
-            "symmetry_score": math.tanh(0.5 * final_gap) ** 2,
-            "objective": -math.tanh(0.5 * final_gap) ** 2,
+            "mean_loss": final_mean_loss,
+            "absolute_loss_gap": abs(final_a.loss - final_b.loss),
+            "relative_gap": final_relative_gap,
+            "objective": final_objective,
         },
         "relative_flatness": {
             "layers": layers,

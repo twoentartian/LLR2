@@ -472,6 +472,8 @@ def train_symmetric_objective(
             "epoch": float(epoch),
             "loss_a": mean_a,
             "loss_b": mean_b,
+            "train_accuracy": current_a.accuracy,
+            "val_accuracy": current_b.accuracy,
             "mean_loss": mean_loss_current,
             "abs_loss_gap": abs(mean_a - mean_b),
             "relative_gap": relative_gap_current,
@@ -482,15 +484,18 @@ def train_symmetric_objective(
         rows.append(row)
         if epoch % max(1, report_interval) == 0 or epoch == epochs - 1:
             logger.info(
-                "epoch %d/%d: loss_a=%.6g loss_b=%.6g mean_loss=%.6g abs_gap=%.6g relative_gap=%.6g objective=%.6g",
+                "epoch %d/%d: train_loss=%.6g val_loss=%.6g train_acc=%.6g val_acc=%.6g mean_loss=%.6g abs_gap=%.6g relative_gap=%.6g objective=%.6g lr=%.6g",
                 epoch,
                 epochs,
                 mean_a,
                 mean_b,
+                current_a.accuracy,
+                current_b.accuracy,
                 mean_loss_current,
                 abs(mean_a - mean_b),
                 relative_gap_current,
                 mean_objective,
+                optimizer.param_groups[0]["lr"],
             )
     with open(csv_path, "w", newline="", encoding="utf-8") as outfile:
         writer = csv.DictWriter(outfile, fieldnames=list(rows[0].keys()) if rows else [])
@@ -647,6 +652,8 @@ def train_normalized_two_sided(
             "epoch": float(epoch),
             "loss_a": current_a.loss,
             "loss_b": current_b.loss,
+            "train_accuracy": current_a.accuracy,
+            "val_accuracy": current_b.accuracy,
             "mean_loss": mean_loss,
             "abs_loss_gap": absolute_gap,
             "relative_gap": relative_gap,
@@ -659,15 +666,18 @@ def train_normalized_two_sided(
             geometry_rows.append({"epoch": float(epoch), **stats})
         if epoch % max(1, report_interval) == 0 or epoch == epochs - 1:
             logger.info(
-                "epoch %d/%d: train_loss=%.6g val_loss=%.6g mean_loss=%.6g abs_gap=%.6g relative_gap=%.6g objective=train-val=%.6g",
+                "epoch %d/%d: train_loss=%.6g val_loss=%.6g train_acc=%.6g val_acc=%.6g mean_loss=%.6g abs_gap=%.6g relative_gap=%.6g objective=train-val=%.6g lr=%.6g",
                 epoch,
                 epochs,
                 current_a.loss,
                 current_b.loss,
+                current_a.accuracy,
+                current_b.accuracy,
                 mean_loss,
                 absolute_gap,
                 relative_gap,
                 objective,
+                optimizer.param_groups[0]["lr"],
             )
     with open(csv_path, "w", newline="", encoding="utf-8") as outfile:
         writer = csv.DictWriter(outfile, fieldnames=list(rows[0].keys()) if rows else [])

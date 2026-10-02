@@ -389,6 +389,19 @@ def _objective_value_and_coefficients(
     return objective, relative_gap, coefficient_a, coefficient_b, 0.5 * total
 
 
+def _write_csv_rows(
+    path: str,
+    rows: list[dict[str, Any]],
+    fieldnames: list[str],
+) -> None:
+    """Rewrite a small experiment CSV so completed epochs are immediately durable."""
+    with open(path, "w", newline="", encoding="utf-8") as outfile:
+        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+        outfile.flush()
+
+
 def train_symmetric_objective(
     model: nn.Module,
     loader_a: DataLoader,
@@ -408,6 +421,11 @@ def train_symmetric_objective(
     if epochs <= 0:
         raise ValueError("epochs must be positive")
     rows: list[dict[str, float]] = []
+    optimization_fields = [
+        "epoch", "loss_a", "loss_b", "train_accuracy", "val_accuracy", "mean_loss",
+        "abs_loss_gap", "relative_gap", "objective", "batches", "learning_rate",
+    ]
+    _write_csv_rows(csv_path, rows, optimization_fields)
     model.eval()
     for epoch in range(epochs):
         _set_augmentation_epoch(loader_a.dataset, epoch)
@@ -482,6 +500,7 @@ def train_symmetric_objective(
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
         }
         rows.append(row)
+        _write_csv_rows(csv_path, rows, optimization_fields)
         if epoch % max(1, report_interval) == 0 or epoch == epochs - 1:
             logger.info(
                 "epoch %d/%d: train_loss=%.6g val_loss=%.6g train_acc=%.6g val_acc=%.6g mean_loss=%.6g abs_gap=%.6g relative_gap=%.6g objective=%.6g lr=%.6g",
@@ -497,10 +516,6 @@ def train_symmetric_objective(
                 mean_objective,
                 optimizer.param_groups[0]["lr"],
             )
-    with open(csv_path, "w", newline="", encoding="utf-8") as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=list(rows[0].keys()) if rows else [])
-        writer.writeheader()
-        writer.writerows(rows)
     return rows
 
 
@@ -541,15 +556,19 @@ def _combine_normalized_train_val_gradients(
     val_gradients: list[torch.Tensor],
     *,
     parameters: list[nn.Parameter],
+    train_weight: float,
+    val_weight: float,
 ) -> tuple[list[torch.Tensor], list[dict[str, float | str]]]:
     """Build the per-parameter train-descent plus val-ascent gradient.
 
     For every parameter tensor, both gradients are normalized first.  The
-    signed directions are then added (train minus val because the optimizer
-    itself performs descent), and the result is rescaled to the original
-    train-gradient norm.  The returned tensors are detached and ready to be
-    assigned to ``parameter.grad`` before one Adam/SGD step.
+    signed directions are then weighted and added (train minus val because the
+    optimizer itself performs descent), and the result is rescaled to the
+    original train-gradient norm.  The returned tensors are detached and ready
+    to be assigned to ``parameter.grad`` before one Adam/SGD step.
     """
+    if train_weight < 0.0 or val_weight < 0.0:
+        raise ValueError("gradient weights must be non-negative")
     names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
     combined: list[torch.Tensor] = []
     stats: list[dict[str, float | str]] = []
@@ -568,7 +587,7 @@ def _combine_normalized_train_val_gradients(
         else:
             train_unit = train_gradient / train_norm
             val_unit = val_gradient / val_norm
-            signed_unit_sum = train_unit - val_unit
+            signed_unit_sum = train_weight * train_unit - val_weight * val_unit
             signed_unit_norm = float(signed_unit_sum.norm().item())
             if signed_unit_norm == 0.0:
                 combined_gradient = torch.zeros_like(train_gradient)
@@ -584,6 +603,8 @@ def _combine_normalized_train_val_gradients(
             "combined_gradient_norm": combined_norm,
             "parameter_norm": parameter_norm,
             "train_val_gradient_cosine": cosine,
+            "train_gradient_weight": train_weight,
+            "val_gradient_weight": val_weight,
             "relative_train_gradient": train_norm / max(parameter_norm, 1e-12),
             "relative_combined_gradient": combined_norm / max(parameter_norm, 1e-12),
         })
@@ -614,6 +635,19 @@ def train_normalized_two_sided(
         raise ValueError("model has no trainable parameters")
     rows: list[dict[str, float]] = []
     geometry_rows: list[dict[str, float | str]] = []
+    optimization_fields = [
+        "epoch", "loss_a", "loss_b", "train_accuracy", "val_accuracy", "mean_loss",
+        "abs_loss_gap", "relative_gap", "objective", "batches", "learning_rate",
+        "train_val_gradient_cosine", "train_gradient_weight", "val_gradient_weight",
+    ]
+    geometry_fields = [
+        "epoch", "parameter", "train_gradient_norm", "val_gradient_norm",
+        "combined_gradient_norm", "parameter_norm", "train_val_gradient_cosine",
+        "train_gradient_weight", "val_gradient_weight", "relative_train_gradient",
+        "relative_combined_gradient",
+    ]
+    _write_csv_rows(csv_path, rows, optimization_fields)
+    _write_csv_rows(gradient_geometry_csv_path, geometry_rows, geometry_fields)
     model.eval()
     for epoch in range(epochs):
         _set_augmentation_epoch(loader_a.dataset, epoch)
@@ -629,8 +663,16 @@ def train_normalized_two_sided(
             model, loader_b, criterion, device=device, modular=modular,
             eq_position=eq_position, parameters=parameters,
         )
+        progress = epoch / max(1, epochs - 1)
+        val_gradient_weight = 0.5 * progress
+        train_gradient_weight = 1.0 + val_gradient_weight
         combined_gradients, gradient_stats = _combine_normalized_train_val_gradients(
-            model, train_gradients, val_gradients, parameters=parameters
+            model,
+            train_gradients,
+            val_gradients,
+            parameters=parameters,
+            train_weight=train_gradient_weight,
+            val_weight=val_gradient_weight,
         )
         optimizer.zero_grad(set_to_none=True)
         for parameter, gradient in zip(parameters, combined_gradients, strict=True):
@@ -648,6 +690,14 @@ def train_normalized_two_sided(
         absolute_gap = abs(current_a.loss - current_b.loss)
         relative_gap = absolute_gap / (current_a.loss + current_b.loss + OBJECTIVE_OFFSET)
         objective = current_a.loss - current_b.loss
+        finite_cosines = [
+            float(stats["train_val_gradient_cosine"])
+            for stats in gradient_stats
+            if math.isfinite(float(stats["train_val_gradient_cosine"]))
+        ]
+        mean_gradient_cosine = (
+            sum(finite_cosines) / len(finite_cosines) if finite_cosines else float("nan")
+        )
         row = {
             "epoch": float(epoch),
             "loss_a": current_a.loss,
@@ -660,13 +710,18 @@ def train_normalized_two_sided(
             "objective": objective,
             "batches": float(len(loader_a) + len(loader_b)),
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
+            "train_val_gradient_cosine": mean_gradient_cosine,
+            "train_gradient_weight": train_gradient_weight,
+            "val_gradient_weight": val_gradient_weight,
         }
         rows.append(row)
         for stats in gradient_stats:
             geometry_rows.append({"epoch": float(epoch), **stats})
+        _write_csv_rows(csv_path, rows, optimization_fields)
+        _write_csv_rows(gradient_geometry_csv_path, geometry_rows, geometry_fields)
         if epoch % max(1, report_interval) == 0 or epoch == epochs - 1:
             logger.info(
-                "epoch %d/%d: train_loss=%.6g val_loss=%.6g train_acc=%.6g val_acc=%.6g mean_loss=%.6g abs_gap=%.6g relative_gap=%.6g objective=train-val=%.6g lr=%.6g",
+                "epoch %d/%d: train_loss=%.6g val_loss=%.6g train_acc=%.6g val_acc=%.6g mean_loss=%.6g abs_gap=%.6g relative_gap=%.6g objective=train-val=%.6g lr=%.6g train_w=%.6g val_w=%.6g",
                 epoch,
                 epochs,
                 current_a.loss,
@@ -678,16 +733,9 @@ def train_normalized_two_sided(
                 relative_gap,
                 objective,
                 optimizer.param_groups[0]["lr"],
+                train_gradient_weight,
+                val_gradient_weight,
             )
-    with open(csv_path, "w", newline="", encoding="utf-8") as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=list(rows[0].keys()) if rows else [])
-        writer.writeheader()
-        writer.writerows(rows)
-    with open(gradient_geometry_csv_path, "w", newline="", encoding="utf-8") as outfile:
-        fieldnames = list(geometry_rows[0].keys()) if geometry_rows else []
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(geometry_rows)
     return rows
 
 

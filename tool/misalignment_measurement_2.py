@@ -394,11 +394,18 @@ def _write_csv_rows(
     rows: list[dict[str, Any]],
     fieldnames: list[str],
 ) -> None:
-    """Rewrite a small experiment CSV so completed epochs are immediately durable."""
+    """Rewrite a small experiment CSV with compact numeric values."""
+    formatted_rows = [
+        {
+            fieldname: format(value, ".5g") if isinstance(value, float) else value
+            for fieldname, value in row.items()
+        }
+        for row in rows
+    ]
     with open(path, "w", newline="", encoding="utf-8") as outfile:
         writer = csv.DictWriter(outfile, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(formatted_rows)
         outfile.flush()
 
 

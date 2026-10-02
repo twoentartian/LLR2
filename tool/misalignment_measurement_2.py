@@ -3,12 +3,12 @@
 
 The input data are combined, shuffled once, and split into two equally sized
 halves A and B.  By default, partition A is treated as ``train`` and
-partition B as ``val`` and the optimization objective is
+partition B as ``val``.  The default optimizer update normalizes the train and
+val gradients independently per parameter tensor, combines train descent with
+val ascent, and rescales the result to the norm of the train gradient.
 
-    J(theta) = L_A(theta) - L_B(theta).
-
-Minimizing this objective descends on A and ascends on B.  The previous
-exchange-symmetric objective remains available with
+The raw ``L_A - L_B`` and previous exchange-symmetric objective remain
+available with ``--objective difference`` and
 ``--objective mean_relative_gap``.  The relative-flatness report is computed
 separately on the two original losses and then averaged.
 
@@ -355,10 +355,10 @@ def _objective_value_and_coefficients(
     that accumulation exactly match the gradient of the dataset-level
     objective without retaining the evaluation graph.
     """
-    if objective_mode == "difference":
-        # A is the train partition and B is the val partition.  The raw
-        # difference is deliberately asymmetric: minimizing it descends on A
-        # and ascends on B, exactly as requested for this experiment.
+    if objective_mode in {"difference", "normalized_two_sided"}:
+        # A is the train partition and B is the val partition.  Both modes
+        # report the raw difference; normalized_two_sided uses it only as a
+        # diagnostic because its actual update is constructed layer by layer.
         total = loss_a + loss_b
         relative_gap = abs(loss_a - loss_b) / (total + offset)
         return loss_a - loss_b, relative_gap, 1.0, -1.0, 0.5 * total
@@ -496,6 +496,188 @@ def train_symmetric_objective(
         writer = csv.DictWriter(outfile, fieldnames=list(rows[0].keys()) if rows else [])
         writer.writeheader()
         writer.writerows(rows)
+    return rows
+
+
+def _compute_partition_gradients(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    *,
+    device: torch.device,
+    modular: bool,
+    eq_position: int | None,
+    parameters: list[nn.Parameter],
+) -> list[torch.Tensor]:
+    """Compute the full-partition gradient without changing model parameters."""
+    gradients = [torch.zeros_like(parameter) for parameter in parameters]
+    example_count = len(loader.dataset)
+    if example_count == 0:
+        raise ValueError("cannot differentiate an empty partition")
+    for raw_batch in loader:
+        batch = _move_batch(raw_batch, device)
+        loss, _ = _loss_and_accuracy(
+            model, batch, criterion, modular=modular, eq_position=eq_position
+        )
+        count = int(batch["text"].shape[0] if modular else batch[0].shape[0])
+        batch_gradients = torch.autograd.grad(
+            loss, parameters, allow_unused=True, retain_graph=False
+        )
+        weight = count / example_count
+        for accumulator, gradient in zip(gradients, batch_gradients, strict=True):
+            if gradient is not None:
+                accumulator.add_(gradient.detach(), alpha=weight)
+    return gradients
+
+
+def _combine_normalized_train_val_gradients(
+    model: nn.Module,
+    train_gradients: list[torch.Tensor],
+    val_gradients: list[torch.Tensor],
+    *,
+    parameters: list[nn.Parameter],
+) -> tuple[list[torch.Tensor], list[dict[str, float | str]]]:
+    """Build the per-parameter train-descent plus val-ascent gradient.
+
+    For every parameter tensor, both gradients are normalized first.  The
+    signed directions are then added (train minus val because the optimizer
+    itself performs descent), and the result is rescaled to the original
+    train-gradient norm.  The returned tensors are detached and ready to be
+    assigned to ``parameter.grad`` before one Adam/SGD step.
+    """
+    names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
+    combined: list[torch.Tensor] = []
+    stats: list[dict[str, float | str]] = []
+    for name, parameter, train_gradient, val_gradient in zip(
+        names, parameters, train_gradients, val_gradients, strict=True
+    ):
+        train_norm = float(train_gradient.norm().item())
+        val_norm = float(val_gradient.norm().item())
+        parameter_norm = float(parameter.detach().norm().item())
+        if train_norm == 0.0:
+            combined_gradient = torch.zeros_like(train_gradient)
+            cosine = float("nan")
+        elif val_norm == 0.0:
+            combined_gradient = train_gradient.detach().clone()
+            cosine = float("nan")
+        else:
+            train_unit = train_gradient / train_norm
+            val_unit = val_gradient / val_norm
+            signed_unit_sum = train_unit - val_unit
+            signed_unit_norm = float(signed_unit_sum.norm().item())
+            if signed_unit_norm == 0.0:
+                combined_gradient = torch.zeros_like(train_gradient)
+            else:
+                combined_gradient = signed_unit_sum * (train_norm / signed_unit_norm)
+            cosine = float(torch.sum(train_gradient * val_gradient).item() / (train_norm * val_norm))
+        combined_norm = float(combined_gradient.norm().item())
+        combined.append(combined_gradient.detach())
+        stats.append({
+            "parameter": name,
+            "train_gradient_norm": train_norm,
+            "val_gradient_norm": val_norm,
+            "combined_gradient_norm": combined_norm,
+            "parameter_norm": parameter_norm,
+            "train_val_gradient_cosine": cosine,
+            "relative_train_gradient": train_norm / max(parameter_norm, 1e-12),
+            "relative_combined_gradient": combined_norm / max(parameter_norm, 1e-12),
+        })
+    return combined, stats
+
+
+def train_normalized_two_sided(
+    model: nn.Module,
+    loader_a: DataLoader,
+    loader_b: DataLoader,
+    criterion: nn.Module,
+    *,
+    device: torch.device,
+    modular: bool,
+    eq_position: int | None,
+    optimizer,
+    scheduler,
+    epochs: int,
+    report_interval: int,
+    csv_path: str,
+    gradient_geometry_csv_path: str,
+) -> list[dict[str, float]]:
+    """Run the normalized train-descent/val-ascent update from initialization."""
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if not parameters:
+        raise ValueError("model has no trainable parameters")
+    rows: list[dict[str, float]] = []
+    geometry_rows: list[dict[str, float | str]] = []
+    model.eval()
+    for epoch in range(epochs):
+        _set_augmentation_epoch(loader_a.dataset, epoch)
+        _set_augmentation_epoch(loader_b.dataset, epoch)
+        # Both gradients are computed before optimizer.step(), so they see the
+        # exact same parameter state.  The optimizer state is updated only once
+        # with the combined gradient below.
+        train_gradients = _compute_partition_gradients(
+            model, loader_a, criterion, device=device, modular=modular,
+            eq_position=eq_position, parameters=parameters,
+        )
+        val_gradients = _compute_partition_gradients(
+            model, loader_b, criterion, device=device, modular=modular,
+            eq_position=eq_position, parameters=parameters,
+        )
+        combined_gradients, gradient_stats = _combine_normalized_train_val_gradients(
+            model, train_gradients, val_gradients, parameters=parameters
+        )
+        optimizer.zero_grad(set_to_none=True)
+        for parameter, gradient in zip(parameters, combined_gradients, strict=True):
+            parameter.grad = gradient
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+        current_a = evaluate_partition(
+            model, loader_a, criterion, device=device, modular=modular, eq_position=eq_position
+        )
+        current_b = evaluate_partition(
+            model, loader_b, criterion, device=device, modular=modular, eq_position=eq_position
+        )
+        mean_loss = 0.5 * (current_a.loss + current_b.loss)
+        absolute_gap = abs(current_a.loss - current_b.loss)
+        relative_gap = absolute_gap / (current_a.loss + current_b.loss + OBJECTIVE_OFFSET)
+        objective = current_a.loss - current_b.loss
+        row = {
+            "epoch": float(epoch),
+            "loss_a": current_a.loss,
+            "loss_b": current_b.loss,
+            "mean_loss": mean_loss,
+            "abs_loss_gap": absolute_gap,
+            "relative_gap": relative_gap,
+            "objective": objective,
+            "batches": float(len(loader_a) + len(loader_b)),
+            "learning_rate": float(optimizer.param_groups[0]["lr"]),
+        }
+        rows.append(row)
+        for stats in gradient_stats:
+            geometry_rows.append({"epoch": float(epoch), **stats})
+        if epoch % max(1, report_interval) == 0 or epoch == epochs - 1:
+            logger.info(
+                "epoch %d/%d: train_loss=%.6g val_loss=%.6g mean_loss=%.6g abs_gap=%.6g relative_gap=%.6g objective=train-val=%.6g",
+                epoch,
+                epochs,
+                current_a.loss,
+                current_b.loss,
+                mean_loss,
+                absolute_gap,
+                relative_gap,
+                objective,
+            )
+    with open(csv_path, "w", newline="", encoding="utf-8") as outfile:
+        writer = csv.DictWriter(outfile, fieldnames=list(rows[0].keys()) if rows else [])
+        writer.writeheader()
+        writer.writerows(rows)
+    with open(gradient_geometry_csv_path, "w", newline="", encoding="utf-8") as outfile:
+        fieldnames = list(geometry_rows[0].keys()) if geometry_rows else []
+        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(geometry_rows)
     return rows
 
 
@@ -640,9 +822,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--augmentation", "--data_augmentation", default="none", help="none/0 or an integer augmentation level")
     parser.add_argument(
         "--objective",
-        choices=["difference", "mean_relative_gap"],
-        default="difference",
-        help="optimization objective: train loss minus val loss, or the previous symmetric objective",
+        choices=["normalized_two_sided", "difference", "mean_relative_gap"],
+        default="normalized_two_sided",
+        help="normalized train-descent/val-ascent update, raw train-val difference, or the previous symmetric objective",
     )
     parser.add_argument("--modulus", type=int, default=None)
     parser.add_argument("--split_seed", type=int, default=1729)
@@ -745,21 +927,38 @@ def main() -> None:
     )
     logger.info("objective mode = %s (partition A=train, partition B=val)", args.objective)
 
-    rows = train_symmetric_objective(
-        model,
-        loader_a,
-        loader_b,
-        criterion,
-        device=device,
-        modular=bundle.modular,
-        eq_position=bundle.eq_position,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        epochs=epochs,
-        report_interval=args.report_interval,
-        csv_path=str(output_folder / "optimization.csv"),
-        objective_mode=args.objective,
-    )
+    if args.objective == "normalized_two_sided":
+        rows = train_normalized_two_sided(
+            model,
+            loader_a,
+            loader_b,
+            criterion,
+            device=device,
+            modular=bundle.modular,
+            eq_position=bundle.eq_position,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epochs=epochs,
+            report_interval=args.report_interval,
+            csv_path=str(output_folder / "optimization.csv"),
+            gradient_geometry_csv_path=str(output_folder / "gradient_geometry.csv"),
+        )
+    else:
+        rows = train_symmetric_objective(
+            model,
+            loader_a,
+            loader_b,
+            criterion,
+            device=device,
+            modular=bundle.modular,
+            eq_position=bundle.eq_position,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epochs=epochs,
+            report_interval=args.report_interval,
+            csv_path=str(output_folder / "optimization.csv"),
+            objective_mode=args.objective,
+        )
     save_model_state(str(output_folder / "final.model.pt"), model.state_dict(), model_type_name, dataset_type_name)
 
     final_a = evaluate_partition(model, loader_a, criterion, device=device, modular=bundle.modular, eq_position=bundle.eq_position)

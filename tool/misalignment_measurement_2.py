@@ -673,8 +673,11 @@ def train_normalized_two_sided(
             eq_position=eq_position, parameters=parameters,
         )
         progress = epoch / max(1, epochs - 1)
+        # Ramp the validation contribution linearly from zero to one half.
+        # The train contribution is reduced at the same rate so that the
+        # total gradient weight is one throughout the run.
         val_gradient_weight = 0.5 * progress
-        train_gradient_weight = 1.0 + val_gradient_weight
+        train_gradient_weight = 1.0 - 0.5 * progress
         combined_gradients, gradient_stats = _combine_normalized_train_val_gradients(
             model,
             train_gradients,

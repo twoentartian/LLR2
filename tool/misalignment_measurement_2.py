@@ -611,6 +611,14 @@ def _combine_normalized_train_val_gradients(
     return combined, stats
 
 
+def _gradient_geometry_sample_epochs(epochs: int) -> set[int]:
+    """Select at most 100 evenly spaced epochs, including the first and last."""
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+    points = min(100, epochs)
+    return {index * (epochs - 1) // max(1, points - 1) for index in range(points)}
+
+
 def train_normalized_two_sided(
     model: nn.Module,
     loader_a: DataLoader,
@@ -635,6 +643,7 @@ def train_normalized_two_sided(
         raise ValueError("model has no trainable parameters")
     rows: list[dict[str, float]] = []
     geometry_rows: list[dict[str, float | str]] = []
+    geometry_sample_epochs = _gradient_geometry_sample_epochs(epochs)
     optimization_fields = [
         "epoch", "loss_a", "loss_b", "train_accuracy", "val_accuracy", "mean_loss",
         "abs_loss_gap", "relative_gap", "objective", "batches", "learning_rate",
@@ -715,10 +724,11 @@ def train_normalized_two_sided(
             "val_gradient_weight": val_gradient_weight,
         }
         rows.append(row)
-        for stats in gradient_stats:
-            geometry_rows.append({"epoch": float(epoch), **stats})
         _write_csv_rows(csv_path, rows, optimization_fields)
-        _write_csv_rows(gradient_geometry_csv_path, geometry_rows, geometry_fields)
+        if epoch in geometry_sample_epochs:
+            for stats in gradient_stats:
+                geometry_rows.append({"epoch": float(epoch), **stats})
+            _write_csv_rows(gradient_geometry_csv_path, geometry_rows, geometry_fields)
         if epoch % max(1, report_interval) == 0 or epoch == epochs - 1:
             logger.info(
                 "epoch %d/%d: train_loss=%.6g val_loss=%.6g train_acc=%.6g val_acc=%.6g mean_loss=%.6g abs_gap=%.6g relative_gap=%.6g objective=train-val=%.6g lr=%.6g train_w=%.6g val_w=%.6g",

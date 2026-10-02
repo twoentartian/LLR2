@@ -2,19 +2,15 @@
 """Symmetric train/validation misalignment measurement.
 
 The input data are combined, shuffled once, and split into two equally sized
-halves A and B.  The optimization objective combines symmetric average loss
-with a bounded relative cross-entropy gap
+halves A and B.  By default, partition A is treated as ``train`` and
+partition B as ``val`` and the optimization objective is
 
-    J(theta) = log((L_A(theta) + L_B(theta) + 1) / 2)
-               - |L_A(theta) - L_B(theta)|
-                 / (L_A(theta) + L_B(theta) + 1).
+    J(theta) = L_A(theta) - L_B(theta).
 
-It is invariant to exchanging A and B.  The logarithmic average-loss term
-prevents the optimizer from increasing one partition's loss without bound,
-while the relative-gap term prefers a mismatch at a fixed average loss.  The
-relative-flatness report is computed separately on the two original losses and
-then averaged, so the reported geometry is invariant to the names of the
-halves as well.
+Minimizing this objective descends on A and ascends on B.  The previous
+exchange-symmetric objective remains available with
+``--objective mean_relative_gap``.  The relative-flatness report is computed
+separately on the two original losses and then averaged.
 
 Supported datasets are MNIST, CIFAR-10, CIFAR-100, ImageNet-1k, and a modular
 dataset folder containing train.txt/val.txt (and optionally test.txt).
@@ -349,6 +345,7 @@ def _objective_value_and_coefficients(
     loss_a: float,
     loss_b: float,
     *,
+    objective_mode: str = "mean_relative_gap",
     offset: float = OBJECTIVE_OFFSET,
 ) -> tuple[float, float, float, float, float]:
     """Evaluate the scalar objective and its derivatives w.r.t. A/B losses.
@@ -358,6 +355,15 @@ def _objective_value_and_coefficients(
     that accumulation exactly match the gradient of the dataset-level
     objective without retaining the evaluation graph.
     """
+    if objective_mode == "difference":
+        # A is the train partition and B is the val partition.  The raw
+        # difference is deliberately asymmetric: minimizing it descends on A
+        # and ascends on B, exactly as requested for this experiment.
+        total = loss_a + loss_b
+        relative_gap = abs(loss_a - loss_b) / (total + offset)
+        return loss_a - loss_b, relative_gap, 1.0, -1.0, 0.5 * total
+    if objective_mode != "mean_relative_gap":
+        raise ValueError(f"unknown objective mode {objective_mode!r}")
     if loss_a < 0.0 or loss_b < 0.0:
         raise ValueError("the symmetric objective requires non-negative losses")
     if offset <= 0.0:
@@ -397,6 +403,7 @@ def train_symmetric_objective(
     epochs: int,
     report_interval: int,
     csv_path: str,
+    objective_mode: str,
 ) -> list[dict[str, float]]:
     if epochs <= 0:
         raise ValueError("epochs must be positive")
@@ -416,7 +423,9 @@ def train_symmetric_objective(
             model, loader_b, criterion, device=device, modular=modular, eq_position=eq_position
         )
         _, _, coefficient_a, coefficient_b, _ = (
-            _objective_value_and_coefficients(baseline_a.loss, baseline_b.loss)
+            _objective_value_and_coefficients(
+                baseline_a.loss, baseline_b.loss, objective_mode=objective_mode
+            )
         )
         optimizer.zero_grad(set_to_none=True)
         batches = 0
@@ -456,7 +465,9 @@ def train_symmetric_objective(
             _,
             _,
             mean_loss_current,
-        ) = _objective_value_and_coefficients(mean_a, mean_b)
+        ) = _objective_value_and_coefficients(
+            mean_a, mean_b, objective_mode=objective_mode
+        )
         row = {
             "epoch": float(epoch),
             "loss_a": mean_a,
@@ -627,6 +638,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_path", default=None, help="modular dataset folder containing train.txt/val.txt")
     parser.add_argument("-m", "--model_type", default=None, help="MLSetup model name; defaults depend on the dataset")
     parser.add_argument("--augmentation", "--data_augmentation", default="none", help="none/0 or an integer augmentation level")
+    parser.add_argument(
+        "--objective",
+        choices=["difference", "mean_relative_gap"],
+        default="difference",
+        help="optimization objective: train loss minus val loss, or the previous symmetric objective",
+    )
     parser.add_argument("--modulus", type=int, default=None)
     parser.add_argument("--split_seed", type=int, default=1729)
     parser.add_argument(
@@ -726,6 +743,7 @@ def main() -> None:
         batch_size,
         epochs,
     )
+    logger.info("objective mode = %s (partition A=train, partition B=val)", args.objective)
 
     rows = train_symmetric_objective(
         model,
@@ -740,6 +758,7 @@ def main() -> None:
         epochs=epochs,
         report_interval=args.report_interval,
         csv_path=str(output_folder / "optimization.csv"),
+        objective_mode=args.objective,
     )
     save_model_state(str(output_folder / "final.model.pt"), model.state_dict(), model_type_name, dataset_type_name)
 
@@ -774,7 +793,7 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(flatness_rows)
     final_objective, final_relative_gap, _, _, final_mean_loss = _objective_value_and_coefficients(
-        final_a.loss, final_b.loss
+        final_a.loss, final_b.loss, objective_mode=args.objective
     )
     summary = {
         "dataset": bundle.dataset_name,
@@ -790,6 +809,7 @@ def main() -> None:
         "device": str(device),
         "batch_size": batch_size,
         "epochs": epochs,
+        "objective_mode": args.objective,
         "optimizer": getattr(optimizer, "misalignment_config", None),
         "final": {
             "partition_a": asdict(final_a),

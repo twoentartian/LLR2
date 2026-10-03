@@ -52,7 +52,7 @@ from misalignment.optimizer import build_optimizer_and_scheduler
 from py_src.ml_setup import get_ml_setup_from_config
 from py_src.ml_setup.grokking import arithmetic_addition_grokking, build_grokking_model
 from py_src.ml_setup_dataset import ArithmeticDataset, DatasetSetup, DatasetType
-from py_src.model_opti_save_load import save_model_state
+from py_src.model_opti_save_load import load_model_state_file, save_model_state
 from py_src.util import set_seed, setup_logging
 
 logger = logging.getLogger("misalignment_measurement_2")
@@ -817,6 +817,9 @@ def measure_relative_flatness(
         batch = _move_batch(raw_batch, device)
         loss, accuracy = _loss_and_accuracy(model, batch, criterion, modular=modular, eq_position=eq_position)
         count = int(batch["text"].shape[0] if modular else batch[0].shape[0])
+        # Keep only the graph needed for the Hessian-vector products.  The
+        # last product does not need to retain it, which makes the allocator
+        # release the activation graph before the next batch is loaded.
         gradients = torch.autograd.grad(loss, selected, create_graph=True, retain_graph=True, allow_unused=True)
         loss_total += float(loss.detach().item()) * count
         accuracy_total += float(accuracy.detach().item()) * count
@@ -828,18 +831,25 @@ def measure_relative_flatness(
             generator = torch.Generator(device=parameter.device)
             generator.manual_seed(int(seed) + 1_000_003 * layer_index + batch_index)
             weight = parameter.detach()
-            for _ in range(hutchinson_samples):
+            for sample_index in range(hutchinson_samples):
                 probe = _rademacher_like(parameter, generator)
                 hessian_probe = torch.autograd.grad(
                     (gradient * probe).sum(),
                     parameter,
-                    retain_graph=True,
+                    retain_graph=not (layer_index == len(layer_names) - 1 and sample_index == hutchinson_samples - 1),
                     allow_unused=True,
                 )[0]
                 if hessian_probe is None:
+                    del probe
                     continue
                 relative_probe = weight @ (weight.transpose(0, 1) @ probe)
                 estimates[name].append(float((relative_probe * hessian_probe).sum().detach().item()))
+                del hessian_probe, relative_probe, probe
+        del gradient
+        # ``autograd.grad`` does not populate parameter.grad, but the local
+        # tensors still keep the current batch and its graph alive until the
+        # next loop iteration unless they are deleted explicitly.
+        del gradients, loss, accuracy, batch
         model.zero_grad(set_to_none=True)
     if examples == 0:
         raise ValueError("relative-flatness loader produced no examples")
@@ -933,7 +943,18 @@ def parse_args() -> argparse.Namespace:
         default=-1,
         help="number of batches for relative flatness; -1 uses all batches",
     )
+    parser.add_argument(
+        "--relative_flatness_batch_size",
+        type=int,
+        default=1024,
+        help="microbatch size used only for second-order relative-flatness measurement",
+    )
     parser.add_argument("--relative_flatness_seed", type=int, default=2718)
+    parser.add_argument(
+        "--flatness_from_checkpoint",
+        default=None,
+        help="skip training and measure flatness for an existing saved model checkpoint",
+    )
     parser.add_argument("--output_folder_name", "-o", default=None)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--num_threads", type=int, default=None)
@@ -952,6 +973,8 @@ def _run_direction(
     val_partition_name: str,
     train_loader: DataLoader,
     val_loader: DataLoader,
+    flatness_train_loader: DataLoader,
+    flatness_val_loader: DataLoader,
     bundle: DatasetBundle,
     model: nn.Module,
     initial_state: dict[str, torch.Tensor],
@@ -1040,7 +1063,7 @@ def _run_direction(
     layers = _resolve_flatness_layers(model, args.relative_flatness_layers)
     flatness_train = measure_relative_flatness(
         model,
-        train_loader,
+        flatness_train_loader,
         criterion,
         device=device,
         modular=bundle.modular,
@@ -1052,7 +1075,7 @@ def _run_direction(
     )
     flatness_val = measure_relative_flatness(
         model,
-        val_loader,
+        flatness_val_loader,
         criterion,
         device=device,
         modular=bundle.modular,
@@ -1133,6 +1156,7 @@ def _run_direction(
         "relative_flatness": {
             "layers": layers,
             "samples": args.relative_flatness_samples,
+            "batch_size": flatness_train_loader.batch_size,
             "batches": args.relative_flatness_batches,
             "symmetric_by_layer": by_layer,
             "partitions": {
@@ -1151,6 +1175,98 @@ def _run_direction(
     }
 
 
+def _measure_flatness_from_checkpoint(
+    *,
+    checkpoint_path: Path,
+    output_folder: Path,
+    bundle: DatasetBundle,
+    model: nn.Module,
+    criterion: nn.Module,
+    device: torch.device,
+    flatness_loader_a: DataLoader,
+    flatness_loader_b: DataLoader,
+    args: argparse.Namespace,
+    model_type_name: str,
+    dataset_type_name: str,
+) -> None:
+    """Measure flatness for an already trained A-as-train/B-as-val model.
+
+    This path deliberately does not construct an optimizer or execute any
+    training epochs.  It is used when a long training run already produced
+    ``final_a_as_train_b_as_val.model.pt`` and only its flatness is missing.
+    """
+    state, checkpoint_model_type, checkpoint_dataset_type = load_model_state_file(
+        str(checkpoint_path), map_location="cpu"
+    )
+    model.load_state_dict(state, strict=True)
+    model.eval()
+    layers = _resolve_flatness_layers(model, args.relative_flatness_layers)
+    flatness_a = measure_relative_flatness(
+        model,
+        flatness_loader_a,
+        criterion,
+        device=device,
+        modular=bundle.modular,
+        eq_position=bundle.eq_position,
+        layer_names=layers,
+        hutchinson_samples=args.relative_flatness_samples,
+        max_batches=args.relative_flatness_batches,
+        seed=args.relative_flatness_seed + 11,
+    )
+    flatness_b = measure_relative_flatness(
+        model,
+        flatness_loader_b,
+        criterion,
+        device=device,
+        modular=bundle.modular,
+        eq_position=bundle.eq_position,
+        layer_names=layers,
+        hutchinson_samples=args.relative_flatness_samples,
+        max_batches=args.relative_flatness_batches,
+        seed=args.relative_flatness_seed + 29,
+    )
+    rows = []
+    for partition_name, values in (("a", flatness_a), ("b", flatness_b)):
+        rows.extend({"partition": partition_name, "role": "checkpoint_flatness", **value} for value in values)
+    flatness_path = output_folder / "relative_flatness_a_as_train_b_as_val.csv"
+    _write_csv_rows(str(flatness_path), rows, list(rows[0].keys()) if rows else [])
+    by_layer = {}
+    for name in layers:
+        value_a = next(item for item in flatness_a if item["layer"] == name)
+        value_b = next(item for item in flatness_b if item["layer"] == name)
+        by_layer[name] = {
+            "partition_a_signed_estimate": value_a["signed_estimate"],
+            "partition_b_signed_estimate": value_b["signed_estimate"],
+            "mean_signed_estimate": (value_a["signed_estimate"] + value_b["signed_estimate"]) / 2,
+            "mean_positive_part": (value_a["positive_part"] + value_b["positive_part"]) / 2,
+        }
+    summary = {
+        "schema_version": 1,
+        "mode": "flatness_from_checkpoint",
+        "checkpoint": str(checkpoint_path),
+        "checkpoint_model_type": checkpoint_model_type,
+        "checkpoint_dataset_type": checkpoint_dataset_type,
+        "model_type": model_type_name,
+        "dataset": bundle.dataset_name,
+        "dataset_type": dataset_type_name,
+        "source_examples": bundle.source_examples,
+        "half_examples": len(bundle.partition_a),
+        "split_seed": args.split_seed,
+        "random_seed": args.random_seed,
+        "relative_flatness": {
+            "layers": layers,
+            "samples": args.relative_flatness_samples,
+            "batch_size": flatness_loader_a.batch_size,
+            "batches": args.relative_flatness_batches,
+            "partitions": {"a": flatness_a, "b": flatness_b},
+            "by_layer": by_layer,
+        },
+        "files": {"checkpoint": checkpoint_path.name, "relative_flatness": flatness_path.name},
+    }
+    _write_json(str(output_folder / "flatness_from_checkpoint.json"), summary)
+    logger.info("flatness computed from checkpoint=%s; results written to %s", checkpoint_path, output_folder)
+
+
 def main() -> None:
     args = parse_args()
     if args.dataset == "modular" and not args.dataset_path:
@@ -1163,6 +1279,8 @@ def main() -> None:
         raise ValueError("--num_workers must be non-negative")
     if args.relative_flatness_batches == 0 or args.relative_flatness_samples <= 0:
         raise ValueError("relative-flatness batches must be non-zero and samples must be positive")
+    if args.relative_flatness_batch_size <= 0:
+        raise ValueError("--relative_flatness_batch_size must be positive")
     if args.num_threads is not None:
         torch.set_num_threads(max(1, args.num_threads))
     set_seed(args.random_seed)
@@ -1185,8 +1303,57 @@ def main() -> None:
         batch_size = int(getattr(bundle.ml_setup, "default_batch_size", 64) or 64)
     loader_a = _build_loader(bundle.partition_a, batch_size, device=device, num_workers=args.num_workers, seed=args.random_seed + 101)
     loader_b = _build_loader(bundle.partition_b, batch_size, device=device, num_workers=args.num_workers, seed=args.random_seed + 202)
+    # Training on the whole modular partition is intentional, but using the
+    # same multi-million-example batch for create_graph=True flatness would
+    # retain all forward activations and trigger a CUDA OOM.  Flatness is an
+    # average over deterministic microbatches instead.
+    flatness_batch_size = min(batch_size, args.relative_flatness_batch_size)
+    flatness_loader_a = _build_loader(
+        bundle.partition_a,
+        flatness_batch_size,
+        device=device,
+        num_workers=args.num_workers,
+        seed=args.random_seed + 303,
+    )
+    flatness_loader_b = _build_loader(
+        bundle.partition_b,
+        flatness_batch_size,
+        device=device,
+        num_workers=args.num_workers,
+        seed=args.random_seed + 404,
+    )
     model_type_name = bundle.ml_setup.model_type.name
     dataset_type_name = bundle.dataset_type_name
+    if args.flatness_from_checkpoint is not None:
+        checkpoint_path = Path(args.flatness_from_checkpoint)
+        if not checkpoint_path.is_absolute():
+            checkpoint_path = Path.cwd() / checkpoint_path
+        checkpoint_path = checkpoint_path.resolve()
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"flatness checkpoint does not exist: {checkpoint_path}")
+        if args.output_folder_name is None:
+            output_folder = checkpoint_path.parent
+        else:
+            output_folder = Path(args.output_folder_name)
+            if not output_folder.is_absolute():
+                output_folder = Path.cwd() / output_folder
+            output_folder = output_folder.resolve()
+        output_folder.mkdir(parents=True, exist_ok=True)
+        (output_folder / "flatness_command.txt").write_text(" ".join([sys.executable, *sys.argv]), encoding="utf-8")
+        _measure_flatness_from_checkpoint(
+            checkpoint_path=checkpoint_path,
+            output_folder=output_folder,
+            bundle=bundle,
+            model=model,
+            criterion=criterion,
+            device=device,
+            flatness_loader_a=flatness_loader_a,
+            flatness_loader_b=flatness_loader_b,
+            args=args,
+            model_type_name=model_type_name,
+            dataset_type_name=dataset_type_name,
+        )
+        return
     _, _, default_epochs = build_optimizer_and_scheduler(
         bundle.ml_setup,
         model,
@@ -1211,12 +1378,13 @@ def main() -> None:
     torch.save(bundle.permutation, output_folder / "split_permutation.pt")
     initial_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
     logger.info(
-        "dataset=%s source_examples=%d half_size=%d augmentation=%s batch_size=%d epochs=%d",
+        "dataset=%s source_examples=%d half_size=%d augmentation=%s batch_size=%d flatness_batch_size=%d epochs=%d",
         bundle.dataset_name,
         bundle.source_examples,
         len(bundle.partition_a),
         args.augmentation,
         batch_size,
+        flatness_batch_size,
         epochs,
     )
     logger.info("objective mode = %s; running both train/val orientations", args.objective)
@@ -1232,6 +1400,8 @@ def main() -> None:
             val_partition_name=val_partition_name,
             train_loader=train_loader,
             val_loader=val_loader,
+            flatness_train_loader=(flatness_loader_a if train_partition_name == "a" else flatness_loader_b),
+            flatness_val_loader=(flatness_loader_b if val_partition_name == "b" else flatness_loader_a),
             bundle=bundle,
             model=model,
             initial_state=initial_state,

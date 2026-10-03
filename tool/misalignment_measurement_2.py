@@ -15,6 +15,10 @@ separately on the two original losses and then averaged.
 Each invocation evaluates both orientations from the same initial model:
 partition A as train/B as val, then B as train/A as val.
 
+The normalized two-sided update accepts arithmetic gradient-weight expressions
+in the variable ``f`` (the normalized epoch fraction). The defaults are the
+constant expressions ``0.5`` and ``0.5`` for train and val respectively.
+
 Supported datasets are MNIST, CIFAR-10, CIFAR-100, ImageNet-1k, and a modular
 dataset folder containing train.txt/val.txt (and optionally test.txt).
 """
@@ -22,18 +26,20 @@ dataset folder containing train.txt/val.txt (and optionally test.txt).
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import json
 import logging
 import math
 import os
+import operator
 import re
 import sys
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn.functional as F
@@ -629,6 +635,74 @@ def _gradient_geometry_sample_epochs(epochs: int) -> set[int]:
     return {index * (epochs - 1) // max(1, points - 1) for index in range(points)}
 
 
+_GRADIENT_WEIGHT_BINARY_OPERATORS: dict[type[ast.operator], Callable[[float, float], float]] = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+}
+_GRADIENT_WEIGHT_UNARY_OPERATORS: dict[type[ast.unaryop], Callable[[float], float]] = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
+_GRADIENT_WEIGHT_FUNCTIONS: dict[str, Callable[..., float]] = {
+    "abs": abs,
+    "max": max,
+    "min": min,
+}
+
+
+def _compile_gradient_weight_expression(expression: str, *, name: str) -> Callable[[float], float]:
+    """Compile a safe arithmetic expression of ``f`` into a weight function."""
+    source = str(expression).strip()
+    if not source:
+        raise ValueError(f"{name} must not be empty")
+    try:
+        tree = ast.parse(source, mode="eval")
+    except SyntaxError as error:
+        raise ValueError(f"invalid {name} expression {source!r}: {error.msg}") from error
+
+    def evaluate(node: ast.AST, fraction: float) -> float:
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body, fraction)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            return float(node.value)
+        if isinstance(node, ast.Name) and node.id == "f":
+            return fraction
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _GRADIENT_WEIGHT_UNARY_OPERATORS:
+            return _GRADIENT_WEIGHT_UNARY_OPERATORS[type(node.op)](evaluate(node.operand, fraction))
+        if isinstance(node, ast.BinOp) and type(node.op) in _GRADIENT_WEIGHT_BINARY_OPERATORS:
+            return _GRADIENT_WEIGHT_BINARY_OPERATORS[type(node.op)](
+                evaluate(node.left, fraction), evaluate(node.right, fraction)
+            )
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _GRADIENT_WEIGHT_FUNCTIONS:
+            if node.keywords:
+                raise ValueError(f"{name} does not support keyword arguments")
+            function = _GRADIENT_WEIGHT_FUNCTIONS[node.func.id]
+            return float(function(*(evaluate(argument, fraction) for argument in node.args)))
+        raise ValueError(
+            f"unsupported syntax in {name} expression {source!r}; use arithmetic with f"
+        )
+
+    def weight(fraction: float) -> float:
+        try:
+            value = float(evaluate(tree, float(fraction)))
+        except (ArithmeticError, TypeError, ValueError) as error:
+            raise ValueError(f"could not evaluate {name} expression {source!r} at f={fraction:g}: {error}") from error
+        if not math.isfinite(value):
+            raise ValueError(f"{name} expression {source!r} returned non-finite value at f={fraction:g}")
+        if value < 0.0:
+            raise ValueError(f"{name} expression {source!r} returned negative value {value:g} at f={fraction:g}")
+        return value
+
+    # Validate the endpoints before training starts, while still allowing
+    # expressions whose value changes between them.
+    weight(0.0)
+    weight(1.0)
+    return weight
+
+
 def train_normalized_two_sided(
     model: nn.Module,
     loader_a: DataLoader,
@@ -644,6 +718,8 @@ def train_normalized_two_sided(
     report_interval: int,
     csv_path: str,
     gradient_geometry_csv_path: str,
+    train_gradient_weight_function: str = "0.5",
+    val_gradient_weight_function: str = "0.5",
 ) -> list[dict[str, float]]:
     """Run the normalized train-descent/val-ascent update from initialization."""
     if epochs <= 0:
@@ -651,6 +727,12 @@ def train_normalized_two_sided(
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not parameters:
         raise ValueError("model has no trainable parameters")
+    train_weight_function = _compile_gradient_weight_expression(
+        train_gradient_weight_function, name="train gradient weight"
+    )
+    val_weight_function = _compile_gradient_weight_expression(
+        val_gradient_weight_function, name="val gradient weight"
+    )
     rows: list[dict[str, float]] = []
     geometry_rows: list[dict[str, float | str]] = []
     geometry_sample_epochs = _gradient_geometry_sample_epochs(epochs)
@@ -683,11 +765,8 @@ def train_normalized_two_sided(
             eq_position=eq_position, parameters=parameters,
         )
         progress = epoch / max(1, epochs - 1)
-        # Ramp the validation contribution linearly from zero to one half.
-        # The train contribution is reduced at the same rate so that the
-        # total gradient weight is one throughout the run.
-        val_gradient_weight = 0.5 * progress
-        train_gradient_weight = 1.0 - 0.5 * progress
+        train_gradient_weight = train_weight_function(progress)
+        val_gradient_weight = val_weight_function(progress)
         combined_gradients, gradient_stats = _combine_normalized_train_val_gradients(
             model,
             train_gradients,
@@ -935,6 +1014,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight_decay", type=float, default=None)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--report_interval", type=int, default=1)
+    parser.add_argument(
+        "--train_gradient_weight_function",
+        "--train_gradient_weight",
+        "--train-gradient-weight-function",
+        dest="train_gradient_weight_function",
+        default="0.5",
+        help="arithmetic expression for train gradient weight as a function of f; f is the normalized epoch fraction",
+    )
+    parser.add_argument(
+        "--val_gradient_weight_function",
+        "--val_gradient_weight",
+        "--val-gradient-weight-function",
+        dest="val_gradient_weight_function",
+        default="0.5",
+        help="arithmetic expression for val gradient weight as a function of f; f is the normalized epoch fraction",
+    )
     parser.add_argument("--relative_flatness_layers", default="last_matrix_weight")
     parser.add_argument("--relative_flatness_samples", type=int, default=8)
     parser.add_argument(
@@ -1035,6 +1130,8 @@ def _run_direction(
             report_interval=args.report_interval,
             csv_path=str(optimization_path),
             gradient_geometry_csv_path=str(geometry_path),
+            train_gradient_weight_function=args.train_gradient_weight_function,
+            val_gradient_weight_function=args.val_gradient_weight_function,
         )
     else:
         rows = train_symmetric_objective(
@@ -1135,6 +1232,11 @@ def _run_direction(
         "batch_size": batch_size,
         "epochs": epochs,
         "objective_mode": args.objective,
+        "gradient_weight_functions": {
+            "train": args.train_gradient_weight_function,
+            "val": args.val_gradient_weight_function,
+            "variable": "f=epoch/(epochs-1) for epochs>1, otherwise 0",
+        },
         "optimizer": getattr(optimizer, "misalignment_config", None),
         "files": {
             "optimization": optimization_path.name,

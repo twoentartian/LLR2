@@ -1132,7 +1132,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--optimizer_preset", type=int, default=0)
     parser.add_argument("--optimizer", choices=["auto", "sgd", "adam", "adamw"], default="auto")
-    parser.add_argument("--scheduler", choices=["auto", "none", "cosine", "onecycle"], default="auto")
+    parser.add_argument(
+        "--scheduler",
+        "--lr_schedule",
+        "--learning_rate_schedule",
+        dest="scheduler",
+        choices=["fixed", "cosine", "auto", "none", "onecycle"],
+        default="fixed",
+        help="learning-rate schedule: fixed (default), cosine annealing, or legacy auto/none/onecycle modes",
+    )
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=None)
     parser.add_argument("--num_workers", type=int, default=4)

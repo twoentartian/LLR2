@@ -54,7 +54,7 @@ class MisalignmentOptimizationSetup:
         learning_rate: float | None = None,
         weight_decay: float | None = None,
         optimizer: str = "auto",
-        scheduler: str = "auto",
+        scheduler: str = "fixed",
         updates_per_epoch: int = 1,
     ) -> MisalignmentOptimizerConfig:
         preset = int(preset)
@@ -85,11 +85,14 @@ class MisalignmentOptimizationSetup:
             optimizer_name = default_optimizer
         if optimizer_name not in ("sgd", "adam", "adamw"):
             raise ValueError("optimizer must be auto, sgd, adam, or adamw")
-        scheduler_name = "auto" if scheduler is None else str(scheduler).lower()
+        scheduler_name = "fixed" if scheduler is None else str(scheduler).lower()
         if scheduler_name == "auto":
             scheduler_name = "none" if dataset_name.startswith("mnist") else "onecycle" if dataset_name.startswith("cifar") else "cosine"
-        if scheduler_name not in ("none", "cosine", "onecycle"):
-            raise ValueError("scheduler must be auto, none, cosine, or onecycle")
+        # ``fixed`` is the explicit, constant-learning-rate mode used by the
+        # misalignment experiment.  Keep the historical ``none`` spelling as
+        # a backwards-compatible alias for the same behavior.
+        if scheduler_name not in ("fixed", "none", "cosine", "onecycle"):
+            raise ValueError("scheduler must be fixed, cosine, auto, none, or onecycle")
 
         actual_epochs = default_epochs if epochs is None else int(epochs)
         actual_updates_per_epoch = int(updates_per_epoch)
@@ -118,7 +121,13 @@ class MisalignmentOptimizationSetup:
             epochs=actual_epochs,
             updates_per_epoch=actual_updates_per_epoch,
             warmup_epochs=warmup_epochs,
-            minimum_learning_rate=actual_lr * minimum_lr_ratio,
+            # For a fixed schedule the effective minimum is the initial LR;
+            # the dataset-specific ratio only applies to cosine annealing.
+            minimum_learning_rate=(
+                actual_lr
+                if scheduler_name in ("fixed", "none")
+                else actual_lr * minimum_lr_ratio
+            ),
         )
 
     @staticmethod
@@ -131,7 +140,7 @@ class MisalignmentOptimizationSetup:
         learning_rate: float | None = None,
         weight_decay: float | None = None,
         optimizer: str = "auto",
-        scheduler: str = "auto",
+        scheduler: str = "fixed",
         updates_per_epoch: int = 1,
     ):
         config = MisalignmentOptimizationSetup.resolve_config(
@@ -207,7 +216,7 @@ def build_optimizer_and_scheduler(
     learning_rate: float | None = None,
     weight_decay: float | None = None,
     optimizer: str = "auto",
-    scheduler: str = "auto",
+    scheduler: str = "fixed",
 ):
     """Build a preset while preserving the original wrapper's call shape."""
     if batch_size <= 0:

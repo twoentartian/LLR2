@@ -56,6 +56,7 @@ class MisalignmentOptimizationSetup:
         optimizer: str = "auto",
         scheduler: str = "fixed",
         updates_per_epoch: int = 1,
+        warmup_epochs: int | None = None,
     ) -> MisalignmentOptimizerConfig:
         preset = int(preset)
         if preset not in (0, 1):
@@ -106,7 +107,18 @@ class MisalignmentOptimizationSetup:
             raise ValueError("learning_rate must be finite and positive")
         if not math.isfinite(actual_wd) or actual_wd < 0:
             raise ValueError("weight_decay must be finite and non-negative")
-        warmup_epochs = min(default_warmup, actual_epochs - 1) if scheduler_name == "cosine" else 0
+        # Fixed and cosine schedules share the dataset warmup.  The grokking
+        # phase-diagram scripts warm up linearly for 10 epochs before holding
+        # the learning rate constant; omitting it changes post-LN Transformer
+        # dynamics from the first Adam steps onward.
+        requested_warmup = default_warmup if warmup_epochs is None else int(warmup_epochs)
+        if requested_warmup < 0:
+            raise ValueError("warmup_epochs must be non-negative")
+        warmup_epochs = (
+            min(requested_warmup, actual_epochs - 1)
+            if scheduler_name in ("fixed", "none", "cosine")
+            else 0
+        )
         return MisalignmentOptimizerConfig(
             dataset=dataset_name,
             model=model_name,
@@ -142,6 +154,7 @@ class MisalignmentOptimizationSetup:
         optimizer: str = "auto",
         scheduler: str = "fixed",
         updates_per_epoch: int = 1,
+        warmup_epochs: int | None = None,
     ):
         config = MisalignmentOptimizationSetup.resolve_config(
             ml_setup,
@@ -152,6 +165,7 @@ class MisalignmentOptimizationSetup:
             optimizer=optimizer,
             scheduler=scheduler,
             updates_per_epoch=updates_per_epoch,
+            warmup_epochs=warmup_epochs,
         )
         if config.optimizer == "sgd":
             optimizer_instance = torch.optim.SGD(
@@ -199,6 +213,15 @@ class MisalignmentOptimizationSetup:
                 )
             else:
                 scheduler_instance = cosine
+        elif config.scheduler in ("fixed", "none") and config.warmup_epochs:
+            # After ``total_iters`` LinearLR keeps the factor at 1.0, giving a
+            # constant learning rate for the rest of training.
+            scheduler_instance = torch.optim.lr_scheduler.LinearLR(
+                optimizer_instance,
+                start_factor=1e-8,
+                end_factor=1.0,
+                total_iters=config.warmup_epochs * config.updates_per_epoch,
+            )
         # Keep the three-value return used by existing callers, while exposing
         # exact resolved values for summary/checkpoint metadata.
         optimizer_instance.misalignment_config = config.as_dict()
@@ -217,6 +240,7 @@ def build_optimizer_and_scheduler(
     weight_decay: float | None = None,
     optimizer: str = "auto",
     scheduler: str = "fixed",
+    warmup_epochs: int | None = None,
 ):
     """Build a preset while preserving the original wrapper's call shape."""
     if batch_size <= 0:
@@ -234,4 +258,5 @@ def build_optimizer_and_scheduler(
         optimizer=optimizer,
         scheduler=scheduler,
         updates_per_epoch=updates_per_epoch,
+        warmup_epochs=warmup_epochs,
     )

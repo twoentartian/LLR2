@@ -35,6 +35,7 @@ import math
 import os
 import operator
 import re
+import secrets
 import sys
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
@@ -1096,6 +1097,26 @@ def _build_loader(dataset: Dataset, batch_size: int, *, device: torch.device, nu
     )
 
 
+class _DeviceCachedLoader:
+    """Fixed-order batches materialized once on the training device.
+
+    Modular partitions are small integer tensors and the loaders never
+    shuffle, so caching yields exactly the same batches as the DataLoader
+    while avoiding per-epoch worker start-up and per-example collation.
+    """
+
+    def __init__(self, loader: DataLoader, device: torch.device) -> None:
+        self.dataset = loader.dataset
+        self.batch_size = loader.batch_size
+        self.batches = [_move_batch(batch, device) for batch in loader]
+
+    def __iter__(self):
+        return iter(self.batches)
+
+    def __len__(self) -> int:
+        return len(self.batches)
+
+
 def _write_json(path: str, payload: dict[str, Any]) -> None:
     with open(path, "w", encoding="utf-8") as outfile:
         json.dump(payload, outfile, indent=2, sort_keys=True, default=str)
@@ -1127,7 +1148,12 @@ def parse_args() -> argparse.Namespace:
         default="drop",
         help="when the combined source count is odd, drop one shuffled example (default) or fail",
     )
-    parser.add_argument("--random_seed", type=int, default=1729)
+    parser.add_argument(
+        "--random_seed",
+        type=int,
+        default=None,
+        help="seed for initialization, dropout and augmentation; omitted draws a fresh seed per run (recorded in summary.json)",
+    )
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--optimizer_preset", type=int, default=0)
@@ -1140,6 +1166,12 @@ def parse_args() -> argparse.Namespace:
         choices=["fixed", "cosine", "auto", "none", "onecycle"],
         default="fixed",
         help="learning-rate schedule: fixed (default), cosine annealing, or legacy auto/none/onecycle modes",
+    )
+    parser.add_argument(
+        "--warmup_epochs",
+        type=int,
+        default=None,
+        help="linear warmup epochs for fixed/cosine schedules (default: dataset preset, 10 for modular)",
     )
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=None)
@@ -1194,9 +1226,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--amp",
         dest="amp",
-        action="store_true",
-        default=False,
-        help="enable CUDA automatic mixed precision during training (default: disabled; ignored on CPU)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="CUDA automatic mixed precision during training, matching the grokking scripts (default: enabled; use --no-amp to disable; ignored on CPU)",
+    )
+    parser.add_argument(
+        "--directions",
+        choices=["both", "a_as_train_b_as_val", "b_as_train_a_as_val"],
+        default="both",
+        help="train/val orientations to run (default: both)",
     )
     parser.add_argument("--num_threads", type=int, default=None)
     parser.add_argument("--m_nlayer", type=int, default=None)
@@ -1242,6 +1280,7 @@ def _run_direction(
         weight_decay=args.weight_decay,
         optimizer=args.optimizer,
         scheduler=args.scheduler,
+        warmup_epochs=args.warmup_epochs,
     )
     runtime_model = model
     compile_enabled = False
@@ -1574,8 +1613,16 @@ def main() -> None:
         raise ValueError("--relative_flatness_batch_size must be positive")
     if args.num_threads is not None:
         torch.set_num_threads(max(1, args.num_threads))
-    set_seed(args.random_seed)
     setup_logging(logger, "main")
+    if args.random_seed is None:
+        # Each invocation gets an independent seed.  It is still applied
+        # explicitly so both directions share the same dropout stream and the
+        # run can be reproduced from the recorded value.
+        args.random_seed = secrets.randbelow(2**31)
+        logger.info("random seed not given; drew random_seed = %d", args.random_seed)
+    else:
+        logger.info("random_seed = %d", args.random_seed)
+    set_seed(args.random_seed)
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--device cuda requested but CUDA is unavailable")
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else args.device if args.device != "auto" else "cpu")
@@ -1594,6 +1641,9 @@ def main() -> None:
         batch_size = int(getattr(bundle.ml_setup, "default_batch_size", 64) or 64)
     loader_a = _build_loader(bundle.partition_a, batch_size, device=device, num_workers=args.num_workers, seed=args.random_seed + 101)
     loader_b = _build_loader(bundle.partition_b, batch_size, device=device, num_workers=args.num_workers, seed=args.random_seed + 202)
+    if bundle.modular:
+        loader_a = _DeviceCachedLoader(loader_a, device)
+        loader_b = _DeviceCachedLoader(loader_b, device)
     # Training on the whole modular partition is intentional, but using the
     # same multi-million-example batch for create_graph=True flatness would
     # retain all forward activations and trigger a CUDA OOM.  Flatness is an
@@ -1656,6 +1706,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         optimizer=args.optimizer,
         scheduler=args.scheduler,
+        warmup_epochs=args.warmup_epochs,
     )
     epochs = args.epochs if args.epochs is not None else int(default_epochs)
     output_folder = (
@@ -1678,10 +1729,14 @@ def main() -> None:
         flatness_batch_size,
         epochs,
     )
-    logger.info("objective mode = %s; running both train/val orientations", args.objective)
-    run_specs = (
-        ("a_as_train_b_as_val", "a", "b", loader_a, loader_b),
-        ("b_as_train_a_as_val", "b", "a", loader_b, loader_a),
+    logger.info("objective mode = %s; directions = %s", args.objective, args.directions)
+    run_specs = tuple(
+        spec
+        for spec in (
+            ("a_as_train_b_as_val", "a", "b", loader_a, loader_b),
+            ("b_as_train_a_as_val", "b", "a", loader_b, loader_a),
+        )
+        if args.directions in ("both", spec[0])
     )
     runs = {}
     for direction_name, train_partition_name, val_partition_name, train_loader, val_loader in run_specs:
@@ -1723,7 +1778,9 @@ def main() -> None:
         "aggregate": {
             "misalignment_measure_by_direction": measure_values,
             "mean_misalignment_measure": sum(measure_items) / max(1, len(measure_items)),
-            "absolute_direction_difference": abs(measure_items[0] - measure_items[1]),
+            "absolute_direction_difference": (
+                abs(measure_items[0] - measure_items[1]) if len(measure_items) == 2 else None
+            ),
         },
     }
     _write_json(str(output_folder / "summary.json"), aggregate)

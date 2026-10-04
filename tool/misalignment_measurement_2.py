@@ -1092,7 +1092,7 @@ def _build_loader(dataset: Dataset, batch_size: int, *, device: torch.device, nu
         generator=generator,
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
-        persistent_workers=False,
+        persistent_workers=True,
     )
 
 

@@ -1186,9 +1186,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--amp",
         dest="amp",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="use CUDA automatic mixed precision during training (default: enabled; ignored on CPU)",
+        action="store_true",
+        default=False,
+        help="enable CUDA automatic mixed precision during training (default: disabled; ignored on CPU)",
     )
     parser.add_argument("--num_threads", type=int, default=None)
     parser.add_argument("--m_nlayer", type=int, default=None)

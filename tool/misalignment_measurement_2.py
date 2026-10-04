@@ -446,10 +446,9 @@ def train_symmetric_objective(
     for epoch in range(epochs):
         _set_augmentation_epoch(loader_a.dataset, epoch)
         _set_augmentation_epoch(loader_b.dataset, epoch)
-        # First evaluate the two complete halves.  The derivative of the
-        # dataset-level objective is then accumulated over mini-batches, so
-        # memory use stays bounded while the update still corresponds to the
-        # objective of the whole halves.
+        # First evaluate the two complete halves to obtain the objective
+        # coefficients.  Each paired mini-batch is then differentiated and
+        # applied immediately, matching ordinary mini-batch optimization.
         baseline_a = evaluate_partition(
             model, loader_a, criterion, device=device, modular=modular, eq_position=eq_position
         )
@@ -461,7 +460,6 @@ def train_symmetric_objective(
                 baseline_a.loss, baseline_b.loss, objective_mode=objective_mode
             )
         )
-        optimizer.zero_grad(set_to_none=True)
         batches = 0
         for raw_a, raw_b in zip(loader_a, loader_b, strict=True):
             batch_a = _move_batch(raw_a, device)
@@ -480,11 +478,12 @@ def train_symmetric_objective(
                 coefficient_a * (count_a / len(loader_a.dataset)) * loss_a
                 + coefficient_b * (count_b / len(loader_b.dataset)) * loss_b
             )
+            optimizer.zero_grad(set_to_none=True)
             surrogate.backward()
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             batches += 1
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
         current_a = evaluate_partition(
             model, loader_a, criterion, device=device, modular=modular, eq_position=eq_position
         )
@@ -564,6 +563,36 @@ def _compute_partition_gradients(
             if gradient is not None:
                 accumulator.add_(gradient.detach(), alpha=weight)
     return gradients
+
+
+def _compute_batch_gradients(
+    model: nn.Module,
+    batch: Any,
+    criterion: nn.Module,
+    *,
+    device: torch.device,
+    modular: bool,
+    eq_position: int | None,
+    parameters: list[nn.Parameter],
+) -> list[torch.Tensor]:
+    """Compute a mean-loss gradient for one mini-batch.
+
+    Unlike :func:`_compute_partition_gradients`, this helper deliberately does
+    not apply a dataset-size weight.  The caller uses the resulting gradient
+    for one optimizer update immediately after the paired train/validation
+    mini-batches have been evaluated.
+    """
+    del device  # ``batch`` is already moved to the selected device by caller.
+    loss, _ = _loss_and_accuracy(
+        model, batch, criterion, modular=modular, eq_position=eq_position
+    )
+    gradients = torch.autograd.grad(
+        loss, parameters, allow_unused=True, retain_graph=False
+    )
+    return [
+        gradient.detach() if gradient is not None else torch.zeros_like(parameter)
+        for parameter, gradient in zip(parameters, gradients, strict=True)
+    ]
 
 
 def _combine_normalized_train_val_gradients(
@@ -753,34 +782,72 @@ def train_normalized_two_sided(
     for epoch in range(epochs):
         _set_augmentation_epoch(loader_a.dataset, epoch)
         _set_augmentation_epoch(loader_b.dataset, epoch)
-        # Both gradients are computed before optimizer.step(), so they see the
-        # exact same parameter state.  The optimizer state is updated only once
-        # with the combined gradient below.
-        train_gradients = _compute_partition_gradients(
-            model, loader_a, criterion, device=device, modular=modular,
-            eq_position=eq_position, parameters=parameters,
-        )
-        val_gradients = _compute_partition_gradients(
-            model, loader_b, criterion, device=device, modular=modular,
-            eq_position=eq_position, parameters=parameters,
-        )
         progress = epoch / max(1, epochs - 1)
         train_gradient_weight = train_weight_function(progress)
         val_gradient_weight = val_weight_function(progress)
-        combined_gradients, gradient_stats = _combine_normalized_train_val_gradients(
-            model,
-            train_gradients,
-            val_gradients,
-            parameters=parameters,
-            train_weight=train_gradient_weight,
-            val_weight=val_gradient_weight,
-        )
-        optimizer.zero_grad(set_to_none=True)
-        for parameter, gradient in zip(parameters, combined_gradients, strict=True):
-            parameter.grad = gradient
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
+        # Update immediately after every paired mini-batch.  Both gradients
+        # are evaluated before the step, so they refer to the same parameter
+        # state; the next pair then sees the updated model and optimizer state.
+        # This matches ordinary mini-batch training and is intentionally
+        # different from accumulating a full-partition gradient and taking a
+        # single optimizer step per epoch.
+        batches = 0
+        geometry_accumulators: dict[str, dict[str, float]] = {}
+        geometry_counts: dict[str, dict[str, int]] = {}
+        for raw_a, raw_b in zip(loader_a, loader_b, strict=True):
+            batch_a = _move_batch(raw_a, device)
+            batch_b = _move_batch(raw_b, device)
+            train_gradients = _compute_batch_gradients(
+                model, batch_a, criterion, device=device, modular=modular,
+                eq_position=eq_position, parameters=parameters,
+            )
+            val_gradients = _compute_batch_gradients(
+                model, batch_b, criterion, device=device, modular=modular,
+                eq_position=eq_position, parameters=parameters,
+            )
+            combined_gradients, batch_stats = _combine_normalized_train_val_gradients(
+                model,
+                train_gradients,
+                val_gradients,
+                parameters=parameters,
+                train_weight=train_gradient_weight,
+                val_weight=val_gradient_weight,
+            )
+            optimizer.zero_grad(set_to_none=True)
+            for parameter, gradient in zip(parameters, combined_gradients, strict=True):
+                parameter.grad = gradient
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+            batches += 1
+
+            # Keep the geometry CSV schema unchanged while reporting the mean
+            # geometry observed over the mini-batch updates in this epoch.
+            for stats in batch_stats:
+                name = str(stats["parameter"])
+                accumulator = geometry_accumulators.setdefault(name, {})
+                counts = geometry_counts.setdefault(name, {})
+                for field in geometry_fields:
+                    if field in ("epoch", "parameter", "train_gradient_weight", "val_gradient_weight"):
+                        continue
+                    value = float(stats[field])
+                    if math.isfinite(value):
+                        accumulator[field] = accumulator.get(field, 0.0) + value
+                        counts[field] = counts.get(field, 0) + 1
+
+        gradient_stats = []
+        for name in (str(parameter_name) for parameter_name, parameter in model.named_parameters() if parameter.requires_grad):
+            accumulator = geometry_accumulators.get(name, {})
+            counts = geometry_counts.get(name, {})
+            averaged: dict[str, float | str] = {"parameter": name}
+            for field in geometry_fields:
+                if field in ("epoch", "parameter", "train_gradient_weight", "val_gradient_weight"):
+                    continue
+                count = counts.get(field, 0)
+                averaged[field] = accumulator[field] / count if count else float("nan")
+            averaged["train_gradient_weight"] = train_gradient_weight
+            averaged["val_gradient_weight"] = val_gradient_weight
+            gradient_stats.append(averaged)
         current_a = evaluate_partition(
             model, loader_a, criterion, device=device, modular=modular, eq_position=eq_position
         )
@@ -809,7 +876,7 @@ def train_normalized_two_sided(
             "abs_loss_gap": absolute_gap,
             "relative_gap": relative_gap,
             "objective": objective,
-            "batches": float(len(loader_a) + len(loader_b)),
+            "batches": float(batches),
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
             "train_val_gradient_cosine": mean_gradient_cosine,
             "train_gradient_weight": train_gradient_weight,

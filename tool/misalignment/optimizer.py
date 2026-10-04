@@ -1,10 +1,9 @@
 """Optimizer presets for the symmetric misalignment experiment.
 
-Unlike normal minibatch training, this experiment computes a dataset-level
-objective and performs exactly one optimizer update per epoch. Scheduler
-durations therefore use the requested epoch count, independently of the
-batch size used to compute the two losses. These presets are local to this
-experiment and do not change project-wide MLSetup interfaces.
+The misalignment objectives are optimized after every paired mini-batch.
+Scheduler durations therefore count the number of mini-batch updates in each
+epoch. These presets are local to this experiment and do not change
+project-wide MLSetup interfaces.
 """
 
 from __future__ import annotations
@@ -56,6 +55,7 @@ class MisalignmentOptimizationSetup:
         weight_decay: float | None = None,
         optimizer: str = "auto",
         scheduler: str = "auto",
+        updates_per_epoch: int = 1,
     ) -> MisalignmentOptimizerConfig:
         preset = int(preset)
         if preset not in (0, 1):
@@ -92,6 +92,9 @@ class MisalignmentOptimizationSetup:
             raise ValueError("scheduler must be auto, none, cosine, or onecycle")
 
         actual_epochs = default_epochs if epochs is None else int(epochs)
+        actual_updates_per_epoch = int(updates_per_epoch)
+        if actual_updates_per_epoch <= 0:
+            raise ValueError("updates_per_epoch must be positive")
         actual_lr = default_lr if learning_rate is None else float(learning_rate)
         actual_wd = default_wd if weight_decay is None else float(weight_decay)
         if actual_epochs <= 0:
@@ -113,7 +116,7 @@ class MisalignmentOptimizationSetup:
             betas=(0.9, 0.98) if modular else (0.9, 0.999),
             eps=1e-8,
             epochs=actual_epochs,
-            updates_per_epoch=1,
+            updates_per_epoch=actual_updates_per_epoch,
             warmup_epochs=warmup_epochs,
             minimum_learning_rate=actual_lr * minimum_lr_ratio,
         )
@@ -129,6 +132,7 @@ class MisalignmentOptimizationSetup:
         weight_decay: float | None = None,
         optimizer: str = "auto",
         scheduler: str = "auto",
+        updates_per_epoch: int = 1,
     ):
         config = MisalignmentOptimizationSetup.resolve_config(
             ml_setup,
@@ -138,6 +142,7 @@ class MisalignmentOptimizationSetup:
             weight_decay=weight_decay,
             optimizer=optimizer,
             scheduler=scheduler,
+            updates_per_epoch=updates_per_epoch,
         )
         if config.optimizer == "sgd":
             optimizer_instance = torch.optim.SGD(
@@ -160,26 +165,28 @@ class MisalignmentOptimizationSetup:
             scheduler_instance = torch.optim.lr_scheduler.OneCycleLR(
                 optimizer_instance,
                 max_lr=config.learning_rate,
-                steps_per_epoch=1,
+                steps_per_epoch=config.updates_per_epoch,
                 epochs=config.epochs,
             )
         elif config.scheduler == "cosine":
+            total_updates = config.epochs * config.updates_per_epoch
+            warmup_updates = config.warmup_epochs * config.updates_per_epoch
             cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer_instance,
-                T_max=config.epochs - config.warmup_epochs,
+                T_max=max(1, total_updates - warmup_updates),
                 eta_min=config.minimum_learning_rate,
             )
-            if config.warmup_epochs:
+            if warmup_updates:
                 warmup = torch.optim.lr_scheduler.LinearLR(
                     optimizer_instance,
                     start_factor=1e-8,
                     end_factor=1.0,
-                    total_iters=config.warmup_epochs,
+                    total_iters=warmup_updates,
                 )
                 scheduler_instance = torch.optim.lr_scheduler.SequentialLR(
                     optimizer_instance,
                     schedulers=[warmup, cosine],
-                    milestones=[config.warmup_epochs],
+                    milestones=[warmup_updates],
                 )
             else:
                 scheduler_instance = cosine
@@ -207,6 +214,7 @@ def build_optimizer_and_scheduler(
         raise ValueError("batch_size must be positive")
     if len(training_dataset) == 0:
         raise ValueError("training_dataset must contain at least one example")
+    updates_per_epoch = max(1, math.ceil(len(training_dataset) / batch_size))
     return MisalignmentOptimizationSetup.get_optimizer_lr_scheduler_epoch(
         ml_setup,
         model,
@@ -216,4 +224,5 @@ def build_optimizer_and_scheduler(
         weight_decay=weight_decay,
         optimizer=optimizer,
         scheduler=scheduler,
+        updates_per_epoch=updates_per_epoch,
     )

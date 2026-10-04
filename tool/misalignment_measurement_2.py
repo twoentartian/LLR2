@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import contextlib
 import json
 import logging
 import math
@@ -433,6 +434,9 @@ def train_symmetric_objective(
     report_interval: int,
     csv_path: str,
     objective_mode: str,
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype | None = None,
+    scaler=None,
 ) -> list[dict[str, float]]:
     if epochs <= 0:
         raise ValueError("epochs must be positive")
@@ -442,8 +446,8 @@ def train_symmetric_objective(
         "abs_loss_gap", "relative_gap", "objective", "batches", "learning_rate",
     ]
     _write_csv_rows(csv_path, rows, optimization_fields)
-    model.eval()
     for epoch in range(epochs):
+        model.train()
         _set_augmentation_epoch(loader_a.dataset, epoch)
         _set_augmentation_epoch(loader_b.dataset, epoch)
         # First evaluate the two complete halves to obtain the objective
@@ -460,16 +464,23 @@ def train_symmetric_objective(
                 baseline_a.loss, baseline_b.loss, objective_mode=objective_mode
             )
         )
+        model.train()
         batches = 0
         for raw_a, raw_b in zip(loader_a, loader_b, strict=True):
             batch_a = _move_batch(raw_a, device)
             batch_b = _move_batch(raw_b, device)
-            loss_a, _ = _loss_and_accuracy(
-                model, batch_a, criterion, modular=modular, eq_position=eq_position
+            autocast_context = (
+                torch.autocast(device_type=device.type, dtype=amp_dtype)
+                if amp_enabled and device.type == "cuda" and amp_dtype is not None
+                else contextlib.nullcontext()
             )
-            loss_b, _ = _loss_and_accuracy(
-                model, batch_b, criterion, modular=modular, eq_position=eq_position
-            )
+            with autocast_context:
+                loss_a, _ = _loss_and_accuracy(
+                    model, batch_a, criterion, modular=modular, eq_position=eq_position
+                )
+                loss_b, _ = _loss_and_accuracy(
+                    model, batch_b, criterion, modular=modular, eq_position=eq_position
+                )
             count_a = int(batch_a["text"].shape[0] if modular else batch_a[0].shape[0])
             count_b = int(batch_b["text"].shape[0] if modular else batch_b[0].shape[0])
             if count_a != count_b:
@@ -478,9 +489,16 @@ def train_symmetric_objective(
                 coefficient_a * (count_a / len(loader_a.dataset)) * loss_a
                 + coefficient_b * (count_b / len(loader_b.dataset)) * loss_b
             )
+            if scaler is not None:
+                surrogate = scaler.scale(surrogate)
             optimizer.zero_grad(set_to_none=True)
             surrogate.backward()
-            optimizer.step()
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
             if scheduler is not None:
                 scheduler.step()
             batches += 1
@@ -574,6 +592,9 @@ def _compute_batch_gradients(
     modular: bool,
     eq_position: int | None,
     parameters: list[nn.Parameter],
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype | None = None,
+    scaler=None,
 ) -> list[torch.Tensor]:
     """Compute a mean-loss gradient for one mini-batch.
 
@@ -582,10 +603,17 @@ def _compute_batch_gradients(
     for one optimizer update immediately after the paired train/validation
     mini-batches have been evaluated.
     """
-    del device  # ``batch`` is already moved to the selected device by caller.
-    loss, _ = _loss_and_accuracy(
-        model, batch, criterion, modular=modular, eq_position=eq_position
+    autocast_context = (
+        torch.autocast(device_type=device.type, dtype=amp_dtype)
+        if amp_enabled and device.type == "cuda" and amp_dtype is not None
+        else contextlib.nullcontext()
     )
+    with autocast_context:
+        loss, _ = _loss_and_accuracy(
+            model, batch, criterion, modular=modular, eq_position=eq_position
+        )
+        if scaler is not None:
+            loss = scaler.scale(loss)
     gradients = torch.autograd.grad(
         loss, parameters, allow_unused=True, retain_graph=False
     )
@@ -593,6 +621,24 @@ def _compute_batch_gradients(
         gradient.detach() if gradient is not None else torch.zeros_like(parameter)
         for parameter, gradient in zip(parameters, gradients, strict=True)
     ]
+
+
+def _apply_gradient_update(optimizer, scheduler, parameters, gradients, scaler=None) -> None:
+    """Assign a manually constructed gradient and perform one optimizer step."""
+    optimizer.zero_grad(set_to_none=True)
+    for parameter, gradient in zip(parameters, gradients, strict=True):
+        parameter.grad = gradient
+    if scaler is not None:
+        # ``gradients`` are still loss-scaled.  Unscaling here lets GradScaler
+        # detect overflow before the optimizer update while preserving the
+        # normalized train/val combination above.
+        scaler.unscale_(optimizer)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+    if scheduler is not None:
+        scheduler.step()
 
 
 def _combine_normalized_train_val_gradients(
@@ -749,6 +795,9 @@ def train_normalized_two_sided(
     gradient_geometry_csv_path: str,
     train_gradient_weight_function: str = "0.5",
     val_gradient_weight_function: str = "0.5",
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype | None = None,
+    scaler=None,
 ) -> list[dict[str, float]]:
     """Run the normalized train-descent/val-ascent update from initialization."""
     if epochs <= 0:
@@ -778,8 +827,10 @@ def train_normalized_two_sided(
     ]
     _write_csv_rows(csv_path, rows, optimization_fields)
     _write_csv_rows(gradient_geometry_csv_path, geometry_rows, geometry_fields)
-    model.eval()
     for epoch in range(epochs):
+        # Keep dropout and other train-time layers enabled during optimization.
+        # evaluate_partition switches back to eval mode for epoch metrics.
+        model.train()
         _set_augmentation_epoch(loader_a.dataset, epoch)
         _set_augmentation_epoch(loader_b.dataset, epoch)
         progress = epoch / max(1, epochs - 1)
@@ -796,15 +847,23 @@ def train_normalized_two_sided(
         geometry_counts: dict[str, dict[str, int]] = {}
         for raw_a, raw_b in zip(loader_a, loader_b, strict=True):
             batch_a = _move_batch(raw_a, device)
-            batch_b = _move_batch(raw_b, device)
             train_gradients = _compute_batch_gradients(
                 model, batch_a, criterion, device=device, modular=modular,
                 eq_position=eq_position, parameters=parameters,
+                amp_enabled=amp_enabled, amp_dtype=amp_dtype, scaler=scaler,
             )
-            val_gradients = _compute_batch_gradients(
-                model, batch_b, criterion, device=device, modular=modular,
-                eq_position=eq_position, parameters=parameters,
-            )
+            if val_gradient_weight == 0.0:
+                # Avoid an unnecessary validation forward/backward pass.  In
+                # particular, this keeps train-only runs from consuming extra
+                # dropout RNG values and makes them a faithful train baseline.
+                val_gradients = [torch.zeros_like(gradient) for gradient in train_gradients]
+            else:
+                batch_b = _move_batch(raw_b, device)
+                val_gradients = _compute_batch_gradients(
+                    model, batch_b, criterion, device=device, modular=modular,
+                    eq_position=eq_position, parameters=parameters,
+                    amp_enabled=amp_enabled, amp_dtype=amp_dtype, scaler=scaler,
+                )
             combined_gradients, batch_stats = _combine_normalized_train_val_gradients(
                 model,
                 train_gradients,
@@ -813,12 +872,9 @@ def train_normalized_two_sided(
                 train_weight=train_gradient_weight,
                 val_weight=val_gradient_weight,
             )
-            optimizer.zero_grad(set_to_none=True)
-            for parameter, gradient in zip(parameters, combined_gradients, strict=True):
-                parameter.grad = gradient
-            optimizer.step()
-            if scheduler is not None:
-                scheduler.step()
+            _apply_gradient_update(
+                optimizer, scheduler, parameters, combined_gradients, scaler=scaler
+            )
             batches += 1
 
             # Keep the geometry CSV schema unchanged while reporting the mean
@@ -1119,6 +1175,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output_folder_name", "-o", default=None)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument(
+        "--torch_compile",
+        "--compile",
+        dest="torch_compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="compile the training model with torch.compile (default: enabled; use --no-compile to disable)",
+    )
+    parser.add_argument(
+        "--amp",
+        dest="amp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="use CUDA automatic mixed precision during training (default: enabled; ignored on CPU)",
+    )
     parser.add_argument("--num_threads", type=int, default=None)
     parser.add_argument("--m_nlayer", type=int, default=None)
     parser.add_argument("--m_n_heads", type=int, default=None)
@@ -1164,6 +1235,37 @@ def _run_direction(
         optimizer=args.optimizer,
         scheduler=args.scheduler,
     )
+    runtime_model = model
+    compile_enabled = False
+    if args.torch_compile:
+        if hasattr(torch, "compile"):
+            try:
+                runtime_model = torch.compile(model)
+                compile_enabled = True
+                logger.info("torch.compile enabled for direction=%s", direction_name)
+            except Exception as exc:
+                logger.warning("torch.compile unavailable; using eager model: %s", exc)
+        else:
+            logger.warning("torch.compile is not available in this PyTorch build")
+
+    amp_enabled = bool(args.amp and device.type == "cuda")
+    amp_dtype = None
+    scaler = None
+    if amp_enabled:
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        if amp_dtype == torch.float16:
+            try:
+                scaler = torch.amp.GradScaler("cuda", enabled=True)
+            except (AttributeError, TypeError):
+                scaler = torch.cuda.amp.GradScaler(enabled=True)
+        logger.info(
+            "CUDA AMP enabled for direction=%s: dtype=%s grad_scaler=%s",
+            direction_name,
+            amp_dtype,
+            scaler is not None,
+        )
+    else:
+        logger.info("CUDA AMP disabled for direction=%s", direction_name)
     logger.info(
         "starting direction=%s: train=partition_%s val=partition_%s",
         direction_name,
@@ -1184,7 +1286,7 @@ def _run_direction(
 
     if args.objective == "normalized_two_sided":
         rows = train_normalized_two_sided(
-            model,
+            runtime_model,
             train_loader,
             val_loader,
             criterion,
@@ -1199,10 +1301,13 @@ def _run_direction(
             gradient_geometry_csv_path=str(geometry_path),
             train_gradient_weight_function=args.train_gradient_weight_function,
             val_gradient_weight_function=args.val_gradient_weight_function,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            scaler=scaler,
         )
     else:
         rows = train_symmetric_objective(
-            model,
+            runtime_model,
             train_loader,
             val_loader,
             criterion,
@@ -1215,14 +1320,17 @@ def _run_direction(
             report_interval=args.report_interval,
             csv_path=str(optimization_path),
             objective_mode=args.objective,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+            scaler=scaler,
         )
     save_model_state(str(final_model_path), model.state_dict(), model_type_name, dataset_type_name)
 
     final_train = evaluate_partition(
-        model, train_loader, criterion, device=device, modular=bundle.modular, eq_position=bundle.eq_position
+        runtime_model, train_loader, criterion, device=device, modular=bundle.modular, eq_position=bundle.eq_position
     )
     final_val = evaluate_partition(
-        model, val_loader, criterion, device=device, modular=bundle.modular, eq_position=bundle.eq_position
+        runtime_model, val_loader, criterion, device=device, modular=bundle.modular, eq_position=bundle.eq_position
     )
     layers = _resolve_flatness_layers(model, args.relative_flatness_layers)
     flatness_train = measure_relative_flatness(
@@ -1296,6 +1404,12 @@ def _run_direction(
         "excluded_source_indices": bundle.excluded_indices.tolist(),
         "model_type": model_type_name,
         "device": str(device),
+        "runtime": {
+            "torch_compile": compile_enabled,
+            "amp": amp_enabled,
+            "amp_dtype": str(amp_dtype) if amp_dtype is not None else None,
+            "grad_scaler": scaler is not None,
+        },
         "batch_size": batch_size,
         "epochs": epochs,
         "objective_mode": args.objective,

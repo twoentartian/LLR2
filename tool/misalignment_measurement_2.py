@@ -15,6 +15,11 @@ separately on the two original losses and then averaged.
 Each invocation evaluates both orientations from the same initial model:
 partition A as train/B as val, then B as train/A as val.
 
+Each orientation retains the five epochs with the largest absolute accuracy
+gap and the five with the largest absolute loss gap. Their checkpoint union
+is measured for relative flatness after training, in addition to the final
+model; an epoch selected by both rankings is measured only once.
+
 The normalized two-sided update accepts arithmetic gradient-weight expressions
 in the variable ``f`` (the normalized epoch fraction). The defaults are the
 constant expressions ``0.5`` and ``0.5`` for train and val respectively.
@@ -56,6 +61,7 @@ from misalignment.augmentation import (
     parse_augmentation_level,
 )
 from misalignment.optimizer import build_optimizer_and_scheduler
+from misalignment.checkpoints import GapCheckpointTracker
 
 from py_src.ml_setup import get_ml_setup_from_config
 from py_src.ml_setup.grokking import arithmetic_addition_grokking, build_grokking_model
@@ -438,13 +444,14 @@ def train_symmetric_objective(
     amp_enabled: bool = False,
     amp_dtype: torch.dtype | None = None,
     scaler=None,
+    epoch_callback: Callable[[dict[str, float]], None] | None = None,
 ) -> list[dict[str, float]]:
     if epochs <= 0:
         raise ValueError("epochs must be positive")
     rows: list[dict[str, float]] = []
     optimization_fields = [
         "epoch", "loss_a", "loss_b", "train_accuracy", "val_accuracy", "mean_loss",
-        "abs_loss_gap", "relative_gap", "objective", "batches", "learning_rate",
+        "abs_accuracy_gap", "abs_loss_gap", "relative_gap", "objective", "batches", "learning_rate",
     ]
     _write_csv_rows(csv_path, rows, optimization_fields)
     for epoch in range(epochs):
@@ -527,6 +534,7 @@ def train_symmetric_objective(
             "train_accuracy": current_a.accuracy,
             "val_accuracy": current_b.accuracy,
             "mean_loss": mean_loss_current,
+            "abs_accuracy_gap": abs(current_a.accuracy - current_b.accuracy),
             "abs_loss_gap": abs(mean_a - mean_b),
             "relative_gap": relative_gap_current,
             "objective": mean_objective,
@@ -534,6 +542,8 @@ def train_symmetric_objective(
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
         }
         rows.append(row)
+        if epoch_callback is not None:
+            epoch_callback(row)
         _write_csv_rows(csv_path, rows, optimization_fields)
         if epoch % max(1, report_interval) == 0 or epoch == epochs - 1:
             logger.info(
@@ -799,6 +809,7 @@ def train_normalized_two_sided(
     amp_enabled: bool = False,
     amp_dtype: torch.dtype | None = None,
     scaler=None,
+    epoch_callback: Callable[[dict[str, float]], None] | None = None,
 ) -> list[dict[str, float]]:
     """Run the normalized train-descent/val-ascent update from initialization."""
     if epochs <= 0:
@@ -817,7 +828,7 @@ def train_normalized_two_sided(
     geometry_sample_epochs = _gradient_geometry_sample_epochs(epochs)
     optimization_fields = [
         "epoch", "loss_a", "loss_b", "train_accuracy", "val_accuracy", "mean_loss",
-        "abs_loss_gap", "relative_gap", "objective", "batches", "learning_rate",
+        "abs_accuracy_gap", "abs_loss_gap", "relative_gap", "objective", "batches", "learning_rate",
         "train_val_gradient_cosine", "train_gradient_weight", "val_gradient_weight",
     ]
     geometry_fields = [
@@ -930,6 +941,7 @@ def train_normalized_two_sided(
             "train_accuracy": current_a.accuracy,
             "val_accuracy": current_b.accuracy,
             "mean_loss": mean_loss,
+            "abs_accuracy_gap": abs(current_a.accuracy - current_b.accuracy),
             "abs_loss_gap": absolute_gap,
             "relative_gap": relative_gap,
             "objective": objective,
@@ -940,6 +952,8 @@ def train_normalized_two_sided(
             "val_gradient_weight": val_gradient_weight,
         }
         rows.append(row)
+        if epoch_callback is not None:
+            epoch_callback(row)
         _write_csv_rows(csv_path, rows, optimization_fields)
         if epoch in geometry_sample_epochs:
             for stats in gradient_stats:
@@ -1080,6 +1094,137 @@ def measure_relative_flatness(
     return results
 
 
+def _measure_direction_relative_flatness(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    criterion: nn.Module,
+    *,
+    device: torch.device,
+    modular: bool,
+    eq_position: int | None,
+    layers: list[str],
+    train_partition_name: str,
+    val_partition_name: str,
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    """Measure one model using the same settings for final and top-gap points."""
+    flatness_train = measure_relative_flatness(
+        model, train_loader, criterion,
+        device=device, modular=modular, eq_position=eq_position,
+        layer_names=layers, hutchinson_samples=args.relative_flatness_samples,
+        max_batches=args.relative_flatness_batches, seed=args.relative_flatness_seed + 11,
+    )
+    flatness_val = measure_relative_flatness(
+        model, val_loader, criterion,
+        device=device, modular=modular, eq_position=eq_position,
+        layer_names=layers, hutchinson_samples=args.relative_flatness_samples,
+        max_batches=args.relative_flatness_batches, seed=args.relative_flatness_seed + 29,
+    )
+    rows = [
+        {"partition": partition_name, "role": role, **value}
+        for role, partition_name, values in (
+            ("train", train_partition_name, flatness_train),
+            ("val", val_partition_name, flatness_val),
+        )
+        for value in values
+    ]
+    by_partition = {train_partition_name: flatness_train, val_partition_name: flatness_val}
+    by_layer = {}
+    for name in layers:
+        train_value = next(item for item in flatness_train if item["layer"] == name)
+        val_value = next(item for item in flatness_val if item["layer"] == name)
+        by_layer[name] = {
+            "mean_signed_estimate": (train_value["signed_estimate"] + val_value["signed_estimate"]) / 2,
+            "mean_positive_part": (train_value["positive_part"] + val_value["positive_part"]) / 2,
+        }
+    report = {
+        "layers": layers,
+        "samples": args.relative_flatness_samples,
+        "batch_size": train_loader.batch_size,
+        "batches": args.relative_flatness_batches,
+        "symmetric_by_layer": by_layer,
+        "partitions": {
+            "train": flatness_train,
+            "val": flatness_val,
+            "a": by_partition["a"],
+            "b": by_partition["b"],
+        },
+    }
+    measure = {
+        "definition": "mean_positive_relative_flatness_across_the_two_equal_halves",
+        "by_layer": {name: values["mean_positive_part"] for name, values in by_layer.items()},
+        "overall_mean": sum(values["mean_positive_part"] for values in by_layer.values()) / max(1, len(by_layer)),
+    }
+    return report, measure, rows
+
+
+def _measure_gap_checkpoint_union(
+    *,
+    tracker: GapCheckpointTracker,
+    model: nn.Module,
+    direction_name: str,
+    final_epoch: int,
+    final_checkpoint_path: Path,
+    final_result: tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]],
+    measure_model: Callable[[], tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]],
+) -> dict[str, Any]:
+    """Load each retained epoch once and restore the final model afterwards."""
+    selection = tracker.selection()
+    measured_points = []
+    csv_rows = []
+    csv_path = tracker.output_folder / f"selected_relative_flatness_{direction_name}.csv"
+    json_path = tracker.output_folder / f"selected_checkpoints_{direction_name}.json"
+    summary = {
+        **selection,
+        "relative_flatness_data": "same_loaders_and_probe_seeds_as_final_model",
+        "relative_flatness_settings": {
+            key: final_result[0][key] for key in ("layers", "samples", "batch_size", "batches")
+        },
+        "union": measured_points,
+    }
+    try:
+        for index, point in enumerate(selection["union"]):
+            logger.info(
+                "measuring selected checkpoint direction=%s epoch=%d (%d/%d): accuracy_gap=%.6g loss_gap=%.6g",
+                direction_name, point["epoch"], index + 1, len(selection["union"]),
+                point["abs_accuracy_gap"], point["abs_loss_gap"],
+            )
+            if point["epoch"] == final_epoch:
+                # The final model was already measured with identical settings.
+                report, measure, rows = final_result
+            else:
+                state, _, _ = load_model_state_file(
+                    str(tracker.output_folder / point["checkpoint"]), map_location="cpu"
+                )
+                model.load_state_dict(state, strict=True)
+                del state
+                report, measure, rows = measure_model()
+            measured_points.append({**point, "relative_flatness": report, "misalignment_measure": measure})
+            for row in rows:
+                layer_summary = report["symmetric_by_layer"][row["layer"]]
+                csv_rows.append({
+                    **point,
+                    "selected_by": "+".join(point["selected_by"]),
+                    **row,
+                    "symmetric_layer_signed_estimate": layer_summary["mean_signed_estimate"],
+                    "symmetric_layer_positive_part": layer_summary["mean_positive_part"],
+                    "misalignment_measure": measure["overall_mean"],
+                })
+            # Persist completed measurements even if a later Hessian pass fails.
+            _write_csv_rows(str(csv_path), csv_rows, list(csv_rows[0]) if csv_rows else [])
+            _write_json(str(json_path), summary)
+    finally:
+        state, _, _ = load_model_state_file(str(final_checkpoint_path), map_location="cpu")
+        model.load_state_dict(state, strict=True)
+        model.eval()
+    # An all-non-finite run may have no qualifying checkpoints.
+    if not measured_points:
+        _write_csv_rows(str(csv_path), [], ["epoch", "checkpoint", "role", "layer", "signed_estimate"])
+        _write_json(str(json_path), summary)
+    return summary
+
+
 def _build_loader(dataset: Dataset, batch_size: int, *, device: torch.device, num_workers: int, seed: int) -> DataLoader:
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed))
@@ -1141,7 +1286,7 @@ def parse_args() -> argparse.Namespace:
         help="normalized train-descent/val-ascent update, raw train-val difference, or the previous symmetric objective",
     )
     parser.add_argument("--modulus", type=int, default=None)
-    parser.add_argument("--split_seed", type=int, default=1729)
+    parser.add_argument("--split_seed", type=int, default=None)
     parser.add_argument(
         "--odd_size_policy",
         choices=["drop", "error"],
@@ -1330,6 +1475,9 @@ def _run_direction(
         model_type_name,
         dataset_type_name,
     )
+    gap_tracker = GapCheckpointTracker(
+        model, output_folder, direction_name, model_type_name, dataset_type_name,
+    )
 
     if args.objective == "normalized_two_sided":
         rows = train_normalized_two_sided(
@@ -1351,6 +1499,7 @@ def _run_direction(
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             scaler=scaler,
+            epoch_callback=gap_tracker.observe,
         )
     else:
         rows = train_symmetric_objective(
@@ -1370,6 +1519,7 @@ def _run_direction(
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             scaler=scaler,
+            epoch_callback=gap_tracker.observe,
         )
     save_model_state(str(final_model_path), model.state_dict(), model_type_name, dataset_type_name)
 
@@ -1380,55 +1530,28 @@ def _run_direction(
         runtime_model, val_loader, criterion, device=device, modular=bundle.modular, eq_position=bundle.eq_position
     )
     layers = _resolve_flatness_layers(model, args.relative_flatness_layers)
-    flatness_train = measure_relative_flatness(
-        model,
-        flatness_train_loader,
-        criterion,
-        device=device,
-        modular=bundle.modular,
-        eq_position=bundle.eq_position,
-        layer_names=layers,
-        hutchinson_samples=args.relative_flatness_samples,
-        max_batches=args.relative_flatness_batches,
-        seed=args.relative_flatness_seed + 11,
-    )
-    flatness_val = measure_relative_flatness(
-        model,
-        flatness_val_loader,
-        criterion,
-        device=device,
-        modular=bundle.modular,
-        eq_position=bundle.eq_position,
-        layer_names=layers,
-        hutchinson_samples=args.relative_flatness_samples,
-        max_batches=args.relative_flatness_batches,
-        seed=args.relative_flatness_seed + 29,
-    )
-    flatness_rows = []
-    for role, partition_name, values in (
-        ("train", train_partition_name, flatness_train),
-        ("val", val_partition_name, flatness_val),
-    ):
-        for value in values:
-            flatness_rows.append({"partition": partition_name, "role": role, **value})
+
+    def measure_current_model():
+        return _measure_direction_relative_flatness(
+            model, flatness_train_loader, flatness_val_loader, criterion,
+            device=device, modular=bundle.modular, eq_position=bundle.eq_position,
+            layers=layers, train_partition_name=train_partition_name,
+            val_partition_name=val_partition_name, args=args,
+        )
+
+    final_flatness_result = measure_current_model()
+    relative_flatness, misalignment_measure, flatness_rows = final_flatness_result
     _write_csv_rows(
         str(flatness_path),
         flatness_rows,
         list(flatness_rows[0].keys()) if flatness_rows else [],
     )
 
-    flatness_by_partition = {
-        train_partition_name: flatness_train,
-        val_partition_name: flatness_val,
-    }
-    by_layer = {}
-    for name in layers:
-        value_train = next(item for item in flatness_train if item["layer"] == name)
-        value_val = next(item for item in flatness_val if item["layer"] == name)
-        by_layer[name] = {
-            "mean_signed_estimate": (value_train["signed_estimate"] + value_val["signed_estimate"]) / 2,
-            "mean_positive_part": (value_train["positive_part"] + value_val["positive_part"]) / 2,
-        }
+    gap_checkpoints = _measure_gap_checkpoint_union(
+        tracker=gap_tracker, model=model, direction_name=direction_name,
+        final_epoch=epochs - 1, final_checkpoint_path=final_model_path,
+        final_result=final_flatness_result, measure_model=measure_current_model,
+    )
     final_objective, final_relative_gap, _, _, final_mean_loss = _objective_value_and_coefficients(
         final_train.loss, final_val.loss, objective_mode=args.objective
     )
@@ -1472,6 +1595,9 @@ def _run_direction(
             "relative_flatness": flatness_path.name,
             "initial_model": initial_model_path.name,
             "final_model": final_model_path.name,
+            "gap_checkpoint_selection": str(gap_tracker.manifest_path.relative_to(output_folder)),
+            "selected_relative_flatness": f"selected_relative_flatness_{direction_name}.csv",
+            "selected_checkpoint_summary": f"selected_checkpoints_{direction_name}.json",
         },
         "final": {
             "train": asdict(final_train),
@@ -1479,28 +1605,14 @@ def _run_direction(
             "partition_a": final_by_partition["a"],
             "partition_b": final_by_partition["b"],
             "mean_loss": final_mean_loss,
+            "absolute_accuracy_gap": abs(final_train.accuracy - final_val.accuracy),
             "absolute_loss_gap": abs(final_train.loss - final_val.loss),
             "relative_gap": final_relative_gap,
             "objective": final_objective,
         },
-        "relative_flatness": {
-            "layers": layers,
-            "samples": args.relative_flatness_samples,
-            "batch_size": flatness_train_loader.batch_size,
-            "batches": args.relative_flatness_batches,
-            "symmetric_by_layer": by_layer,
-            "partitions": {
-                "train": flatness_train,
-                "val": flatness_val,
-                "a": flatness_by_partition["a"],
-                "b": flatness_by_partition["b"],
-            },
-        },
-        "misalignment_measure": {
-            "definition": "mean_positive_relative_flatness_across_the_two_equal_halves",
-            "by_layer": {name: values["mean_positive_part"] for name, values in by_layer.items()},
-            "overall_mean": sum(values["mean_positive_part"] for values in by_layer.values()) / max(1, len(by_layer)),
-        },
+        "relative_flatness": relative_flatness,
+        "misalignment_measure": misalignment_measure,
+        "gap_checkpoints": gap_checkpoints,
         "optimization_last_row": rows[-1] if rows else None,
     }
 

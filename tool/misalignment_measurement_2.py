@@ -41,6 +41,9 @@ constant expressions ``0.5`` and ``0.5`` for train and val respectively.
 
 Supported datasets are MNIST, CIFAR-10, CIFAR-100, ImageNet-1k, and a modular
 dataset folder containing train.txt/val.txt (and optionally test.txt).
+ImageNet defaults to DALI mixed decoding and GPU preprocessing for training,
+evaluation and flatness. Other datasets keep PyTorch; --loader_backend
+pytorch explicitly selects the previous ImageNet loading path.
 """
 
 from __future__ import annotations
@@ -81,6 +84,9 @@ from misalignment.variance import EpochWeightVarianceRecorder
 from misalignment.tokenizer_stats import TOKENIZER_RATIO_FIELDS, TokenizerOutputMonitor
 from misalignment.gradient_geometry import GRADIENT_GEOMETRY_FIELDS, GradientGeometryAccumulator
 from misalignment.gradient_combination import NormalizedGradientCombiner, combine_normalized_gradient_tensors
+from misalignment.dali_loader import (
+    DaliImageNetLoader, close_dali_loaders, loader_runtime_info, resolve_loader_backend,
+)
 
 from py_src.ml_setup import get_ml_setup_from_config
 from py_src.ml_setup.grokking import arithmetic_addition_grokking, build_grokking_model
@@ -1259,9 +1265,20 @@ def _build_loader(
     num_workers: int,
     seed: int,
     prefetch_factor: int = 4,
-) -> DataLoader:
+    loader_backend: str = "pytorch",
+    augmentation_config: dict[str, Any] | None = None,
+) -> DataLoader | DaliImageNetLoader:
     if prefetch_factor <= 0:
         raise ValueError("prefetch_factor must be positive")
+    if loader_backend == "dali":
+        if augmentation_config is None:
+            raise ValueError("DALI loading requires augmentation_config")
+        return DaliImageNetLoader(
+            dataset, batch_size, device=device, num_workers=num_workers, seed=seed,
+            prefetch_factor=prefetch_factor, augmentation_config=augmentation_config,
+        )
+    if loader_backend != "pytorch":
+        raise ValueError(f"unsupported loader backend {loader_backend!r}")
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed))
     return DataLoader(
@@ -1361,10 +1378,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight_decay", type=float, default=None)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument(
+        "--loader_backend", "--loader-backend", choices=["auto", "pytorch", "dali"], default="auto",
+        help="auto (default): DALI for ImageNet, PyTorch otherwise; DALI requires CUDA and NVIDIA DALI",
+    )
+    parser.add_argument(
         "--prefetch_factor",
         type=int,
         default=4,
-        help="batches prefetched into CPU memory per DataLoader worker (default: 4; ignored when num_workers=0)",
+        help="PyTorch batches prefetched per worker, or DALI pipeline prefetch depth (default: 4)",
     )
     parser.add_argument("--report_interval", type=int, default=1)
     parser.add_argument(
@@ -1607,15 +1628,21 @@ def _run_direction(
         )
     finally:
         tokenizer_monitor.close()
+        # Do not keep the training decoder/preprocessing pools resident while
+        # building the separate second-order flatness microbatch pipelines.
+        close_dali_loaders(train_loader, val_loader)
     layers = _resolve_flatness_layers(model, args.relative_flatness_layers)
 
     def measure_current_model():
-        return _measure_direction_relative_flatness(
-            model, flatness_train_loader, flatness_val_loader, criterion,
-            device=device, modular=bundle.modular, eq_position=bundle.eq_position,
-            layers=layers, train_partition_name=train_partition_name,
-            val_partition_name=val_partition_name, args=args,
-        )
+        try:
+            return _measure_direction_relative_flatness(
+                model, flatness_train_loader, flatness_val_loader, criterion,
+                device=device, modular=bundle.modular, eq_position=bundle.eq_position,
+                layers=layers, train_partition_name=train_partition_name,
+                val_partition_name=val_partition_name, args=args,
+            )
+        finally:
+            close_dali_loaders(flatness_train_loader, flatness_val_loader)
 
     final_flatness_result = measure_current_model()
     relative_flatness, misalignment_measure, flatness_rows = final_flatness_result
@@ -1653,6 +1680,12 @@ def _run_direction(
         "model_type": model_type_name,
         "device": str(device),
         "runtime": {
+            "loader": {
+                "train": loader_runtime_info(train_loader),
+                "val": loader_runtime_info(val_loader),
+                "flatness_train": loader_runtime_info(flatness_train_loader),
+                "flatness_val": loader_runtime_info(flatness_val_loader),
+            },
             "torch_compile": compile_enabled,
             "gradient_combination": gradient_combiner.runtime_info() if gradient_combiner is not None else None,
             "amp": amp_enabled,
@@ -1789,6 +1822,10 @@ def _measure_flatness_from_checkpoint(
         "half_examples": len(bundle.partition_a),
         "split_seed": args.split_seed,
         "random_seed": args.random_seed,
+        "loader": {
+            "partition_a": loader_runtime_info(flatness_loader_a),
+            "partition_b": loader_runtime_info(flatness_loader_b),
+        },
         "relative_flatness": {
             "layers": layers,
             "samples": args.relative_flatness_samples,
@@ -1835,6 +1872,11 @@ def main() -> None:
         raise RuntimeError("--device cuda requested but CUDA is unavailable")
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else args.device if args.device != "auto" else "cpu")
     logger.info("device = %s", device)
+    loader_backend = resolve_loader_backend(args.dataset, args.loader_backend)
+    if loader_backend == "dali" and device.type != "cuda":
+        raise ValueError("DALI ImageNet loading requires CUDA; use --loader_backend pytorch on CPU")
+    augmentation_config = describe_augmentation(args.dataset, args.augmentation)
+    logger.info("loader backend = %s (requested=%s)", loader_backend, args.loader_backend)
 
     bundle = load_dataset_bundle(args)
     model = bundle.ml_setup.model.to(device)
@@ -1850,10 +1892,12 @@ def main() -> None:
     loader_a = _build_loader(
         bundle.partition_a, batch_size, device=device, num_workers=args.num_workers,
         seed=args.random_seed + 101, prefetch_factor=args.prefetch_factor,
+        loader_backend=loader_backend, augmentation_config=augmentation_config,
     )
     loader_b = _build_loader(
         bundle.partition_b, batch_size, device=device, num_workers=args.num_workers,
         seed=args.random_seed + 202, prefetch_factor=args.prefetch_factor,
+        loader_backend=loader_backend, augmentation_config=augmentation_config,
     )
     if bundle.modular:
         loader_a = _DeviceCachedLoader(loader_a, device)
@@ -1870,6 +1914,7 @@ def main() -> None:
         num_workers=args.num_workers,
         seed=args.random_seed + 303,
         prefetch_factor=args.prefetch_factor,
+        loader_backend=loader_backend, augmentation_config=augmentation_config,
     )
     flatness_loader_b = _build_loader(
         bundle.partition_b,
@@ -1878,6 +1923,7 @@ def main() -> None:
         num_workers=args.num_workers,
         seed=args.random_seed + 404,
         prefetch_factor=args.prefetch_factor,
+        loader_backend=loader_backend, augmentation_config=augmentation_config,
     )
     model_type_name = bundle.ml_setup.model_type.name
     dataset_type_name = bundle.dataset_type_name
@@ -1897,19 +1943,22 @@ def main() -> None:
             output_folder = output_folder.resolve()
         output_folder.mkdir(parents=True, exist_ok=True)
         (output_folder / "flatness_command.txt").write_text(" ".join([sys.executable, *sys.argv]), encoding="utf-8")
-        _measure_flatness_from_checkpoint(
-            checkpoint_path=checkpoint_path,
-            output_folder=output_folder,
-            bundle=bundle,
-            model=model,
-            criterion=criterion,
-            device=device,
-            flatness_loader_a=flatness_loader_a,
-            flatness_loader_b=flatness_loader_b,
-            args=args,
-            model_type_name=model_type_name,
-            dataset_type_name=dataset_type_name,
-        )
+        try:
+            _measure_flatness_from_checkpoint(
+                checkpoint_path=checkpoint_path,
+                output_folder=output_folder,
+                bundle=bundle,
+                model=model,
+                criterion=criterion,
+                device=device,
+                flatness_loader_a=flatness_loader_a,
+                flatness_loader_b=flatness_loader_b,
+                args=args,
+                model_type_name=model_type_name,
+                dataset_type_name=dataset_type_name,
+            )
+        finally:
+            close_dali_loaders(loader_a, loader_b, flatness_loader_a, flatness_loader_b)
         return
     _, _, default_epochs = build_optimizer_and_scheduler(
         bundle.ml_setup,
@@ -1989,6 +2038,7 @@ def main() -> None:
         "split_seed": args.split_seed,
         "random_seed": args.random_seed,
         "permutation_file": "split_permutation.pt",
+        "loader_backend": loader_backend,
         "run_order": list(runs),
         "runs": runs,
         "aggregate": {

@@ -30,6 +30,11 @@ Gradient geometry is accumulated on the device and copied to the host once
 per epoch. CUDA AMP, when enabled, covers training and evaluation, but not
 the second-order relative-flatness measurements.
 
+CUDA gradient combination is also fused with torch.compile by default when
+model compilation is enabled. Epoch weights are tensor inputs, so changing
+them does not trigger recompilation. --no-compile-gradient-combination keeps
+the original eager calculation; compilation failures also fall back to it.
+
 The normalized two-sided update accepts arithmetic gradient-weight expressions
 in the variable ``f`` (the normalized epoch fraction). The defaults are the
 constant expressions ``0.5`` and ``0.5`` for train and val respectively.
@@ -75,6 +80,7 @@ from misalignment.checkpoints import GapCheckpointTracker
 from misalignment.variance import EpochWeightVarianceRecorder
 from misalignment.tokenizer_stats import TOKENIZER_RATIO_FIELDS, TokenizerOutputMonitor
 from misalignment.gradient_geometry import GRADIENT_GEOMETRY_FIELDS, GradientGeometryAccumulator
+from misalignment.gradient_combination import NormalizedGradientCombiner, combine_normalized_gradient_tensors
 
 from py_src.ml_setup import get_ml_setup_from_config
 from py_src.ml_setup.grokking import arithmetic_addition_grokking, build_grokking_model
@@ -731,58 +737,9 @@ def _combine_normalized_train_val_gradients(
     """
     if train_weight < 0.0 or val_weight < 0.0:
         raise ValueError("gradient weights must be non-negative")
-    combined: list[torch.Tensor] = []
-    train_norms, val_norms, dot_products = [], [], []
-    parameter_norms, combined_norms = [], []
-    for parameter, train_gradient, val_gradient in zip(
-        parameters, train_gradients, val_gradients, strict=True
-    ):
-        train_norm = train_gradient.norm()
-        val_norm = val_gradient.norm()
-        train_zero = train_norm == 0
-        val_zero = val_norm == 0
-        # Replacing only exact zero divisors preserves the old zero-gradient
-        # cases without introducing an epsilon-dependent update rule.
-        train_unit = train_gradient / torch.where(train_zero, 1.0, train_norm)
-        val_unit = val_gradient / torch.where(val_zero, 1.0, val_norm)
-        signed_unit_sum = train_weight * train_unit - val_weight * val_unit
-        signed_unit_norm = signed_unit_sum.norm()
-        safe_signed_norm = torch.where(signed_unit_norm == 0, 1.0, signed_unit_norm)
-        rescale = torch.where(signed_unit_norm == 0, 0.0, train_norm / safe_signed_norm)
-        combined_gradient = signed_unit_sum * rescale
-        # Preserve the existing fallback, including a bitwise-identical
-        # train-only gradient when validation gradients are zero.
-        combined_gradient = torch.where(val_zero, train_gradient, combined_gradient)
-        combined_gradient = torch.where(train_zero, 0.0, combined_gradient)
-        combined.append(combined_gradient.detach())
-        train_norms.append(train_norm)
-        val_norms.append(val_norm)
-        dot_products.append(torch.sum(train_gradient * val_gradient))
-        if collect_geometry:
-            parameter_norms.append(parameter.detach().norm())
-            combined_norms.append(combined_gradient.norm())
-
-    train_norm_values = torch.stack(train_norms).to(dtype=torch.float64)
-    val_norm_values = torch.stack(val_norms).to(dtype=torch.float64)
-    valid_cosine = (train_norm_values != 0) & (val_norm_values != 0)
-    denominator = torch.where(valid_cosine, train_norm_values * val_norm_values, 1.0)
-    cosine_values = torch.where(
-        valid_cosine,
-        torch.stack(dot_products).to(dtype=torch.float64) / denominator,
-        float("nan"),
+    return combine_normalized_gradient_tensors(
+        parameters, train_gradients, val_gradients, (train_weight, val_weight), collect_geometry,
     )
-    if not collect_geometry:
-        return combined, cosine_values.unsqueeze(1)
-    parameter_norm_values = torch.stack(parameter_norms).to(dtype=torch.float64)
-    combined_norm_values = torch.stack(combined_norms).to(dtype=torch.float64)
-    relative_denominator = parameter_norm_values.clamp_min(1e-12)
-    stats = torch.stack((
-        train_norm_values, val_norm_values, combined_norm_values,
-        parameter_norm_values, cosine_values,
-        train_norm_values / relative_denominator,
-        combined_norm_values / relative_denominator,
-    ), dim=1)
-    return combined, stats
 
 
 def _gradient_geometry_sample_epochs(epochs: int) -> set[int]:
@@ -883,6 +840,7 @@ def train_normalized_two_sided(
     scaler=None,
     epoch_callback: Callable[[dict[str, float]], None] | None = None,
     tokenizer_monitor: TokenizerOutputMonitor | None = None,
+    gradient_combiner: NormalizedGradientCombiner | None = None,
 ) -> list[dict[str, float]]:
     """Run the normalized train-descent/val-ascent update from initialization."""
     if epochs <= 0:
@@ -953,15 +911,18 @@ def train_normalized_two_sided(
                     eq_position=eq_position, parameters=parameters,
                     amp_enabled=amp_enabled, amp_dtype=amp_dtype, scaler=scaler,
                 )
-            combined_gradients, batch_stats = _combine_normalized_train_val_gradients(
-                model,
-                train_gradients,
-                val_gradients,
-                parameters=parameters,
-                train_weight=train_gradient_weight,
-                val_weight=val_gradient_weight,
-                collect_geometry=collect_geometry,
-            )
+            if gradient_combiner is None:
+                combined_gradients, batch_stats = _combine_normalized_train_val_gradients(
+                    model, train_gradients, val_gradients, parameters=parameters,
+                    train_weight=train_gradient_weight, val_weight=val_gradient_weight,
+                    collect_geometry=collect_geometry,
+                )
+            else:
+                combined_gradients, batch_stats = gradient_combiner(
+                    train_gradients, val_gradients,
+                    train_weight=train_gradient_weight, val_weight=val_gradient_weight,
+                    collect_geometry=collect_geometry,
+                )
             _apply_gradient_update(
                 optimizer, scheduler, parameters, combined_gradients, scaler=scaler
             )
@@ -1453,6 +1414,13 @@ def parse_args() -> argparse.Namespace:
         help="compile the training model with torch.compile (default: enabled; use --no-compile to disable)",
     )
     parser.add_argument(
+        "--compile_gradient_combination", "--compile-gradient-combination",
+        dest="compile_gradient_combination",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="fuse CUDA normalized gradient combination with torch.compile (default: follows --torch_compile); use --no-compile-gradient-combination for eager combination",
+    )
+    parser.add_argument(
         "--amp",
         dest="amp",
         action=argparse.BooleanOptionalAction,
@@ -1573,8 +1541,14 @@ def _run_direction(
     # Captures are active only in epoch-end/final evaluation, never during the
     # training forwards/backwards or second-order flatness measurements.
     tokenizer_monitor = TokenizerOutputMonitor(model)
+    gradient_combiner = None
     try:
         if args.objective == "normalized_two_sided":
+            combine_compile = getattr(args, "compile_gradient_combination", None)
+            gradient_combiner = NormalizedGradientCombiner(
+                [parameter for parameter in runtime_model.parameters() if parameter.requires_grad],
+                enabled=args.torch_compile if combine_compile is None else combine_compile,
+            )
             rows = train_normalized_two_sided(
                 runtime_model,
                 train_loader,
@@ -1596,6 +1570,7 @@ def _run_direction(
                 scaler=scaler,
                 epoch_callback=record_epoch,
                 tokenizer_monitor=tokenizer_monitor,
+                gradient_combiner=gradient_combiner,
             )
         else:
             rows = train_symmetric_objective(
@@ -1679,6 +1654,7 @@ def _run_direction(
         "device": str(device),
         "runtime": {
             "torch_compile": compile_enabled,
+            "gradient_combination": gradient_combiner.runtime_info() if gradient_combiner is not None else None,
             "amp": amp_enabled,
             "evaluation_amp": amp_enabled,
             "relative_flatness_amp": False,

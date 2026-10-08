@@ -20,6 +20,9 @@ gap and the five with the largest absolute loss gap. Their checkpoint union
 is measured for relative flatness after training, in addition to the final
 model; an epoch selected by both rankings is measured only once.
 
+Every epoch also records per-weight-tensor sample variance in a direction-
+specific CSV, using scientific notation with four significant digits.
+
 The normalized two-sided update accepts arithmetic gradient-weight expressions
 in the variable ``f`` (the normalized epoch fraction). The defaults are the
 constant expressions ``0.5`` and ``0.5`` for train and val respectively.
@@ -62,6 +65,7 @@ from misalignment.augmentation import (
 )
 from misalignment.optimizer import build_optimizer_and_scheduler
 from misalignment.checkpoints import GapCheckpointTracker
+from misalignment.variance import EpochWeightVarianceRecorder
 
 from py_src.ml_setup import get_ml_setup_from_config
 from py_src.ml_setup.grokking import arithmetic_addition_grokking, build_grokking_model
@@ -1225,7 +1229,17 @@ def _measure_gap_checkpoint_union(
     return summary
 
 
-def _build_loader(dataset: Dataset, batch_size: int, *, device: torch.device, num_workers: int, seed: int) -> DataLoader:
+def _build_loader(
+    dataset: Dataset,
+    batch_size: int,
+    *,
+    device: torch.device,
+    num_workers: int,
+    seed: int,
+    prefetch_factor: int = 4,
+) -> DataLoader:
+    if prefetch_factor <= 0:
+        raise ValueError("prefetch_factor must be positive")
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed))
     return DataLoader(
@@ -1238,7 +1252,10 @@ def _build_loader(dataset: Dataset, batch_size: int, *, device: torch.device, nu
         generator=generator,
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
-        persistent_workers=True,
+        persistent_workers=num_workers > 0,
+        # This is batches prefetched per worker, not a fraction of the data.
+        # Single-process loading does not support multiprocessing prefetch.
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
 
 
@@ -1321,6 +1338,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=None)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument(
+        "--prefetch_factor",
+        type=int,
+        default=4,
+        help="batches prefetched into CPU memory per DataLoader worker (default: 4; ignored when num_workers=0)",
+    )
     parser.add_argument("--report_interval", type=int, default=1)
     parser.add_argument(
         "--train_gradient_weight_function",
@@ -1466,6 +1489,7 @@ def _run_direction(
     )
     optimization_path = output_folder / f"optimization_{direction_name}.csv"
     geometry_path = output_folder / f"gradient_geometry_{direction_name}.csv"
+    variance_path = output_folder / f"weight_variance_{direction_name}.csv"
     flatness_path = output_folder / f"relative_flatness_{direction_name}.csv"
     initial_model_path = output_folder / f"initial_{direction_name}.model.pt"
     final_model_path = output_folder / f"final_{direction_name}.model.pt"
@@ -1478,6 +1502,11 @@ def _run_direction(
     gap_tracker = GapCheckpointTracker(
         model, output_folder, direction_name, model_type_name, dataset_type_name,
     )
+    variance_recorder = EpochWeightVarianceRecorder(model, variance_path)
+
+    def record_epoch(row: dict[str, float]) -> None:
+        variance_recorder.record(int(row["epoch"]))
+        gap_tracker.observe(row)
 
     if args.objective == "normalized_two_sided":
         rows = train_normalized_two_sided(
@@ -1499,7 +1528,7 @@ def _run_direction(
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             scaler=scaler,
-            epoch_callback=gap_tracker.observe,
+            epoch_callback=record_epoch,
         )
     else:
         rows = train_symmetric_objective(
@@ -1519,7 +1548,7 @@ def _run_direction(
             amp_enabled=amp_enabled,
             amp_dtype=amp_dtype,
             scaler=scaler,
-            epoch_callback=gap_tracker.observe,
+            epoch_callback=record_epoch,
         )
     save_model_state(str(final_model_path), model.state_dict(), model_type_name, dataset_type_name)
 
@@ -1592,6 +1621,7 @@ def _run_direction(
         "files": {
             "optimization": optimization_path.name,
             "gradient_geometry": geometry_path.name if args.objective == "normalized_two_sided" else None,
+            "weight_variance": variance_path.name,
             "relative_flatness": flatness_path.name,
             "initial_model": initial_model_path.name,
             "final_model": final_model_path.name,
@@ -1613,6 +1643,12 @@ def _run_direction(
         "relative_flatness": relative_flatness,
         "misalignment_measure": misalignment_measure,
         "gap_checkpoints": gap_checkpoints,
+        "weight_variance": {
+            "layers": variance_recorder.layer_names,
+            "correction": 1,
+            "format": ".3E (4 significant digits)",
+            "epoch_definition": "zero_based_epoch_after_updates",
+        },
         "optimization_last_row": rows[-1] if rows else None,
     }
 
@@ -1719,6 +1755,8 @@ def main() -> None:
         raise ValueError("--epochs must be positive")
     if args.num_workers < 0:
         raise ValueError("--num_workers must be non-negative")
+    if args.prefetch_factor <= 0:
+        raise ValueError("--prefetch_factor must be positive")
     if args.relative_flatness_batches == 0 or args.relative_flatness_samples <= 0:
         raise ValueError("relative-flatness batches must be non-zero and samples must be positive")
     if args.relative_flatness_batch_size <= 0:
@@ -1751,8 +1789,14 @@ def main() -> None:
         batch_size = min(len(bundle.partition_a), 65536)
     else:
         batch_size = int(getattr(bundle.ml_setup, "default_batch_size", 64) or 64)
-    loader_a = _build_loader(bundle.partition_a, batch_size, device=device, num_workers=args.num_workers, seed=args.random_seed + 101)
-    loader_b = _build_loader(bundle.partition_b, batch_size, device=device, num_workers=args.num_workers, seed=args.random_seed + 202)
+    loader_a = _build_loader(
+        bundle.partition_a, batch_size, device=device, num_workers=args.num_workers,
+        seed=args.random_seed + 101, prefetch_factor=args.prefetch_factor,
+    )
+    loader_b = _build_loader(
+        bundle.partition_b, batch_size, device=device, num_workers=args.num_workers,
+        seed=args.random_seed + 202, prefetch_factor=args.prefetch_factor,
+    )
     if bundle.modular:
         loader_a = _DeviceCachedLoader(loader_a, device)
         loader_b = _DeviceCachedLoader(loader_b, device)
@@ -1767,6 +1811,7 @@ def main() -> None:
         device=device,
         num_workers=args.num_workers,
         seed=args.random_seed + 303,
+        prefetch_factor=args.prefetch_factor,
     )
     flatness_loader_b = _build_loader(
         bundle.partition_b,
@@ -1774,6 +1819,7 @@ def main() -> None:
         device=device,
         num_workers=args.num_workers,
         seed=args.random_seed + 404,
+        prefetch_factor=args.prefetch_factor,
     )
     model_type_name = bundle.ml_setup.model_type.name
     dataset_type_name = bundle.dataset_type_name

@@ -253,7 +253,7 @@ class TestMisalignmentCheckpointIntegration(unittest.TestCase):
                         self.assertAlmostEqual(report["partitions"]["val"][0]["loss"], point["val_loss"], places=6)
                         self.assertEqual(report["partitions"]["train"][0]["examples"], 8)
                         self.assertTrue(math.isfinite(point["misalignment_measure"]["overall_mean"]))
-                    for key in ("initial_model", "final_model", "relative_flatness",
+                    for key in ("initial_model", "final_model", "relative_flatness", "weight_variance",
                                 "gap_checkpoint_selection", "selected_relative_flatness", "selected_checkpoint_summary"):
                         self.assertTrue((root / result["files"][key]).is_file())
                     final_state, _, _ = load_model_state_file(str(root / result["files"]["final_model"]), map_location="cpu")
@@ -264,6 +264,20 @@ class TestMisalignmentCheckpointIntegration(unittest.TestCase):
                     self.assertEqual(len(rows), 6)
                     self.assertIn("abs_accuracy_gap", rows[0])
                     self.assertAlmostEqual(float(rows[-1]["loss_a"]), result["final"]["train"]["loss"], places=4)
+                    with (root / result["files"]["weight_variance"]).open() as infile:
+                        variance_rows = list(csv.DictReader(infile))
+                    self.assertEqual([int(row["epoch"]) for row in variance_rows], list(range(6)))
+                    weight_names = [name for name in final_state if "weight" in name]
+                    self.assertEqual(list(variance_rows[0]), ["epoch", *weight_names])
+                    self.assertEqual(result["weight_variance"]["layers"], weight_names)
+                    # Check every epoch against its captured model, not just
+                    # the final model (also catches callback timing mistakes).
+                    for point in selected["union"]:
+                        state, _, _ = load_model_state_file(str(root / point["checkpoint"]), map_location="cpu")
+                        variance_row = variance_rows[point["epoch"]]
+                        for name in weight_names:
+                            expected = f"{torch.var(state[name]).item():.3E}"
+                            self.assertEqual(variance_row[name], expected)
 
 
 if __name__ == "__main__":

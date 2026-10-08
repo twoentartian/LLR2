@@ -26,6 +26,10 @@ specific CSV, using scientific notation with four significant digits.
 For models with a tokenizer module (such as CCT), epoch-end evaluation also
 reports its exact nonzero output-element ratio on each complete partition.
 
+Gradient geometry is accumulated on the device and copied to the host once
+per epoch. CUDA AMP, when enabled, covers training and evaluation, but not
+the second-order relative-flatness measurements.
+
 The normalized two-sided update accepts arithmetic gradient-weight expressions
 in the variable ``f`` (the normalized epoch fraction). The defaults are the
 constant expressions ``0.5`` and ``0.5`` for train and val respectively.
@@ -70,6 +74,7 @@ from misalignment.optimizer import build_optimizer_and_scheduler
 from misalignment.checkpoints import GapCheckpointTracker
 from misalignment.variance import EpochWeightVarianceRecorder
 from misalignment.tokenizer_stats import TOKENIZER_RATIO_FIELDS, TokenizerOutputMonitor
+from misalignment.gradient_geometry import GRADIENT_GEOMETRY_FIELDS, GradientGeometryAccumulator
 
 from py_src.ml_setup import get_ml_setup_from_config
 from py_src.ml_setup.grokking import arithmetic_addition_grokking, build_grokking_model
@@ -336,22 +341,33 @@ def evaluate_partition(
     modular: bool,
     eq_position: int | None,
     tokenizer_monitor: TokenizerOutputMonitor | None = None,
+    amp_enabled: bool = False,
+    amp_dtype: torch.dtype | None = None,
 ) -> LossMetrics:
+    """Evaluate a complete partition, optionally using the training AMP dtype.
+
+    Loss/accuracy totals stay on the device until the partition is complete.
+    Relative-flatness measurements use a separate, full-precision path.
+    """
     model.eval()
-    loss_sum = 0.0
-    correct_sum = 0.0
+    totals = torch.zeros(2, dtype=torch.float64, device=device)
     example_count = 0
     capture_context = tokenizer_monitor.capture() if tokenizer_monitor is not None else contextlib.nullcontext()
-    with capture_context:
+    autocast_context = (
+        torch.autocast(device_type=device.type, dtype=amp_dtype)
+        if amp_enabled and device.type == "cuda" and amp_dtype is not None
+        else contextlib.nullcontext()
+    )
+    with capture_context, autocast_context:
         for raw_batch in loader:
             batch = _move_batch(raw_batch, device)
             loss, accuracy = _loss_and_accuracy(model, batch, criterion, modular=modular, eq_position=eq_position)
             count = int(batch["text"].shape[0] if modular else batch[0].shape[0])
-            loss_sum += float(loss.item()) * count
-            correct_sum += float(accuracy.item()) * count
+            totals.add_(torch.stack((loss, accuracy)).to(dtype=torch.float64), alpha=count)
             example_count += count
     if example_count == 0:
         raise ValueError("cannot evaluate an empty partition")
+    loss_sum, correct_sum = totals.cpu().tolist()
     return LossMetrics(
         loss=loss_sum / example_count, accuracy=correct_sum / example_count, examples=example_count,
         tokenizer_nonzero_ratio=tokenizer_monitor.nonzero_ratio if tokenizer_monitor is not None else None,
@@ -491,10 +507,12 @@ def train_symmetric_objective(
         # coefficients.  Each paired mini-batch is then differentiated and
         # applied immediately, matching ordinary mini-batch optimization.
         baseline_a = evaluate_partition(
-            model, loader_a, criterion, device=device, modular=modular, eq_position=eq_position
+            model, loader_a, criterion, device=device, modular=modular, eq_position=eq_position,
+            amp_enabled=amp_enabled, amp_dtype=amp_dtype,
         )
         baseline_b = evaluate_partition(
-            model, loader_b, criterion, device=device, modular=modular, eq_position=eq_position
+            model, loader_b, criterion, device=device, modular=modular, eq_position=eq_position,
+            amp_enabled=amp_enabled, amp_dtype=amp_dtype,
         )
         _, _, coefficient_a, coefficient_b, _ = (
             _objective_value_and_coefficients(
@@ -542,10 +560,12 @@ def train_symmetric_objective(
         current_a = evaluate_partition(
             model, loader_a, criterion, device=device, modular=modular, eq_position=eq_position,
             tokenizer_monitor=tokenizer_monitor,
+            amp_enabled=amp_enabled, amp_dtype=amp_dtype,
         )
         current_b = evaluate_partition(
             model, loader_b, criterion, device=device, modular=modular, eq_position=eq_position,
             tokenizer_monitor=tokenizer_monitor,
+            amp_enabled=amp_enabled, amp_dtype=amp_dtype,
         )
         mean_a = current_a.loss
         mean_b = current_b.loss
@@ -685,6 +705,7 @@ def _apply_gradient_update(optimizer, scheduler, parameters, gradients, scaler=N
         scheduler.step()
 
 
+@torch.no_grad()
 def _combine_normalized_train_val_gradients(
     model: nn.Module,
     train_gradients: list[torch.Tensor],
@@ -693,56 +714,74 @@ def _combine_normalized_train_val_gradients(
     parameters: list[nn.Parameter],
     train_weight: float,
     val_weight: float,
-) -> tuple[list[torch.Tensor], list[dict[str, float | str]]]:
+    collect_geometry: bool = True,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
     """Build the per-parameter train-descent plus val-ascent gradient.
 
     For every parameter tensor, both gradients are normalized first.  The
     signed directions are then weighted and added (train minus val because the
     optimizer itself performs descent), and the result is rescaled to the
-    original train-gradient norm.  The returned tensors are detached and ready
-    to be assigned to ``parameter.grad`` before one Adam/SGD step.
+    original train-gradient norm. Zero norms are handled with device-side
+    masks, not scalar host reads. Returned gradients are ready to be assigned
+    to ``parameter.grad`` before one Adam/SGD step.
+
+    Diagnostics are a device tensor whose columns follow
+    ``GRADIENT_GEOMETRY_FIELDS``. On unsampled geometry epochs only the cosine
+    column is returned; the optimization CSV still reports it every epoch.
     """
     if train_weight < 0.0 or val_weight < 0.0:
         raise ValueError("gradient weights must be non-negative")
-    names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
     combined: list[torch.Tensor] = []
-    stats: list[dict[str, float | str]] = []
-    for name, parameter, train_gradient, val_gradient in zip(
-        names, parameters, train_gradients, val_gradients, strict=True
+    train_norms, val_norms, dot_products = [], [], []
+    parameter_norms, combined_norms = [], []
+    for parameter, train_gradient, val_gradient in zip(
+        parameters, train_gradients, val_gradients, strict=True
     ):
-        train_norm = float(train_gradient.norm().item())
-        val_norm = float(val_gradient.norm().item())
-        parameter_norm = float(parameter.detach().norm().item())
-        if train_norm == 0.0:
-            combined_gradient = torch.zeros_like(train_gradient)
-            cosine = float("nan")
-        elif val_norm == 0.0:
-            combined_gradient = train_gradient.detach().clone()
-            cosine = float("nan")
-        else:
-            train_unit = train_gradient / train_norm
-            val_unit = val_gradient / val_norm
-            signed_unit_sum = train_weight * train_unit - val_weight * val_unit
-            signed_unit_norm = float(signed_unit_sum.norm().item())
-            if signed_unit_norm == 0.0:
-                combined_gradient = torch.zeros_like(train_gradient)
-            else:
-                combined_gradient = signed_unit_sum * (train_norm / signed_unit_norm)
-            cosine = float(torch.sum(train_gradient * val_gradient).item() / (train_norm * val_norm))
-        combined_norm = float(combined_gradient.norm().item())
+        train_norm = train_gradient.norm()
+        val_norm = val_gradient.norm()
+        train_zero = train_norm == 0
+        val_zero = val_norm == 0
+        # Replacing only exact zero divisors preserves the old zero-gradient
+        # cases without introducing an epsilon-dependent update rule.
+        train_unit = train_gradient / torch.where(train_zero, 1.0, train_norm)
+        val_unit = val_gradient / torch.where(val_zero, 1.0, val_norm)
+        signed_unit_sum = train_weight * train_unit - val_weight * val_unit
+        signed_unit_norm = signed_unit_sum.norm()
+        safe_signed_norm = torch.where(signed_unit_norm == 0, 1.0, signed_unit_norm)
+        rescale = torch.where(signed_unit_norm == 0, 0.0, train_norm / safe_signed_norm)
+        combined_gradient = signed_unit_sum * rescale
+        # Preserve the existing fallback, including a bitwise-identical
+        # train-only gradient when validation gradients are zero.
+        combined_gradient = torch.where(val_zero, train_gradient, combined_gradient)
+        combined_gradient = torch.where(train_zero, 0.0, combined_gradient)
         combined.append(combined_gradient.detach())
-        stats.append({
-            "parameter": name,
-            "train_gradient_norm": train_norm,
-            "val_gradient_norm": val_norm,
-            "combined_gradient_norm": combined_norm,
-            "parameter_norm": parameter_norm,
-            "train_val_gradient_cosine": cosine,
-            "train_gradient_weight": train_weight,
-            "val_gradient_weight": val_weight,
-            "relative_train_gradient": train_norm / max(parameter_norm, 1e-12),
-            "relative_combined_gradient": combined_norm / max(parameter_norm, 1e-12),
-        })
+        train_norms.append(train_norm)
+        val_norms.append(val_norm)
+        dot_products.append(torch.sum(train_gradient * val_gradient))
+        if collect_geometry:
+            parameter_norms.append(parameter.detach().norm())
+            combined_norms.append(combined_gradient.norm())
+
+    train_norm_values = torch.stack(train_norms).to(dtype=torch.float64)
+    val_norm_values = torch.stack(val_norms).to(dtype=torch.float64)
+    valid_cosine = (train_norm_values != 0) & (val_norm_values != 0)
+    denominator = torch.where(valid_cosine, train_norm_values * val_norm_values, 1.0)
+    cosine_values = torch.where(
+        valid_cosine,
+        torch.stack(dot_products).to(dtype=torch.float64) / denominator,
+        float("nan"),
+    )
+    if not collect_geometry:
+        return combined, cosine_values.unsqueeze(1)
+    parameter_norm_values = torch.stack(parameter_norms).to(dtype=torch.float64)
+    combined_norm_values = torch.stack(combined_norms).to(dtype=torch.float64)
+    relative_denominator = parameter_norm_values.clamp_min(1e-12)
+    stats = torch.stack((
+        train_norm_values, val_norm_values, combined_norm_values,
+        parameter_norm_values, cosine_values,
+        train_norm_values / relative_denominator,
+        combined_norm_values / relative_denominator,
+    ), dim=1)
     return combined, stats
 
 
@@ -851,6 +890,7 @@ def train_normalized_two_sided(
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not parameters:
         raise ValueError("model has no trainable parameters")
+    parameter_names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
     train_weight_function = _compile_gradient_weight_expression(
         train_gradient_weight_function, name="train gradient weight"
     )
@@ -891,8 +931,9 @@ def train_normalized_two_sided(
         # different from accumulating a full-partition gradient and taking a
         # single optimizer step per epoch.
         batches = 0
-        geometry_accumulators: dict[str, dict[str, float]] = {}
-        geometry_counts: dict[str, dict[str, int]] = {}
+        collect_geometry = epoch in geometry_sample_epochs
+        statistic_fields = GRADIENT_GEOMETRY_FIELDS if collect_geometry else ("train_val_gradient_cosine",)
+        geometry_accumulator = GradientGeometryAccumulator(parameter_names, statistic_fields, device)
         for raw_a, raw_b in zip(loader_a, loader_b, strict=True):
             batch_a = _move_batch(raw_a, device)
             train_gradients = _compute_batch_gradients(
@@ -919,6 +960,7 @@ def train_normalized_two_sided(
                 parameters=parameters,
                 train_weight=train_gradient_weight,
                 val_weight=val_gradient_weight,
+                collect_geometry=collect_geometry,
             )
             _apply_gradient_update(
                 optimizer, scheduler, parameters, combined_gradients, scaler=scaler
@@ -927,38 +969,21 @@ def train_normalized_two_sided(
 
             # Keep the geometry CSV schema unchanged while reporting the mean
             # geometry observed over the mini-batch updates in this epoch.
-            for stats in batch_stats:
-                name = str(stats["parameter"])
-                accumulator = geometry_accumulators.setdefault(name, {})
-                counts = geometry_counts.setdefault(name, {})
-                for field in geometry_fields:
-                    if field in ("epoch", "parameter", "train_gradient_weight", "val_gradient_weight"):
-                        continue
-                    value = float(stats[field])
-                    if math.isfinite(value):
-                        accumulator[field] = accumulator.get(field, 0.0) + value
-                        counts[field] = counts.get(field, 0) + 1
+            geometry_accumulator.update(batch_stats)
 
-        gradient_stats = []
-        for name in (str(parameter_name) for parameter_name, parameter in model.named_parameters() if parameter.requires_grad):
-            accumulator = geometry_accumulators.get(name, {})
-            counts = geometry_counts.get(name, {})
-            averaged: dict[str, float | str] = {"parameter": name}
-            for field in geometry_fields:
-                if field in ("epoch", "parameter", "train_gradient_weight", "val_gradient_weight"):
-                    continue
-                count = counts.get(field, 0)
-                averaged[field] = accumulator[field] / count if count else float("nan")
-            averaged["train_gradient_weight"] = train_gradient_weight
-            averaged["val_gradient_weight"] = val_gradient_weight
-            gradient_stats.append(averaged)
+        gradient_stats = geometry_accumulator.averages()
+        for stats in gradient_stats:
+            stats["train_gradient_weight"] = train_gradient_weight
+            stats["val_gradient_weight"] = val_gradient_weight
         current_a = evaluate_partition(
             model, loader_a, criterion, device=device, modular=modular, eq_position=eq_position,
             tokenizer_monitor=tokenizer_monitor,
+            amp_enabled=amp_enabled, amp_dtype=amp_dtype,
         )
         current_b = evaluate_partition(
             model, loader_b, criterion, device=device, modular=modular, eq_position=eq_position,
             tokenizer_monitor=tokenizer_monitor,
+            amp_enabled=amp_enabled, amp_dtype=amp_dtype,
         )
         mean_loss = 0.5 * (current_a.loss + current_b.loss)
         absolute_gap = abs(current_a.loss - current_b.loss)
@@ -1432,7 +1457,7 @@ def parse_args() -> argparse.Namespace:
         dest="amp",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="CUDA automatic mixed precision during training, matching the grokking scripts (default: enabled; use --no-amp to disable; ignored on CPU)",
+        help="CUDA automatic mixed precision during training and evaluation; relative flatness stays full precision (default: enabled; use --no-amp to disable; ignored on CPU)",
     )
     parser.add_argument(
         "--directions",
@@ -1510,7 +1535,7 @@ def _run_direction(
             except (AttributeError, TypeError):
                 scaler = torch.cuda.amp.GradScaler(enabled=True)
         logger.info(
-            "CUDA AMP enabled for direction=%s: dtype=%s grad_scaler=%s",
+            "CUDA AMP enabled for training and evaluation, direction=%s: dtype=%s grad_scaler=%s; relative flatness remains full precision",
             direction_name,
             amp_dtype,
             scaler is not None,
@@ -1598,10 +1623,12 @@ def _run_direction(
         final_train = evaluate_partition(
             runtime_model, train_loader, criterion, device=device, modular=bundle.modular,
             eq_position=bundle.eq_position, tokenizer_monitor=tokenizer_monitor,
+            amp_enabled=amp_enabled, amp_dtype=amp_dtype,
         )
         final_val = evaluate_partition(
             runtime_model, val_loader, criterion, device=device, modular=bundle.modular,
             eq_position=bundle.eq_position, tokenizer_monitor=tokenizer_monitor,
+            amp_enabled=amp_enabled, amp_dtype=amp_dtype,
         )
     finally:
         tokenizer_monitor.close()
@@ -1653,6 +1680,8 @@ def _run_direction(
         "runtime": {
             "torch_compile": compile_enabled,
             "amp": amp_enabled,
+            "evaluation_amp": amp_enabled,
+            "relative_flatness_amp": False,
             "amp_dtype": str(amp_dtype) if amp_dtype is not None else None,
             "grad_scaler": scaler is not None,
         },

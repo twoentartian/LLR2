@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import json
 import logging
 import math
 import os
@@ -172,8 +173,25 @@ def normalize_expression(expression: str, modulus: int) -> str:
 
 
 def loading_dataset_from(path: str, modulus: Optional[int] = None):
-    match = re.search(r"modulus(\d+)", Path(path).name)
-    actual_modulus = int(match.group(1)) if match is not None else modulus
+    dataset_path = Path(path)
+    # Newly generated datasets are stored below a short, stable ``dataset``
+    # directory.  The modulus can therefore no longer be inferred from the
+    # directory name alone; prefer the metadata written alongside the data.
+    metadata_path = dataset_path / "dataset_metadata.json"
+    metadata_modulus = None
+    if metadata_path.is_file():
+        try:
+            with metadata_path.open("r", encoding="utf-8") as infile:
+                metadata_modulus = int(json.load(infile)["modulus"])
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Could not read dataset metadata from {metadata_path}") from exc
+
+    match = re.search(r"modulus(\d+)", dataset_path.name)
+    actual_modulus = (
+        metadata_modulus
+        if metadata_modulus is not None
+        else (int(match.group(1)) if match is not None else modulus)
+    )
     if actual_modulus is None:
         raise ValueError("Could not infer modulus from dataset path; pass --modulus or use a modulus{N} folder name")
     train_dataset = ArithmeticDataset.load_from_file(
@@ -215,10 +233,33 @@ def generate_dataset(
         chessboard_transpose_ratio=chessboard_transpose_ratio,
         noise_fraction=noise_fraction,
     )
-    name = train_dataset.name
-    train_dataset.save_to_file(os.path.join(output_folder_path, name, "train.txt"))
-    val_dataset.save_to_file(os.path.join(output_folder_path, name, "val.txt"))
-    train_dataset.tokenizer.save_tokens(os.path.join(output_folder_path, name, "tokenizer.txt"))
+    # Keep the generated dataset under a deliberately short, stable path.
+    # Dataset names contain timestamps, expressions and noise settings; using
+    # them as directory names made Windows/Explorer hit MAX_PATH quickly,
+    # especially inside a phase-diagram result directory.
+    dataset_dir = os.path.join(output_folder_path, "dataset")
+    train_dataset.save_to_file(os.path.join(dataset_dir, "train.txt"))
+    val_dataset.save_to_file(os.path.join(dataset_dir, "val.txt"))
+    train_dataset.tokenizer.save_tokens(os.path.join(dataset_dir, "tokenizer.txt"))
+
+    metadata = {
+        "dataset_name": train_dataset.name,
+        "dataset_path": "dataset",
+        "expression": expression,
+        "normalized_expression": normalized_expression,
+        "modulus": modulus,
+        "train_pct": train_pct,
+        "train_split_type": train_split_type,
+        "operand_length": operand_length,
+        "seed": seed,
+        "chessboard_transpose_ratio": chessboard_transpose_ratio,
+        "noise_fraction": noise_fraction,
+        "train_examples": len(train_dataset),
+        "validation_examples": len(val_dataset),
+    }
+    with open(os.path.join(dataset_dir, "dataset_metadata.json"), "w", encoding="utf-8") as outfile:
+        json.dump(metadata, outfile, indent=2)
+        outfile.write("\n")
     return train_dataset, val_dataset
 
 

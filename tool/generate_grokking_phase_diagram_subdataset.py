@@ -87,6 +87,12 @@ def copy_master(source: Path, destination: Path) -> Path:
             # copyfile also replaces a stale generated file, which is useful
             # when a master dataset was regenerated between experiments.
             shutil.copyfile(src, dst)
+        # Preserve the generation parameters when the master was produced by
+        # ``generate_dataset``.  Older master datasets do not have this file,
+        # so its absence remains fully supported.
+        metadata = source / "dataset_metadata.json"
+        if metadata.is_file():
+            shutil.copyfile(metadata, destination / metadata.name)
     return destination
 
 
@@ -121,9 +127,14 @@ def generate_master_dataset(
         seed=random_seed,
         noise_fraction=noise_fraction,
     )
-    generated = Path(train_ds.name)
-    if not generated.is_absolute():
-        generated = generated_parent / generated
+    # ``generate_dataset`` now uses a short, stable ``dataset`` directory to
+    # avoid Windows MAX_PATH failures.  Keep the legacy name-based fallback so
+    # this helper remains compatible with older versions of the generator.
+    generated = generated_parent / "dataset"
+    if not generated.is_dir():
+        generated = Path(train_ds.name)
+        if not generated.is_absolute():
+            generated = generated_parent / generated
     if not generated.is_dir():
         # ``ArithmeticDataset.name`` is normally the generated directory name,
         # but accepting the basename makes this robust across older versions.

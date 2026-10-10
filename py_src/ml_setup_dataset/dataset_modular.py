@@ -187,6 +187,7 @@ class ArithmeticDataset:
         train_split_type: TrainSplitType = "random",
         seed: Optional[int] = None,
         chessboard_transpose_ratio: float = 100.0,
+        noise_fraction: float = 0.0,
     ):
         """
         Creates training and validation datasets
@@ -197,10 +198,14 @@ class ArithmeticDataset:
         :param seed: random seed for randomized dataset generation; if None, use fresh entropy
         :param chessboard_transpose_ratio: percentage of chessboard_random cells whose
             transpose is assigned to the same partition
+        :param noise_fraction: fraction of randomly selected examples whose RHS
+            is replaced by a different randomly selected RHS
         :returns: (train_dataset, validation_dataset)
         """
 
         assert (0 < train_pct) and (train_pct <= 100)
+        if not math.isfinite(noise_fraction) or not 0 <= noise_fraction <= 1:
+            raise ValueError("noise_fraction must be between 0 and 1")
 
         ds_name = cls.get_dsname(
             modulus,
@@ -209,6 +214,7 @@ class ArithmeticDataset:
             train_pct,
             train_split_type,
             chessboard_transpose_ratio,
+            noise_fraction,
         )
         eqs_train, eqs_val = cls.make_data(
             operator,
@@ -218,6 +224,7 @@ class ArithmeticDataset:
             train_split_type=train_split_type,
             train_pct=train_pct,
             chessboard_transpose_ratio=chessboard_transpose_ratio,
+            noise_fraction=noise_fraction,
         )
 
         train_ds = cls(ds_name, eqs_train, modulus, train=True)
@@ -439,6 +446,7 @@ class ArithmeticDataset:
         train_pct,
         split_type,
         chessboard_transpose_ratio=100.0,
+        noise_fraction: float = 0.0,
     ) -> str:
         operator, noise_level = cls._get_operator_and_noise_level(operator)
         if operator in VALID_OPERATORS:
@@ -451,6 +459,8 @@ class ArithmeticDataset:
             ds_name += f"_transpose{chessboard_transpose_ratio:g}"
         if noise_level > 0:
             ds_name += f"_noise{noise_level}"
+        if noise_fraction > 0:
+            ds_name += f"_noisefrac{noise_fraction:g}"
         ds_name += datetime.now().strftime("_%Y-%m-%d_%H-%M-%S")
         ds_name = ds_name.replace("**", "^")
         ds_name = ds_name.replace("*", "")
@@ -465,6 +475,30 @@ class ArithmeticDataset:
             return operator, 0
 
     @classmethod
+    def _apply_random_label_noise(cls, data, noise_count, rng):
+        """Replace selected RHS values with different values from the dataset."""
+
+        if noise_count <= 0:
+            return
+        if noise_count > len(data):
+            raise ValueError("noise count cannot exceed the number of examples")
+        target_indices = rng.choice(len(data), size=noise_count, replace=False)
+        answers = [equation.split(" = ", 1)[1] for equation in data]
+        # Preserve the generated answer order so a fixed seed gives
+        # reproducible corruption across Python processes.
+        unique_answers = list(dict.fromkeys(answers))
+        if len(unique_answers) < 2:
+            raise ValueError("Could not construct a different random answer")
+        for target_index in target_indices:
+            target_index = int(target_index)
+            original_answer = answers[target_index]
+            choice = int(rng.integers(len(unique_answers) - 1))
+            if unique_answers[choice] == original_answer:
+                choice += 1
+            random_answer = unique_answers[choice]
+            data[target_index] = data[target_index].split(" = ", 1)[0] + " = " + random_answer
+
+    @classmethod
     def make_data(
         cls,
         operator,
@@ -475,9 +509,12 @@ class ArithmeticDataset:
         train_split_type="random",
         train_pct: float = 0.5,
         chessboard_transpose_ratio: float = 100.0,
+        noise_fraction: float = 0.0,
     ) -> tuple[List[str], List[str]]:
         cls._validate_chessboard_transpose_ratio(train_split_type, chessboard_transpose_ratio)
         operator, noise_level = cls._get_operator_and_noise_level(operator)
+        if not math.isfinite(noise_fraction) or not 0 <= noise_fraction <= 1:
+            raise ValueError("noise_fraction must be between 0 and 1")
         data, data_table = None, None
         if operator not in ["sort", "reverse", "copy"]:
             data, data_table = cls._make_binary_operation_data(operator, modulus)
@@ -528,18 +565,26 @@ class ArithmeticDataset:
                 rng.shuffle(train_eqs)
                 rng.shuffle(val_eqs)
 
+            if noise_fraction > 0:
+                all_eqs = train_eqs + val_eqs
+                cls._apply_random_label_noise(
+                    all_eqs, round(len(all_eqs) * noise_fraction), rng
+                )
+                train_len = len(train_eqs)
+                train_eqs, val_eqs = all_eqs[:train_len], all_eqs[train_len:]
+
             return train_eqs, val_eqs
         else:
             data = [EOS_TOKEN + " " + eq + " " + EOS_TOKEN for eq in data]
             if shuffle:
                 rng.shuffle(data)
-            if noise_level > 0:
-                random_answer_eqns = rng.choice(data, size=noise_level)
-                random_answers = [
-                    random_eq.split(" = ")[1] for random_eq in random_answer_eqns
-                ]
-                for i in range(noise_level):
-                    data[i] = data[i].split(" = ")[0] + " = " + random_answers[i]
+            noise_count = noise_level
+            if noise_fraction > 0:
+                if noise_level > 0:
+                    raise ValueError("use either _noisy_N or noise_fraction, not both")
+                noise_count = round(len(data) * noise_fraction)
+            if noise_count > 0:
+                cls._apply_random_label_noise(data, noise_count, rng)
 
             train_rows, _ = cls.calc_split_len(train_pct, len(data))
             train_eqs = data[:train_rows]

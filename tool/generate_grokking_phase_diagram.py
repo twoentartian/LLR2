@@ -92,6 +92,7 @@ def train_cell(args, lr, wd, train_ds, val_ds, device):
         extra={
             "modulus": args.modulus,
             "train_pct": args.train_pct,
+            "noise_fraction": getattr(args, "noise_fraction", 0.0),
             "epoch": args.epoch,
             "model_type": args.model_type,
         },
@@ -145,10 +146,12 @@ def parse_args():
     parser.add_argument("--n_lr", type=int, default=DEFAULT_N_LR)
     parser.add_argument("--wd_max", type=float, default=DEFAULT_WD_MAX)
     parser.add_argument("--n_wd", type=int, default=DEFAULT_N_WD)
-    parser.add_argument("-dpath", "--dataset_path", type=str, default=None)
-    parser.add_argument("-dexp", "--dataset_exp", type=str, default=None)
+    dataset_source = parser.add_mutually_exclusive_group(required=True)
+    dataset_source.add_argument("-dpath", "--dataset_path", type=str)
+    dataset_source.add_argument("-dexp", "--dataset_exp", type=str)
     parser.add_argument("--modulus", type=int, default=97)
     parser.add_argument("-tp", "--train_pct", type=float, default=50)
+    parser.add_argument("--noise_fraction", "--noise-fraction", "--noise", type=float, default=0.0, help="Fraction of generated examples whose answer is replaced by a different random answer (0 to 1)")
     parser.add_argument("-st", "--split_type", type=str, default="random", choices=SPLIT_CHOICES)
     parser.add_argument("-ol", "--operand_length", type=int, default=None)
     parser.add_argument("-epoch", "--epoch", type=int, default=150000)
@@ -160,53 +163,19 @@ def parse_args():
     parser.add_argument("--m_context_len", default=None, type=int)
     parser.add_argument("--m_pos_encoding", default=None, type=str, choices=["default", "trainable"])
     parser.add_argument("-rs", "--random_seed", type=int, default=None)
-    parser.set_defaults(
-        enable_ineffective_training_stop=True,
-        enable_skip_larger_wd_after_confusion=True,
-        enable_training_loss_plateau_stop=False,
-    )
-    parser.add_argument(
-        "--enable_ineffective_training_stop",
-        action="store_true",
-        help="Enable ineffective/high-loss early stopping (enabled by default)",
-    )
-    parser.add_argument(
-        "--disable_ineffective_training_stop",
-        action="store_false",
-        dest="enable_ineffective_training_stop",
-        help="Disable ineffective/high-loss early stopping",
-    )
-    parser.add_argument(
-        "--enable_skip_larger_wd_after_confusion",
-        action="store_true",
-        help="Skip larger WD values after two consecutive confusion cells (enabled by default)",
-    )
-    parser.add_argument(
-        "--disable_skip_larger_wd_after_confusion",
-        action="store_false",
-        dest="enable_skip_larger_wd_after_confusion",
-        help="Disable confusion-based WD skipping",
-    )
-    parser.add_argument(
-        "--enable_training_loss_plateau_stop",
-        action="store_true",
-        help="Stop a low-accuracy run when training loss makes too little progress (enabled by default)",
-    )
-    parser.add_argument(
-        "--disable_training_loss_plateau_stop",
-        action="store_false",
-        dest="enable_training_loss_plateau_stop",
-        help="Disable training-loss plateau stopping",
-    )
+
+    parser.set_defaults(enable_ineffective_training_stop=True,enable_skip_larger_wd_after_confusion=True,enable_training_loss_plateau_stop=False)
+    parser.add_argument("--enable_ineffective_training_stop",action="store_true",help="Enable ineffective/high-loss early stopping (enabled by default)")
+    parser.add_argument("--disable_ineffective_training_stop",action="store_false",dest="enable_ineffective_training_stop",help="Disable ineffective/high-loss early stopping")
+    parser.add_argument("--enable_skip_larger_wd_after_confusion",action="store_true",help="Skip larger WD values after two consecutive confusion cells (enabled by default)")
+    parser.add_argument("--disable_skip_larger_wd_after_confusion",action="store_false",dest="enable_skip_larger_wd_after_confusion",help="Disable confusion-based WD skipping")
+    parser.add_argument("--enable_training_loss_plateau_stop",action="store_true",help="Stop a low-accuracy run when training loss makes too little progress (enabled by default)")
+    parser.add_argument("--disable_training_loss_plateau_stop",action="store_false",dest="enable_training_loss_plateau_stop",help="Disable training-loss plateau stopping")
     parser.add_argument("--training_loss_plateau_window_ratio", type=float, default=0.01)
     parser.add_argument("--training_loss_plateau_consecutive_windows", type=int, default=2)
     parser.add_argument("--training_loss_plateau_min_epoch", type=int, default=0)
-    parser.add_argument(
-        "--training_loss_plateau_min_relative_improvement",
-        type=float,
-        default=0.0001,
-        help="Minimum relative loss improvement over the plateau window",
-    )
+    parser.add_argument("--training_loss_plateau_min_relative_improvement",type=float,default=0.0001,help="Minimum relative loss improvement over the plateau window")
+
     return parser.parse_args()
 
 
@@ -222,6 +191,10 @@ def main():
         raise ValueError("--training_loss_plateau_min_epoch must be non-negative")
     if args.training_loss_plateau_min_relative_improvement < 0:
         raise ValueError("--training_loss_plateau_min_relative_improvement must be non-negative")
+    if not 0 <= args.noise_fraction <= 1:
+        raise ValueError("--noise_fraction must be between 0 and 1")
+    if args.dataset_path is not None and args.noise_fraction != 0:
+        raise ValueError("--noise_fraction requires generated data via --dataset_exp; an existing dataset is already materialized")
 
     setup_logging(logger, "main")
     logger.info("phase diagram sweep starting")
@@ -243,7 +216,15 @@ def main():
     with open(os.path.join(args.output_folder_path, "command.txt"), "w", encoding="utf-8") as outfile:
         outfile.write(" ".join(sys.argv))
     with open(os.path.join(args.output_folder_path, "grid_spec.json"), "w", encoding="utf-8") as outfile:
-        json.dump({"learning_rates": learning_rates, "weight_decays": weight_decays}, outfile, indent=2)
+        json.dump(
+            {
+                "learning_rates": learning_rates,
+                "weight_decays": weight_decays,
+                "noise_fraction": args.noise_fraction,
+            },
+            outfile,
+            indent=2,
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if args.dataset_path is not None:
@@ -259,6 +240,7 @@ def main():
             args.split_type,
             args.operand_length,
             seed=args.random_seed,
+            noise_fraction=args.noise_fraction,
         )
 
     total_cells = len(learning_rates) * len(weight_decays)

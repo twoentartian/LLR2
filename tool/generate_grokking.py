@@ -202,6 +202,7 @@ def generate_dataset(
     operand_length,
     seed=None,
     chessboard_transpose_ratio=100.0,
+    noise_fraction=0.0,
 ):
     normalized_expression = normalize_expression(expression, modulus)
     train_dataset, val_dataset = ArithmeticDataset.splits(
@@ -212,6 +213,7 @@ def generate_dataset(
         operand_length=operand_length,
         seed=seed,
         chessboard_transpose_ratio=chessboard_transpose_ratio,
+        noise_fraction=noise_fraction,
     )
     name = train_dataset.name
     train_dataset.save_to_file(os.path.join(output_folder_path, name, "train.txt"))
@@ -652,10 +654,12 @@ def parse_args():
     parser.add_argument("-w", "--worker", type=int, default=1, help="kept for CLI compatibility; training is sequential")
     parser.add_argument("-o", "--output_folder_name", default=None)
     parser.add_argument("-m", "--model_type", type=str, default="transformer_for_grokking")
-    parser.add_argument("-dpath", "--dataset_path", type=str, default=None)
-    parser.add_argument("-dexp", "--dataset_exp", type=str, default=None)
+    dataset_source = parser.add_mutually_exclusive_group(required=True)
+    dataset_source.add_argument("-dpath", "--dataset_path", type=str)
+    dataset_source.add_argument("-dexp", "--dataset_exp", type=str)
     parser.add_argument("--modulus", type=int, default=97)
     parser.add_argument("-tp", "--train_pct", type=float, default=50)
+    parser.add_argument("--noise_fraction", "--noise-fraction", "--noise", type=float, default=0.0, help="Fraction of generated examples whose answer is replaced by a different random answer (0 to 1)")
     parser.add_argument("-st", "--split_type", type=str, default="random", choices=SPLIT_CHOICES)
     parser.add_argument("--chessboard_transpose_ratio",type=float,default=100.0,help=("percentage of chessboard_random samples whose (b,a) transpose is in the same partition; rounded to the nearest feasible cell count (default: 100)"),)
     parser.add_argument("-ol", "--operand_length", type=int, default=None)
@@ -690,6 +694,10 @@ def main():
         raise ValueError("--disable_validation cannot be combined with --inverse_train_val")
     if args.distance_to_origin_interval is not None and args.distance_to_origin_interval <= 0:
         raise ValueError("--distance_to_origin_interval must be positive when set")
+    if not 0 <= args.noise_fraction <= 1:
+        raise ValueError("--noise_fraction must be between 0 and 1")
+    if args.dataset_path is not None and args.noise_fraction != 0:
+        raise ValueError("--noise_fraction requires generated data via --dataset_exp; an existing dataset is already materialized")
 
     torch.set_num_threads(max(1, min(args.core, 8)))
     setup_logging(logger, "main")
@@ -724,6 +732,7 @@ def main():
             args.operand_length,
             seed=args.random_seed,
             chessboard_transpose_ratio=args.chessboard_transpose_ratio,
+            noise_fraction=args.noise_fraction,
         )
 
     if args.inverse_train_val:

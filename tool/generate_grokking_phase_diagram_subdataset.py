@@ -99,6 +99,7 @@ def generate_master_dataset(
     split_type: str,
     operand_length: int | None,
     random_seed: int | None,
+    noise_fraction: float = 0.0,
 ) -> Path:
     """Generate a complete master dataset through the repository API."""
 
@@ -118,6 +119,7 @@ def generate_master_dataset(
         split_type,
         operand_length,
         seed=random_seed,
+        noise_fraction=noise_fraction,
     )
     generated = Path(train_ds.name)
     if not generated.is_absolute():
@@ -130,14 +132,28 @@ def generate_master_dataset(
     return generated
 
 
-def dataset_dir_name(size: int, fixed_label_modulus: int, train_pct: float, split_type: str) -> str:
+def dataset_dir_name(
+    size: int,
+    fixed_label_modulus: int,
+    train_pct: float,
+    split_type: str,
+    noise_fraction: float = 0.0,
+) -> str:
     train_text = f"{train_pct:g}"
-    return f"modulus{size}_x^y_mod_{fixed_label_modulus}_train{train_text}_{split_type}_prefix"
+    noise_text = f"_noisefrac{noise_fraction:g}" if noise_fraction > 0 else ""
+    return f"modulus{size}_x^y_mod_{fixed_label_modulus}_train{train_text}_{split_type}{noise_text}_prefix"
 
 
-def result_dir_name(size: int, fixed_label_modulus: int, train_pct: float, split_type: str) -> str:
+def result_dir_name(
+    size: int,
+    fixed_label_modulus: int,
+    train_pct: float,
+    split_type: str,
+    noise_fraction: float = 0.0,
+) -> str:
     train_text = f"{train_pct:g}"
-    return f"x^y_mod_{fixed_label_modulus}_size{size}_train{train_text}_{split_type}_phase_diagram"
+    noise_text = f"_noisefrac{noise_fraction:g}" if noise_fraction > 0 else ""
+    return f"x^y_mod_{fixed_label_modulus}_size{size}_train{train_text}_{split_type}{noise_text}_phase_diagram"
 
 
 def _write_prefixes_for_file(
@@ -467,6 +483,7 @@ def prepare_prefixes(
     fixed_label_modulus: int,
     train_pct: float,
     split_type: str,
+    noise_fraction: float = 0.0,
 ) -> list[dict]:
     """Create every prefix and return manifest entries."""
 
@@ -474,7 +491,9 @@ def prepare_prefixes(
     datasets_root = output_root / "datasets"
     sizes = tuple(sorted(set(sizes)))
     directories = {
-        size: datasets_root / dataset_dir_name(size, fixed_label_modulus, train_pct, split_type)
+        size: datasets_root / dataset_dir_name(
+            size, fixed_label_modulus, train_pct, split_type, noise_fraction
+        )
         for size in sizes
     }
     train_total, train_kept = _write_prefixes_for_file(
@@ -510,6 +529,7 @@ def prepare_prefixes(
             "master_train_examples": train_total,
             "master_validation_examples": val_total,
             "tokenizer_source": str(tokenizer_source),
+            "noise_fraction": noise_fraction,
         }
         (directory / "prefix_metadata.json").write_text(
             json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
@@ -520,32 +540,14 @@ def prepare_prefixes(
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     master_source = parser.add_mutually_exclusive_group(required=True)
-    master_source.add_argument(
-        "--master-path",
-        type=Path,
-        help="Existing complete master dataset directory containing train.txt, val.txt and tokenizer.txt.",
-    )
-    master_source.add_argument(
-        "-dexp",
-        "--dataset-exp",
-        "--master-expression",
-        dest="dataset_exp",
-        help="Generate the master from an expression, e.g. x**y_mod_1997 (also accepts x**y).",
-    )
-    parser.add_argument(
-        "--generate-master",
-        action="store_true",
-        help="Deprecated compatibility flag; -dexp already generates the master automatically.",
-    )
-    parser.add_argument(
-        "--output-root",
-        type=Path,
-        default=None,
-        help="Output directory. Defaults to ./generate_grokking_phase_diagram_subdataset_YYYY-MM-DD_HH-MM-SS.",
-    )
+    master_source.add_argument("--master-path",type=Path,help="Existing complete master dataset directory containing train.txt, val.txt and tokenizer.txt.",)
+    master_source.add_argument("-dexp","--dataset-exp","--master-expression",dest="dataset_exp",help="Generate the master from an expression, e.g. x**y_mod_1997 (also accepts x**y).",)
+    parser.add_argument("--generate-master",action="store_true",help="Deprecated compatibility flag; -dexp already generates the master automatically.",)
+    parser.add_argument("--output-root",type=Path,default=None,help="Output directory. Defaults to ./generate_grokking_phase_diagram_subdataset_YYYY-MM-DD_HH-MM-SS.",)
     parser.add_argument("--sizes", nargs="+", type=int, default=list(DEFAULT_SIZES))
     parser.add_argument("--modulus", type=int, default=1997, help="Fixed label modulus of the master dataset")
     parser.add_argument("--train-pct", type=float, default=50.0)
+    parser.add_argument("--noise_fraction","--noise",type=float,default=0.0,help="Fraction of generated master examples whose answer is replaced by a different random answer (0 to 1)",)
     parser.add_argument("--split-type", default="random")
     parser.add_argument("--operand-length", type=int, default=None)
     parser.add_argument("--random-seed", type=int, default=None)
@@ -571,59 +573,20 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--m_d_model", type=int, default=None)
     parser.add_argument("--m_context_len", type=int, default=None)
     parser.add_argument("--m_pos_encoding", choices=["default", "trainable"], default=None)
-    parser.set_defaults(
-        enable_ineffective_training_stop=True,
-        enable_skip_larger_wd_after_confusion=True,
-        enable_training_loss_plateau_stop=False,
-    )
-    parser.add_argument(
-        "--enable-ineffective-training-stop",
-        "--enable_ineffective_training_stop",
-        dest="enable_ineffective_training_stop",
-        action="store_true",
-        help="Enable ineffective/high-loss early stopping (enabled by default)",
-    )
-    parser.add_argument(
-        "--disable-ineffective-training-stop",
-        dest="enable_ineffective_training_stop",
-        action="store_false",
-        help="Do not add --enable_ineffective_training_stop to generated runs",
-    )
-    parser.add_argument(
-        "--enable-skip-larger-wd-after-confusion",
-        "--enable_skip_larger_wd_after_confusion",
-        dest="enable_skip_larger_wd_after_confusion",
-        action="store_true",
-        help="Skip larger WD values after repeated confusion (enabled by default)",
-    )
-    parser.add_argument(
-        "--disable-skip-larger-wd-after-confusion",
-        dest="enable_skip_larger_wd_after_confusion",
-        action="store_false",
-        help="Do not add --enable_skip_larger_wd_after_confusion to generated runs",
-    )
-    parser.add_argument(
-        "--enable-training-loss-plateau-stop",
-        action="store_true",
-        help="Add the training-loss plateau stop to generated phase-diagram runs (enabled by default)",
-    )
-    parser.add_argument(
-        "--disable-training-loss-plateau-stop",
-        action="store_false",
-        dest="enable_training_loss_plateau_stop",
-        help="Do not add training-loss plateau stopping to generated runs",
-    )
+
+    parser.set_defaults(enable_ineffective_training_stop=True,enable_skip_larger_wd_after_confusion=True,enable_training_loss_plateau_stop=False,)
+    parser.add_argument("--enable-ineffective-training-stop","--enable_ineffective_training_stop",dest="enable_ineffective_training_stop",action="store_true",help="Enable ineffective/high-loss early stopping (enabled by default)",)
+    parser.add_argument("--disable-ineffective-training-stop",dest="enable_ineffective_training_stop",action="store_false",help="Do not add --enable_ineffective_training_stop to generated runs",)
+    parser.add_argument("--enable-skip-larger-wd-after-confusion","--enable_skip_larger_wd_after_confusion",dest="enable_skip_larger_wd_after_confusion",action="store_true",help="Skip larger WD values after repeated confusion (enabled by default)",)
+    parser.add_argument("--disable-skip-larger-wd-after-confusion",dest="enable_skip_larger_wd_after_confusion",action="store_false",help="Do not add --enable_skip_larger_wd_after_confusion to generated runs",)
+    parser.add_argument("--enable-training-loss-plateau-stop",action="store_true",help="Add the training-loss plateau stop to generated phase-diagram runs (enabled by default)",)
+    parser.add_argument("--disable-training-loss-plateau-stop",action="store_false",dest="enable_training_loss_plateau_stop",help="Do not add training-loss plateau stopping to generated runs",)
     parser.add_argument("--training-loss-plateau-window-ratio", type=float, default=0.01)
     parser.add_argument("--training-loss-plateau-consecutive-windows", type=int, default=2)
     parser.add_argument("--training-loss-plateau-min-epoch", type=int, default=0)
     parser.add_argument("--training-loss-plateau-min-relative-improvement", type=float, default=0.0001)
-    parser.add_argument(
-        "--phase-extra-arg",
-        action="append",
-        default=[],
-        metavar="ARG",
-        help="Additional already-tokenized phase-generator argument; repeat for each token",
-    )
+
+    parser.add_argument("--phase-extra-arg",action="append",default=[],metavar="ARG",help="Additional already-tokenized phase-generator argument; repeat for each token",)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -635,6 +598,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--generate-master is only valid together with -dexp/--dataset-exp")
     if args.modulus <= 0:
         parser.error("--modulus must be positive")
+    if not 0 <= args.noise_fraction <= 1:
+        parser.error("--noise_fraction must be between 0 and 1")
+    if args.master_path is not None and args.noise_fraction != 0:
+        parser.error("--noise_fraction requires -dexp/--dataset-exp; an existing master is already materialized")
     if any(size <= 0 or size > args.modulus for size in args.sizes):
         parser.error(f"every --sizes value must be in [1, {args.modulus}]")
     if args.batchsize is not None and args.batchsize <= 0:
@@ -669,7 +636,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         output_root = args.output_root.expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
-    requested_master = args.master_path.expanduser().resolve()
+    requested_master = args.master_path.expanduser().resolve() if args.master_path is not None else None
     # ``-dexp`` is intentionally sufficient to request generation.  The
     # explicit flag remains accepted for compatibility, but no longer permits
     # omitting the required source selector.
@@ -686,6 +653,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             split_type=args.split_type,
             operand_length=args.operand_length,
             random_seed=args.random_seed,
+            noise_fraction=args.noise_fraction,
         )
     else:
         source_master = requested_master
@@ -699,6 +667,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         fixed_label_modulus=args.modulus,
         train_pct=args.train_pct,
         split_type=args.split_type,
+        noise_fraction=args.noise_fraction,
     )
     phase_script = args.phase_script.expanduser().resolve()
     if not phase_script.is_file():
@@ -718,7 +687,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             train_examples=entry["train_examples"],
         )
         result_dir = output_root / "results" / result_dir_name(
-            plan.size, args.modulus, args.train_pct, args.split_type
+            plan.size, args.modulus, args.train_pct, args.split_type, args.noise_fraction
         )
         entry.update(
             {

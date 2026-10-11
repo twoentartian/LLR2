@@ -59,6 +59,7 @@ import os
 import operator
 import re
 import secrets
+import subprocess
 import sys
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
@@ -1323,6 +1324,44 @@ def _write_json(path: str, payload: dict[str, Any]) -> None:
         json.dump(payload, outfile, indent=2, sort_keys=True, default=str)
 
 
+def _git_provenance() -> dict[str, Any]:
+    """Return the Git revision used for this run when the source is in Git.
+
+    Result folders are often copied away from the checkout, so recording the
+    revision in the result metadata is more useful than relying on the path to
+    the source script.  Missing Git metadata must not prevent an experiment
+    from running (for example, when the script is packaged or copied alone).
+    """
+    repository = Path(__file__).resolve().parents[1]
+    provenance: dict[str, Any] = {
+        "repository": str(repository),
+        "commit": None,
+        "describe": None,
+        "branch": None,
+        "dirty": None,
+    }
+    try:
+        def run_git(*arguments: str) -> str:
+            result = subprocess.run(
+                ["git", *arguments],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return result.stdout.strip()
+
+        provenance["commit"] = run_git("rev-parse", "HEAD")
+        provenance["describe"] = run_git("describe", "--always", "--dirty", "--long")
+        provenance["branch"] = run_git("branch", "--show-current") or None
+        # Ignore unrelated untracked data directories; ``dirty`` describes
+        # tracked source changes relative to the recorded commit.
+        provenance["dirty"] = bool(run_git("status", "--porcelain", "--untracked-files=no"))
+    except (OSError, subprocess.SubprocessError) as error:
+        provenance["error"] = f"{type(error).__name__}: {error}"
+    return provenance
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Measure symmetric train/validation misalignment.")
     parser.add_argument(
@@ -1812,6 +1851,7 @@ def _measure_flatness_from_checkpoint(
     summary = {
         "schema_version": 1,
         "mode": "flatness_from_checkpoint",
+        "git_provenance": _git_provenance(),
         "checkpoint": str(checkpoint_path),
         "checkpoint_model_type": checkpoint_model_type,
         "checkpoint_dataset_type": checkpoint_dataset_type,
@@ -1868,6 +1908,7 @@ def main() -> None:
     else:
         logger.info("random_seed = %d", args.random_seed)
     set_seed(args.random_seed)
+    git_provenance = _git_provenance()
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--device cuda requested but CUDA is unavailable")
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else args.device if args.device != "auto" else "cpu")
@@ -2031,6 +2072,7 @@ def main() -> None:
     measure_items = list(measure_values.values())
     aggregate = {
         "schema_version": 2,
+        "git_provenance": git_provenance,
         "dataset": bundle.dataset_name,
         "dataset_type": dataset_type_name,
         "source_examples": bundle.source_examples,

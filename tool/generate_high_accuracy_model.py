@@ -7,6 +7,7 @@ import math
 import os
 import random
 import sys
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Optional, TypeAlias, cast
 
@@ -15,6 +16,7 @@ import numpy.typing as npt
 import torch
 from PIL import Image
 import lightning as L
+from tqdm.auto import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -119,6 +121,28 @@ def maybe_enable_torch_compile(
             child_logger.info("torch.compile returned a non-Module wrapper; using the original module")
     except Exception as exc:
         child_logger.info("torch.compile skipped: %s", exc)
+
+
+class _ProgressIterable:
+    """Update a tqdm bar as batches are consumed by the training engine."""
+
+    def __init__(self, iterable, progress_bar):
+        self._iterable = iterable
+        self._progress_bar = progress_bar
+
+    def __iter__(self):
+        for batch in self._iterable:
+            yield batch
+            self._progress_bar.update(1)
+
+
+def _should_enable_progress_bar(arg_worker_count: int) -> bool:
+    """Only show interactive progress bars for a single training process."""
+    if arg_worker_count != 1:
+        return False
+    # Redirected logs and batch jobs should remain plain text without control
+    # characters from tqdm.
+    return sys.stderr.isatty()
 
 
 def _move_nested_tensors_to_cpu(value: Any) -> Any:
@@ -511,21 +535,38 @@ def training_model(
     checkpoint_run_config = copy.deepcopy(run_config)
     checkpoint_run_config["epoch_override"] = arg_epoch_override
 
+    progress_enabled = _should_enable_progress_bar(arg_worker_count)
+    if arg_worker_count == 1 and not progress_enabled:
+        child_logger.info("progress bar disabled for non-interactive output")
+
     for epoch in range(start_epoch, epochs):
         train_sampler = getattr(dataloader, "sampler", None)
         if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
 
-        train_result = train(
-            adapter,
-            dataloader,
-            optimizer, # type: ignore
-            lr_scheduler, # type: ignore
-            device=device,
-            scaler=scaler,
-            gradient_accumulate_every=arg_ml_setup.gradient_accumulate_every,
-            max_grad_norm=arg_ml_setup.max_grad_norm,
-        ) # type: ignore
+        progress_context = tqdm(
+            total=steps_per_epoch,
+            desc=f"epoch {epoch + 1}/{epochs}",
+            unit="batch",
+            dynamic_ncols=True,
+            leave=True,
+        ) if progress_enabled else nullcontext()
+        with progress_context as progress_bar:
+            train_iterable = (
+                _ProgressIterable(dataloader, progress_bar)
+                if progress_enabled and progress_bar is not None
+                else dataloader
+            )
+            train_result = train(
+                adapter,
+                train_iterable,
+                optimizer, # type: ignore
+                lr_scheduler, # type: ignore
+                device=device,
+                scaler=scaler,
+                gradient_accumulate_every=arg_ml_setup.gradient_accumulate_every,
+                max_grad_norm=arg_ml_setup.max_grad_norm,
+            ) # type: ignore
 
         lrs = [pg["lr"] for pg in optimizer.param_groups] # type: ignore
 
@@ -582,6 +623,11 @@ def training_model(
             number_of_models=number_of_models,
             output_folder=output_folder,
             run_config=checkpoint_run_config,
+        )
+        child_logger.info(
+            "saved resumable training checkpoint after epoch %d to %s",
+            epoch,
+            training_checkpoint_path,
         )
 
     child_logger.info("training complete")

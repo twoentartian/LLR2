@@ -1,4 +1,5 @@
 imagenet1k_path = "~/dataset/imagenet1k"
+imagenet21k_p_path = "~/dataset/imagenet21k_resized"
 imagenet100_path = "~/dataset/imagenet100"
 imagenet10_path = "~/dataset/imagenet10"
 flickr30k_path = "~/dataset/flickr30k"

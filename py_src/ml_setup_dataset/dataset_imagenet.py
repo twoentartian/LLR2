@@ -22,7 +22,12 @@ from torchvision.transforms.v2 import RandAugment
 from torch.utils.data import Dataset
 
 from .dataset_types import DatasetSetup, DatasetType
-from .dataset_default import imagenet1k_path, imagenet100_path, imagenet10_path
+from .dataset_default import (
+    imagenet1k_path,
+    imagenet21k_p_path,
+    imagenet100_path,
+    imagenet10_path,
+)
 from .dataset_masked import MaskedImageDataset
 
 # Standard ImageNet normalisation constants
@@ -492,12 +497,14 @@ def _make_dali_imagenet_setup(
     auto_augment_interpolation: transforms.InterpolationMode = transforms.InterpolationMode.BILINEAR,
     random_erase_prob: float = 0.0,
     repeated_augmentation_repetitions: Optional[int] = None,
+    train_dirname: str = "train",
+    val_dirname: str = "val",
 ) -> DatasetSetup:
     root = str(dataset_root)
     if repeated_augmentation_repetitions is None:
         repeated_augmentation_repetitions = _default_dali_repetitions(preset_version)
     train_data = DaliImageNetDataset(
-        file_root=os.path.join(root, "train"),
+        file_root=os.path.join(root, train_dirname),
         dataset_type=dataset_type,
         split="train",
         preset_version=preset_version,
@@ -512,7 +519,7 @@ def _make_dali_imagenet_setup(
         repeated_augmentation_repetitions=repeated_augmentation_repetitions,
     )
     val_data = DaliImageNetDataset(
-        file_root=os.path.join(root, "val"),
+        file_root=os.path.join(root, val_dirname),
         dataset_type=dataset_type,
         split="val",
         preset_version=preset_version,
@@ -655,6 +662,67 @@ def dataset_imagenet10(
     train_data = datasets.ImageFolder(os.path.join(imagenet10_path, "train"), transform=transforms_training)
     val_data = datasets.ImageFolder(os.path.join(imagenet10_path, "val"), transform=transforms_testing)
     return DatasetSetup(DatasetType.imagenet10, train_data, val_data)
+
+
+def dataset_imagenet21k_p(
+    preset_version: int = 1,
+    transforms_training=None,
+    transforms_testing=None,
+    train_crop_size: Optional[int] = None,
+    val_resize_size: Optional[int] = None,
+    val_crop_size: Optional[int] = None,
+    random_erasing: Optional[float] = None,
+    augmentation: bool = True,
+    use_dali: bool = False,
+    dali_device_id: int = 0,
+) -> DatasetSetup:
+    """ImageNet-21k-p in the resized ImageFolder layout.
+
+    The default root is ``~/dataset/imagenet21k_resized`` and contains
+    ``imagenet21k_train/`` and ``imagenet21k_val/``.  The root can be
+    overridden in ``py_src/ml_setup_dataset/dataset_env.py``.
+    """
+    if use_dali:
+        if transforms_training is not None or transforms_testing is not None:
+            raise ValueError("DALI ImageNet setup does not accept torchvision transforms")
+        ds = _make_dali_imagenet_setup(
+            DatasetType.imagenet21k_p,
+            imagenet21k_p_path,
+            preset_version,
+            train_crop_size,
+            val_resize_size,
+            val_crop_size,
+            augmentation,
+            dali_device_id,
+            random_erase_prob=_default_dali_random_erase_prob(preset_version, random_erasing),
+            train_dirname="imagenet21k_train",
+            val_dirname="imagenet21k_val",
+        )
+        if ds.train_data.classes != ds.valdation_data.classes:
+            raise ValueError(
+                "ImageNet-21k train/val class mappings differ; both splits must "
+                "contain the same class directories"
+            )
+        return ds
+
+    if transforms_training is None and transforms_testing is None:
+        transforms_training, transforms_testing = get_imagenet_preprocessing(
+            preset_version, train_crop_size, val_resize_size, val_crop_size,
+            random_erasing, augmentation,
+        )
+    root = str(imagenet21k_p_path)
+    train_data = datasets.ImageFolder(
+        os.path.join(root, "imagenet21k_train"), transform=transforms_training
+    )
+    val_data = datasets.ImageFolder(
+        os.path.join(root, "imagenet21k_val"), transform=transforms_testing
+    )
+    if train_data.class_to_idx != val_data.class_to_idx:
+        raise ValueError(
+            "ImageNet-21k train/val class mappings differ; both splits must "
+            "contain the same class directories"
+        )
+    return DatasetSetup(DatasetType.imagenet21k_p, train_data, val_data)
 
 def dataset_imagenet1k_from_pytorch(train_crop_size=224, val_resize_size=256, val_crop_size=224,
                               interpolation=transforms.InterpolationMode.BILINEAR, auto_augment_policy=None,

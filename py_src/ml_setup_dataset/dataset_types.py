@@ -30,6 +30,10 @@ class DatasetType(Enum):
     arithmetic_cubepoly = auto()
     arithmetic_cube2 = auto()
     arithmetic_exp_unknown = auto()
+    # ImageNet-21k-p (appended to preserve the numeric values of existing
+    # DatasetType members used by older configs).
+    imagenet21k_p = auto()
+    imagenet21kp = imagenet21k_p
 
 @dataclass
 class DatasetSetup:

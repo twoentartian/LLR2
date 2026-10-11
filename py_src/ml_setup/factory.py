@@ -24,7 +24,8 @@ def get_ml_setup_from_config(
         sys.exit(1)
 
     try:
-        dt = DatasetType[dataset_type] if dataset_type != "default" else None
+        dataset_type_key = "imagenet21k_p" if dataset_type == "imagenet21k-p" else dataset_type
+        dt = DatasetType[dataset_type_key] if dataset_type != "default" else None
     except KeyError:
         print(f"Unknown dataset type: {dataset_type!r}. Valid options: {[e.name for e in DatasetType]}")
         sys.exit(1)
@@ -297,9 +298,11 @@ def _build(mt: ModelType, dt, preset: int, device, *, use_dali: bool = False, da
         raise _nie(mt, dt)
 
     elif mt == ModelType.cct_14_7x2_224:
-        from .cct import cct14_7x2_imagenet1k
+        from .cct import cct14_7x2_imagenet1k, cct14_7x2_imagenet21k_p
         if _default or dt == DatasetType.imagenet1k:
             return cct14_7x2_imagenet1k()
+        elif dt == DatasetType.imagenet21k_p:
+            return cct14_7x2_imagenet21k_p(use_dali=use_dali, dali_device_id=dali_device_id)
         raise _nie(mt, dt)
     
     elif mt == ModelType.dla_46_c:

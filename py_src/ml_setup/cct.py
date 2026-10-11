@@ -15,9 +15,15 @@ from py_src.ml_setup.ml_setup import MLSetup
 from py_src.ml_setup_model import ModelType
 from py_src.ml_setup_dataset import DatasetSetup
 
-from py_src.ml_setup_dataset import (dataset_cifar10, dataset_cifar100, dataset_imagenet1k, 
-                                     dataset_imagenet100, dataset_imagenet10, 
-                                     dataset_imagenet1k_from_pytorch)
+from py_src.ml_setup_dataset import (
+    dataset_cifar10,
+    dataset_cifar100,
+    dataset_imagenet1k,
+    dataset_imagenet21k_p,
+    dataset_imagenet100,
+    dataset_imagenet10,
+    dataset_imagenet1k_from_pytorch,
+)
 from .shared_setup_util import make_setup
 from py_src.ml_setup_dataset.dataset_default import default_path_imagenet1k
 
@@ -91,3 +97,32 @@ def cct14_7x2_imagenet1k(override_dataset:Optional[DatasetSetup]=None) -> MLSetu
         output_setup.override_test_loader = val_loader
 
     return output_setup
+
+
+def cct14_7x2_imagenet21k_p(
+    override_dataset: Optional[DatasetSetup] = None,
+    *,
+    use_dali: bool = False,
+    dali_device_id: int = 0,
+) -> MLSetup:
+    """CCT-14/7x2-224 setup for the 10,450-class ImageNet-21k-p split."""
+    import py_src.third_party.compact_transformers.src.cct as cct
+
+    ds = (
+        dataset_imagenet21k_p(
+            preset_version=1,
+            train_crop_size=224,
+            val_resize_size=256,
+            val_crop_size=224,
+            use_dali=use_dali,
+            dali_device_id=dali_device_id,
+        )
+        if override_dataset is None
+        else override_dataset
+    )
+    # Infer the output width for small override datasets used by tests.  The
+    # real ImageNet-21k-p directory has 10,450 class folders.
+    classes = getattr(ds.train_data, "classes", None)
+    num_classes = len(classes) if classes is not None else 10450
+    model = cct.cct_14_7x2_224(num_classes=num_classes)
+    return make_setup(model, ModelType.cct_14_7x2_224, ds, 128)

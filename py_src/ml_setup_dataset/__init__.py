@@ -15,6 +15,7 @@ from .dataset_mnist import dataset_mnist
 from .dataset_imagenet import (
     get_imagenet_preprocessing,
     dataset_imagenet1k,
+    dataset_imagenet21k_p,
     dataset_imagenet100,
     dataset_imagenet10,
     dataset_imagenet1k_from_pytorch,
@@ -34,6 +35,7 @@ __all__ = [
     "dataset_mnist",
     "get_imagenet_preprocessing",
     "dataset_imagenet1k",
+    "dataset_imagenet21k_p",
     "dataset_imagenet100",
     "dataset_imagenet10",
     "dataset_imagenet1k_from_pytorch",

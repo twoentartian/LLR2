@@ -194,7 +194,7 @@ class FastTrainingSetup:
             return optimizer, scheduler, epochs
         
         elif mt == ModelType.cct_14_7x2_224:
-            if dt in (DatasetType.imagenet1k,):
+            if dt in (DatasetType.imagenet1k, DatasetType.imagenet21k_p):
                 weight_decay, initial_lr = 5e-2, 5e-4
             else:
                 raise err

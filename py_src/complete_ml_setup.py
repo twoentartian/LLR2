@@ -196,15 +196,17 @@ class FastTrainingSetup:
         elif mt == ModelType.cct_14_7x2_224:
             if dt == DatasetType.imagenet1k:
                 warmup_epochs, epochs = 25, 300
+                weight_decay, initial_lr = 5e-2, 5e-4
+                warmup_lr, min_lr = 0.000001, 0.00001
             elif dt == DatasetType.imagenet21k_p:
                 # Adopt the 90-epoch / 5-epoch warmup budget used for
                 # ImageNet-21K/22K Transformer pretraining (not a CCT recipe):
                 # https://github.com/microsoft/Swin-Transformer/blob/main/configs/swin/swin_base_patch4_window7_224_22k.yaml
                 warmup_epochs, epochs = 5, 90
+                weight_decay, initial_lr = 5e-2, 1e-4
+                warmup_lr, min_lr = 0.000001, 0.00001
             else:
                 raise err
-            weight_decay, initial_lr = 5e-2, 5e-4
-            warmup_lr, min_lr = 0.000001, 0.00001
             warmup_steps = warmup_epochs * steps_per_epoch
             cosine_steps = (epochs - warmup_epochs) * steps_per_epoch
             optimizer = torch.optim.AdamW(model.parameters(), lr=initial_lr, weight_decay=weight_decay)

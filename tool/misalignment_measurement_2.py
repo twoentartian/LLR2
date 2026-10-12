@@ -1381,7 +1381,10 @@ def parse_args() -> argparse.Namespace:
         help="normalized train-descent/val-ascent update, raw train-val difference, or the previous symmetric objective",
     )
     parser.add_argument("--modulus", type=int, default=None)
-    parser.add_argument("--split_seed", type=int, default=None)
+    parser.add_argument(
+        "--split_seed", type=int, default=None,
+        help="seed for shuffling the combined dataset; defaults to the resolved --random_seed",
+    )
     parser.add_argument(
         "--odd_size_policy",
         choices=["drop", "error"],
@@ -1907,6 +1910,9 @@ def main() -> None:
         logger.info("random seed not given; drew random_seed = %d", args.random_seed)
     else:
         logger.info("random_seed = %d", args.random_seed)
+    if args.split_seed is None:
+        args.split_seed = args.random_seed
+    logger.info("split_seed = %d", args.split_seed)
     set_seed(args.random_seed)
     git_provenance = _git_provenance()
     if args.device == "cuda" and not torch.cuda.is_available():

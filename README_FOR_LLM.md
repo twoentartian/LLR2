@@ -106,12 +106,15 @@
 集中定义标准训练预设。
 
 - `FastTrainingSetup.get_optimizer_lr_scheduler_epoch()` 根据 model、dataset 和 preset 返回 optimizer、scheduler 和 epoch 数。
+- ViT-B/32 的 register 对照模型名为 `vit_b_32_reg4`，增加 4 个无位置编码的可学习 tokens；同 seed 下共同权重与 `vit_b_32` 初始化一致，通用训练 recipe 复用原版设置。
 - 覆盖 SGD、Adam/AdamW、OneCycle、Cosine、MultiStep、warmup 等训练 recipe，并根据 dataloader 的 steps-per-epoch 换算 scheduler 步数。
 - `TransferTrainingSetup.get_optimizer_lr_scheduler_epoch()` 定义允许的迁移学习组合和对应的优化器配置。
 - 训练脚本的 `--preset` 默认值会影响学习率、weight decay、scheduler 和总 epoch；显式 CLI 参数通常会覆盖这些默认值。
 - CCT misalignment launcher 会对 CCT 的 recipe 做额外覆盖，因此分析 CCT 实验时应同时查看 `tool/misalignment_cct_entry.py`。
 
 ## 建议的阅读顺序
+
+ViT register 实验与 LayerNorm 前 token 范数 CSV 的说明见 `tool/misalignment/README_vit_registers.md`。misalignment 脚本默认对两种 ViT 启用范数记录，阈值由 `--token_norm_threshold` 控制，可通过 `--no-token_norms` 关闭。
 
 1. 先看目标实验脚本的 `parse_args()` 和 `main()`，确认输入、输出和默认参数。
 2. 再看 `py_src/ml_setup/factory.py`，确认字符串模型/数据集最终映射到哪个 setup。

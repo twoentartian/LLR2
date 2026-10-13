@@ -83,6 +83,7 @@ from misalignment.optimizer import build_optimizer_and_scheduler
 from misalignment.checkpoints import GapCheckpointTracker
 from misalignment.variance import EpochWeightVarianceRecorder
 from misalignment.tokenizer_stats import TOKENIZER_RATIO_FIELDS, TokenizerOutputMonitor
+from misalignment.token_norms import TokenNormMonitor, TokenNormRecorder
 from misalignment.gradient_geometry import GRADIENT_GEOMETRY_FIELDS, GradientGeometryAccumulator
 from misalignment.gradient_combination import NormalizedGradientCombiner, combine_normalized_gradient_tensors
 from misalignment.dali_loader import (
@@ -124,6 +125,7 @@ class LossMetrics:
     accuracy: float
     examples: int
     tokenizer_nonzero_ratio: float | None = None
+    token_norms: dict[str, dict] | None = None
 
 
 def _parse_augmentation(value: str) -> int:
@@ -354,6 +356,7 @@ def evaluate_partition(
     modular: bool,
     eq_position: int | None,
     tokenizer_monitor: TokenizerOutputMonitor | None = None,
+    token_norm_monitor: TokenNormMonitor | None = None,
     amp_enabled: bool = False,
     amp_dtype: torch.dtype | None = None,
 ) -> LossMetrics:
@@ -366,12 +369,13 @@ def evaluate_partition(
     totals = torch.zeros(2, dtype=torch.float64, device=device)
     example_count = 0
     capture_context = tokenizer_monitor.capture() if tokenizer_monitor is not None else contextlib.nullcontext()
+    norm_capture_context = token_norm_monitor.capture() if token_norm_monitor is not None else contextlib.nullcontext()
     autocast_context = (
         torch.autocast(device_type=device.type, dtype=amp_dtype)
         if amp_enabled and device.type == "cuda" and amp_dtype is not None
         else contextlib.nullcontext()
     )
-    with capture_context, autocast_context:
+    with capture_context, norm_capture_context, autocast_context:
         for raw_batch in loader:
             batch = _move_batch(raw_batch, device)
             loss, accuracy = _loss_and_accuracy(model, batch, criterion, modular=modular, eq_position=eq_position)
@@ -384,6 +388,7 @@ def evaluate_partition(
     return LossMetrics(
         loss=loss_sum / example_count, accuracy=correct_sum / example_count, examples=example_count,
         tokenizer_nonzero_ratio=tokenizer_monitor.nonzero_ratio if tokenizer_monitor is not None else None,
+        token_norms=token_norm_monitor.statistics if token_norm_monitor is not None else None,
     )
 
 
@@ -395,6 +400,21 @@ def _append_tokenizer_metrics(row: dict[str, float], train: LossMetrics, val: Lo
         ratio = metrics.tokenizer_nonzero_ratio
         row[name] = ratio if ratio is not None else float("nan")
     return "".join(f" {name}={row[name]:.3E}" for name in TOKENIZER_RATIO_FIELDS)
+
+
+def _record_token_norms(recorder, epoch: int, train: LossMetrics, val: LossMetrics) -> str:
+    if recorder is not None:
+        recorder.record(epoch, train.token_norms, val.token_norms)
+    parts = []
+    for role, metrics in (("train", train), ("val", val)):
+        if metrics.token_norms is not None:
+            patch = metrics.token_norms["patch"]
+            parts.append(
+                f" {role}_patch_norm_mean={patch['mean']:.4g}"
+                f" {role}_patch_norm_max={patch['max']:.4g}"
+                f" {role}_patch_high_norm_ratio={patch['high_norm_ratio']:.3E}"
+            )
+    return "".join(parts)
 
 
 def _symmetric_objective(loss_a: torch.Tensor, loss_b: torch.Tensor) -> torch.Tensor:
@@ -501,6 +521,8 @@ def train_symmetric_objective(
     scaler=None,
     epoch_callback: Callable[[dict[str, float]], None] | None = None,
     tokenizer_monitor: TokenizerOutputMonitor | None = None,
+    token_norm_monitor: TokenNormMonitor | None = None,
+    token_norm_recorder: TokenNormRecorder | None = None,
 ) -> list[dict[str, float]]:
     if epochs <= 0:
         raise ValueError("epochs must be positive")
@@ -572,12 +594,12 @@ def train_symmetric_objective(
             batches += 1
         current_a = evaluate_partition(
             model, loader_a, criterion, device=device, modular=modular, eq_position=eq_position,
-            tokenizer_monitor=tokenizer_monitor,
+            tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
             amp_enabled=amp_enabled, amp_dtype=amp_dtype,
         )
         current_b = evaluate_partition(
             model, loader_b, criterion, device=device, modular=modular, eq_position=eq_position,
-            tokenizer_monitor=tokenizer_monitor,
+            tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
             amp_enabled=amp_enabled, amp_dtype=amp_dtype,
         )
         mean_a = current_a.loss
@@ -606,6 +628,7 @@ def train_symmetric_objective(
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
         }
         tokenizer_log = _append_tokenizer_metrics(row, current_a, current_b)
+        tokenizer_log += _record_token_norms(token_norm_recorder, epoch, current_a, current_b)
         rows.append(row)
         if epoch_callback is not None:
             epoch_callback(row)
@@ -847,6 +870,8 @@ def train_normalized_two_sided(
     scaler=None,
     epoch_callback: Callable[[dict[str, float]], None] | None = None,
     tokenizer_monitor: TokenizerOutputMonitor | None = None,
+    token_norm_monitor: TokenNormMonitor | None = None,
+    token_norm_recorder: TokenNormRecorder | None = None,
     gradient_combiner: NormalizedGradientCombiner | None = None,
 ) -> list[dict[str, float]]:
     """Run the normalized train-descent/val-ascent update from initialization."""
@@ -945,12 +970,12 @@ def train_normalized_two_sided(
             stats["val_gradient_weight"] = val_gradient_weight
         current_a = evaluate_partition(
             model, loader_a, criterion, device=device, modular=modular, eq_position=eq_position,
-            tokenizer_monitor=tokenizer_monitor,
+            tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
             amp_enabled=amp_enabled, amp_dtype=amp_dtype,
         )
         current_b = evaluate_partition(
             model, loader_b, criterion, device=device, modular=modular, eq_position=eq_position,
-            tokenizer_monitor=tokenizer_monitor,
+            tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
             amp_enabled=amp_enabled, amp_dtype=amp_dtype,
         )
         mean_loss = 0.5 * (current_a.loss + current_b.loss)
@@ -983,6 +1008,7 @@ def train_normalized_two_sided(
             "val_gradient_weight": val_gradient_weight,
         }
         tokenizer_log = _append_tokenizer_metrics(row, current_a, current_b)
+        tokenizer_log += _record_token_norms(token_norm_recorder, epoch, current_a, current_b)
         rows.append(row)
         if epoch_callback is not None:
             epoch_callback(row)
@@ -1431,6 +1457,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--report_interval", type=int, default=1)
     parser.add_argument(
+        "--token_norms", action=argparse.BooleanOptionalAction, default=True,
+        help="record pre-LayerNorm token norms during ViT epoch evaluation (default: enabled for ViT)",
+    )
+    parser.add_argument(
+        "--token_norm_threshold", type=float, default=150.0,
+        help="fixed L2 threshold for reporting high-norm token ratios; use the same value for both models",
+    )
+    parser.add_argument(
         "--train_gradient_weight_function",
         "--train_gradient_weight",
         "--train-gradient-weight-function",
@@ -1604,6 +1638,12 @@ def _run_direction(
     # Captures are active only in epoch-end/final evaluation, never during the
     # training forwards/backwards or second-order flatness measurements.
     tokenizer_monitor = TokenizerOutputMonitor(model)
+    token_norm_monitor = TokenNormMonitor(
+        model, threshold=getattr(args, "token_norm_threshold", 150.0),
+        enabled=getattr(args, "token_norms", True),
+    )
+    token_norm_path = output_folder / f"token_norms_{direction_name}.csv"
+    token_norm_recorder = TokenNormRecorder(token_norm_path, token_norm_monitor)
     gradient_combiner = None
     try:
         if args.objective == "normalized_two_sided":
@@ -1632,7 +1672,8 @@ def _run_direction(
                 amp_dtype=amp_dtype,
                 scaler=scaler,
                 epoch_callback=record_epoch,
-                tokenizer_monitor=tokenizer_monitor,
+                tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
+                token_norm_recorder=token_norm_recorder,
                 gradient_combiner=gradient_combiner,
             )
         else:
@@ -1654,22 +1695,24 @@ def _run_direction(
                 amp_dtype=amp_dtype,
                 scaler=scaler,
                 epoch_callback=record_epoch,
-                tokenizer_monitor=tokenizer_monitor,
+                tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
+                token_norm_recorder=token_norm_recorder,
             )
         save_model_state(str(final_model_path), model.state_dict(), model_type_name, dataset_type_name)
 
         final_train = evaluate_partition(
             runtime_model, train_loader, criterion, device=device, modular=bundle.modular,
-            eq_position=bundle.eq_position, tokenizer_monitor=tokenizer_monitor,
+            eq_position=bundle.eq_position, tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
             amp_enabled=amp_enabled, amp_dtype=amp_dtype,
         )
         final_val = evaluate_partition(
             runtime_model, val_loader, criterion, device=device, modular=bundle.modular,
-            eq_position=bundle.eq_position, tokenizer_monitor=tokenizer_monitor,
+            eq_position=bundle.eq_position, tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
             amp_enabled=amp_enabled, amp_dtype=amp_dtype,
         )
     finally:
         tokenizer_monitor.close()
+        token_norm_monitor.close()
         # Do not keep the training decoder/preprocessing pools resident while
         # building the separate second-order flatness microbatch pipelines.
         close_dali_loaders(train_loader, val_loader)
@@ -1755,6 +1798,7 @@ def _run_direction(
             "gap_checkpoint_selection": str(gap_tracker.manifest_path.relative_to(output_folder)),
             "selected_relative_flatness": f"selected_relative_flatness_{direction_name}.csv",
             "selected_checkpoint_summary": f"selected_checkpoints_{direction_name}.json",
+            "token_norms": token_norm_path.name if token_norm_monitor.available else None,
         },
         "final": {
             "train": asdict(final_train),
@@ -1782,6 +1826,7 @@ def _run_direction(
             "measurement": "epoch_end_full_partition_eval_mode",
             "format": ".3E (4 significant digits)",
         },
+        "token_norm_diagnostics": token_norm_monitor.metadata(),
         "optimization_last_row": rows[-1] if rows else None,
     }
 

@@ -229,8 +229,8 @@ def _build(mt: ModelType, dt, preset: int, device, *, use_dali: bool = False, da
             return regnet_y_400mf_imagenet1k(preset, override_dataset=override)
         raise _nie(mt, dt)
 
-    elif mt == ModelType.vit_b_32:
-        from .vit import vit_b_32_imagenet1k
+    elif mt in (ModelType.vit_b_32, ModelType.vit_b_32_reg4):
+        from .vit import vit_b_32_imagenet1k, vit_b_32_reg4_imagenet1k
         if _default or dt == DatasetType.imagenet1k:
             if use_dali:
                 from py_src.ml_setup_dataset import dataset_imagenet1k_from_pytorch_dali
@@ -238,7 +238,8 @@ def _build(mt: ModelType, dt, preset: int, device, *, use_dali: bool = False, da
                 override = dataset_imagenet1k_from_pytorch_dali(dali_device_id=dali_device_id)
             else:
                 override = None
-            return vit_b_32_imagenet1k(preset, override_dataset=override)
+            builder = vit_b_32_reg4_imagenet1k if mt == ModelType.vit_b_32_reg4 else vit_b_32_imagenet1k
+            return builder(preset, override_dataset=override)
         raise _nie(mt, dt)
 
     elif mt == ModelType.squeezenet1_1:

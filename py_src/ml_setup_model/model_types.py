@@ -13,6 +13,7 @@ class ModelType(Enum):
     cct_14_7x2_224 = auto()
     vit_b_16 = auto()
     vit_b_32 = auto()
+    vit_b_32_reg4 = auto()
     lenet5_large_fc = auto()
     mobilenet_v3_small = auto()
     mobilenet_v3_large = auto()
@@ -46,3 +47,4 @@ class ModelType(Enum):
     bnn = auto()
     bnn_floating = auto()
     binary_attention_cct_7_3x1_32 = auto()
+    

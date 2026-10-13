@@ -222,7 +222,7 @@ class FastTrainingSetup:
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
             return optimizer, scheduler, epochs
 
-        elif mt == ModelType.vit_b_32:
+        elif mt in (ModelType.vit_b_32, ModelType.vit_b_32_reg4):
             if dt == DatasetType.imagenet1k:
                 # Torchvision's recipe is defined in epochs, while LLR2 steps the
                 # scheduler after every optimizer update.

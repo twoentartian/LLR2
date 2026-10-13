@@ -48,6 +48,15 @@ def vit_b_32_imagenet1k(preset: int = 1, override_dataset: Optional[DatasetSetup
     except that the optimizer lr / weight decay come from the local DeiT-style tuning in
     ``complete_ml_setup.py``.
     """
+    return _vit_b_32_imagenet1k(preset, override_dataset, registers=False)
+
+
+def vit_b_32_reg4_imagenet1k(preset: int = 1, override_dataset: Optional[DatasetSetup] = None) -> MLSetup:
+    """ViT-B/32 with four registers and the same recipe as the baseline."""
+    return _vit_b_32_imagenet1k(preset, override_dataset, registers=True)
+
+
+def _vit_b_32_imagenet1k(preset, override_dataset, *, registers: bool) -> MLSetup:
     from torchvision import models
 
     if preset not in (0, 1):
@@ -65,10 +74,17 @@ def vit_b_32_imagenet1k(preset: int = 1, override_dataset: Optional[DatasetSetup
     collate_fn = _vit_b_32_torchvision_collate_fn()
     sampler_fn = _vit_b_32_torchvision_sampler_fn
 
-    model = models.vit_b_32(progress=False, weights=None, num_classes=1000)
+    if registers:
+        from py_src.ml_setup_model.vit_registers import vit_b_32_reg4
+
+        model = vit_b_32_reg4(num_classes=1000)
+        model_type = ModelType.vit_b_32_reg4
+    else:
+        model = models.vit_b_32(progress=False, weights=None, num_classes=1000)
+        model_type = ModelType.vit_b_32
     return make_setup(
         model,
-        ModelType.vit_b_32,
+        model_type,
         ds,
         512,
         criterion=criterion,

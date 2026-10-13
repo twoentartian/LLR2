@@ -41,9 +41,9 @@ constant expressions ``0.5`` and ``0.5`` for train and val respectively.
 
 Supported datasets are MNIST, CIFAR-10, CIFAR-100, ImageNet-1k, and a modular
 dataset folder containing train.txt/val.txt (and optionally test.txt).
-ImageNet defaults to DALI mixed decoding and GPU preprocessing for training,
-evaluation and flatness. Other datasets keep PyTorch; --loader_backend
-pytorch explicitly selects the previous ImageNet loading path.
+ImageNet defaults to the shared high-accuracy ImageNet DALI pipeline: CPU
+decoding and GPU preprocessing for training, evaluation and flatness. Other
+datasets keep PyTorch; --loader_backend pytorch selects the PyTorch path.
 """
 
 from __future__ import annotations

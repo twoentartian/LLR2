@@ -2,7 +2,8 @@
 
 DALI is imported lazily, so all other datasets retain their existing PyTorch
 path without a DALI dependency. Only file names and labels are materialized;
-image decoding/resizing happens in bounded, prefetched CPU/GPU batches.
+image decoding/resizing uses the same pipeline as generate_high_accuracy_model.
+This module adapts the partition manifest, iteration lifecycle and pass seed.
 """
 
 from __future__ import annotations
@@ -74,44 +75,6 @@ def _import_dali():
     return dali, fn, types, pipeline_def, DALIGenericIterator, LastBatchPolicy
 
 
-class _RandomEraseSource:
-    """Generate tiny erase rectangles, not images, on the CPU.
-
-    Match torchvision's p=.1, scale=.02..33, log-uniform aspect ratio .3..3.3,
-    and ten rejection attempts. Erase raw RGB with zero *before* normalization,
-    as in this project's ImageNet preset 2 (not normalized tensors with zero).
-    A zero-sized rectangle means no erasure. This independent RNG never
-    consumes the model/dropout/Hutchinson torch RNG streams.
-    """
-
-    def __init__(self, batch_size: int, crop_size: int, seed: int) -> None:
-        import numpy as np
-
-        self.np = np
-        self.rng = np.random.default_rng(seed)
-        self.batch_size = batch_size
-        self.crop_size = crop_size
-
-    def __call__(self):
-        anchors, shapes = [], []
-        size = self.crop_size
-        for _ in range(self.batch_size):
-            anchor, shape = (0, 0), (0, 0)
-            if self.rng.random() < 0.1:
-                for _ in range(10):
-                    area = size * size * self.rng.uniform(0.02, 0.33)
-                    aspect = math.exp(self.rng.uniform(math.log(0.3), math.log(3.3)))
-                    height = round(math.sqrt(area * aspect))
-                    width = round(math.sqrt(area / aspect))
-                    if 0 < height < size and 0 < width < size:
-                        anchor = (self.rng.integers(size - height + 1), self.rng.integers(size - width + 1))
-                        shape = (height, width)
-                        break
-            anchors.append(self.np.asarray(anchor, dtype=self.np.int32))
-            shapes.append(self.np.asarray(shape, dtype=self.np.int32))
-        return anchors, shapes
-
-
 class DaliImageNetLoader:
     """DataLoader-shaped GPU iterator over one canonical, fixed-order half.
 
@@ -158,89 +121,32 @@ class DaliImageNetLoader:
         return {
             "backend": "dali", "dali_version": self._dali_api[0].__version__,
             "device_id": self.device_id, "num_threads": self.num_threads,
-            "prefetch_queue_depth": self.prefetch_factor, "decoder_device": "mixed",
+            "prefetch_queue_depth": self.prefetch_factor, "decoder_device": "cpu",
             "resize_normalize_device": "gpu", "input_size": self.crop_size,
             "last_batch_policy": "partial", "shuffle": False,
             "repeated_augmentation": False, "mixup_cutmix": False,
             "augmentation_seed": self.seed,
             "augmentation_rng": "partition_seed + 1000003 * epoch; reset for each pass",
-            "augmentation_implementation": "DALI-native equivalents of the configured torchvision operations",
-            "trivial_augment_max_translate_pixels": 32 if self.level == 2 else None,
-            "rand_augment_max_translate_fraction": 150.0 / 331.0 if self.level == 2 else None,
+            "augmentation_implementation": "shared high-accuracy ImageNet DALI pipeline",
+            "preprocessing_source": "py_src.ml_setup_dataset.dataset_imagenet.build_dali_imagenet_pipeline",
             "torchvision_bitwise_equivalent": False,
         }
 
     def _build_pipeline(self) -> None:
-        _, fn, types, pipeline_def, iterator_type, last_batch_policy = self._dali_api
+        from py_src.ml_setup_dataset.dataset_imagenet import build_dali_imagenet_pipeline
+
+        _, _, _, _, iterator_type, last_batch_policy = self._dali_api
         pass_seed = (self.seed + 1_000_003 * _augmentation_epoch(self.dataset)) % (2**31 - 1)
-        crop_size, level = self.crop_size, self.level
-        erase_source = _RandomEraseSource(self.batch_size, crop_size, pass_seed + 71) if level == 2 else None
-
-        @pipeline_def(enable_conditionals=level == 2)
-        def image_pipeline():
-            encoded, labels = fn.readers.file(
-                files=self.files, labels=self.labels, random_shuffle=False,
-                shuffle_after_epoch=False, pad_last_batch=True, name="Reader",
-            )
-            if level == 0:
-                images = fn.decoders.image(
-                    encoded, device="mixed", output_type=types.RGB,
-                    adjust_orientation=False, jpeg_fancy_upsampling=True,
-                )
-                images = fn.resize(
-                    images, device="gpu", resize_shorter=math.ceil(256 * crop_size / 224),
-                    interp_type=types.INTERP_LINEAR, antialias=True,
-                )
-            else:
-                images = fn.decoders.image_random_crop(
-                    encoded, device="mixed", output_type=types.RGB,
-                    # nvJPEG ROI decoding cannot reliably use fancy upsampling
-                    # on all supported CUDA versions. Keep its safe default.
-                    adjust_orientation=False, jpeg_fancy_upsampling=False,
-                    random_area=[0.08, 1.0], random_aspect_ratio=[0.75, 4.0 / 3.0],
-                    num_attempts=10,
-                )
-                images = fn.resize(
-                    images, device="gpu", resize_x=crop_size, resize_y=crop_size,
-                    interp_type=types.INTERP_LINEAR, antialias=True,
-                )
-                images = fn.flip(images, device="gpu", horizontal=fn.random.coin_flip(probability=0.5))
-                if level == 2:
-                    from nvidia.dali.auto_aug import trivial_augment, rand_augment
-
-                    images = trivial_augment.trivial_augment_wide(
-                        # Passing shape without an explicit translation limit
-                        # would change DALI's default from 32 pixels to 100%
-                        # of the image. Torchvision TrivialAugmentWide uses 32.
-                        images, max_translate_abs=32, fill_value=0, interp_type=types.INTERP_NN,
-                    )
-                    images = rand_augment.rand_augment(
-                        images, n=2, m=9, shape=(crop_size, crop_size), fill_value=0,
-                        interp_type=types.INTERP_NN, max_translate_rel=150.0 / 331.0,
-                    )
-                    anchors, shapes = fn.external_source(
-                        source=erase_source, num_outputs=2, batch=True,
-                        dtype=[types.INT32, types.INT32], ndim=[1, 1],
-                    )
-                    images = fn.erase(
-                        images, device="gpu", anchor=fn.cast(anchors, dtype=types.FLOAT),
-                        shape=fn.cast(shapes, dtype=types.FLOAT),
-                        axis_names="HW", normalized_anchor=False, normalized_shape=False, fill_value=0,
-                    )
-            images = fn.crop_mirror_normalize(
-                images, device="gpu", dtype=types.FLOAT, output_layout="CHW",
-                crop=(crop_size, crop_size), crop_pos_x=0.5, crop_pos_y=0.5,
-                mean=[0.485 * 255, 0.456 * 255, 0.406 * 255],
-                std=[0.229 * 255, 0.224 * 255, 0.225 * 255],
-            )
-            return images, labels.gpu()
-
-        pipeline = image_pipeline(
-            batch_size=self.batch_size, num_threads=self.num_threads,
-            device_id=self.device_id, seed=pass_seed,
-            prefetch_queue_depth=self.prefetch_factor,
-            # The conventional executor keeps memory bounded by prefetch depth.
-            exec_dynamic=False,
+        pipeline = build_dali_imagenet_pipeline(
+            reader_kwargs={"files": self.files, "labels": self.labels, "random_shuffle": False,
+                           "shuffle_after_epoch": False, "pad_last_batch": True, "name": "Reader"},
+            training=self.level > 0, crop_size=self.crop_size,
+            resize_size=math.ceil(256 * self.crop_size / 224),
+            preset_version=2 if self.level == 2 else 1,
+            random_erase_prob=0.1 if self.level == 2 else 0.0,
+            batch_size=self.batch_size, num_threads=self.num_threads, device_id=self.device_id,
+            labels_on_gpu=True,
+            pipeline_kwargs={"seed": pass_seed, "prefetch_queue_depth": self.prefetch_factor},
         )
         pipeline.build()
         self._pipeline = pipeline

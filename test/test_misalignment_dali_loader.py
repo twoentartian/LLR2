@@ -17,12 +17,16 @@ import torch
 from torch import nn
 from torch.utils.data import ConcatDataset, Dataset, Subset, TensorDataset
 from torchvision.datasets import ImageFolder
+from py_src.ml_setup.dataloader_util import DataloaderConfig
+from py_src.ml_setup_dataset import DatasetType
+from py_src.ml_setup_dataset.dataset_imagenet import DaliImageNetDataset
+import py_src.ml_setup_dataset.dataset_imagenet as imagenet_module
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tool"))
 import misalignment_measurement_2 as measurement
 from misalignment.augmentation import describe_augmentation
 from misalignment.dali_loader import (
-    DaliImageNetLoader, _RandomEraseSource, image_file_manifest, resolve_loader_backend,
+    DaliImageNetLoader, image_file_manifest, resolve_loader_backend,
 )
 
 
@@ -91,24 +95,6 @@ class TestDaliLoaderMetadata(unittest.TestCase):
             with self.assertRaisesRegex(ImportError, "--loader_backend pytorch"):
                 _import_dali()
 
-    def test_erase_rectangles_are_reproducible_valid_and_do_not_use_torch_rng(self):
-        before = torch.random.get_rng_state().clone()
-        source_a = _RandomEraseSource(1000, 224, 123)
-        source_b = _RandomEraseSource(1000, 224, 123)
-        anchors_a, shapes_a = source_a()
-        anchors_b, shapes_b = source_b()
-        self.assertTrue(torch.equal(before, torch.random.get_rng_state()))
-        np.testing.assert_array_equal(anchors_a, anchors_b)
-        np.testing.assert_array_equal(shapes_a, shapes_b)
-        erased = 0
-        for anchor, shape in zip(anchors_a, shapes_a):
-            self.assertEqual(shape.dtype, np.int32)
-            self.assertTrue(np.all(anchor >= 0))
-            self.assertTrue(np.all(anchor + shape <= 224))
-            if shape.sum():
-                erased += 1
-                self.assertTrue(np.all((shape > 0) & (shape < 224)))
-        self.assertTrue(60 < erased < 140)
 
 
 def has_dali_gpu():
@@ -158,6 +144,43 @@ class TestDaliLoaderGPU(unittest.TestCase):
     def read(self, loader):
         batches = list(loader)
         return torch.cat([batch[0] for batch in batches]), torch.cat([batch[1] for batch in batches]), batches
+
+    def test_same_images_as_high_accuracy_loader_for_all_recipes(self):
+        # Both entry points must use identical decode/resize/augmentation
+        # operators. Compare actual pixels, including a one-sample final batch.
+        folder = ImageFolder(self.root / "train", transform=None)
+        shared_builder = imagenet_module.build_dali_imagenet_pipeline
+
+        def fixed_seed_builder(**options):
+            options["pipeline_kwargs"] = {"seed": 123, "prefetch_queue_depth": 2}
+            return shared_builder(**options)
+
+        for level in (0, 1, 2):
+            with self.subTest(level=level):
+                high_accuracy_dataset = DaliImageNetDataset(
+                    file_root=str(self.root / "train"), dataset_type=DatasetType.imagenet1k,
+                    split="train", preset_version=2 if level == 2 else 1,
+                    train_crop_size=224, val_resize_size=256, val_crop_size=224,
+                    augmentation=level > 0, random_erase_prob=0.1 if level == 2 else 0.0,
+                    repeated_augmentation_repetitions=1,
+                )
+                loader = self.make_loader(folder, level, seed=123, input_size=224)
+                try:
+                    with patch.object(imagenet_module, "build_dali_imagenet_pipeline", side_effect=fixed_seed_builder):
+                        reference_loader = high_accuracy_dataset.build_dataloader(
+                            2, DataloaderConfig(num_workers=2, shuffle=False), is_train=True,
+                        )
+                        reference_batches = list(reference_loader)
+                        images, labels, batches = self.read(loader)
+                    reference_images = torch.cat([batch[0] for batch in reference_batches])
+                    reference_labels = torch.cat([batch[1] for batch in reference_batches])
+                    self.assertTrue(torch.equal(images, reference_images))
+                    self.assertTrue(torch.equal(labels.cpu(), reference_labels.cpu()))
+                    self.assertEqual([batch[1].shape for batch in reference_batches], [(2,), (2,), (2,), (1,)])
+                    self.assertEqual([batch[1].shape for batch in batches], [(2,), (2,), (2,), (1,)])
+                    self.assertEqual(loader.runtime_info()["decoder_device"], "cpu")
+                finally:
+                    loader.close()
 
     def test_all_augmentation_levels_gpu_shape_labels_and_repeated_passes(self):
         for level in (0, 1, 2):

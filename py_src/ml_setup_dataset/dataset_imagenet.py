@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import math
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import torch
 from torchvision import transforms, datasets
@@ -75,7 +75,7 @@ class _DaliImageNetIterator:
                     if isinstance(batch, list):
                         batch = batch[0]
                     data = batch["data"]
-                    label = batch["label"].squeeze().long()
+                    label = batch["label"].reshape(-1).long()
 
                     remaining = self._sample_count - consumed
                     if remaining <= 0:
@@ -121,6 +121,146 @@ class _DaliImageNetIterator:
         return math.ceil(self._sample_count / self._batch_size)
 
 
+def build_dali_imagenet_pipeline(
+    *, reader_kwargs: dict[str, Any], training: bool, crop_size: int,
+    batch_size: int, num_threads: int, device_id: int, resize_size: int = 256,
+    preset_version: int = 1, auto_augment_policy: Optional[str] = None,
+    auto_augment_interpolation=transforms.InterpolationMode.BILINEAR,
+    random_erase_prob: float = 0.0, labels_on_gpu: bool = False,
+    pipeline_kwargs: Optional[dict[str, Any]] = None,
+):
+    """Shared CPU decoding/GPU preprocessing for both ImageNet entry points.
+
+    Reader arguments can name an ImageFolder root or an explicit partition
+    manifest. Image operations are the existing high-accuracy training/eval
+    pipelines; callers only select the recipe, sizes and execution settings.
+    Returns an unbuilt DALI pipeline, retaining lazy imports and construction.
+    """
+    from nvidia.dali import fn, types
+    from nvidia.dali import math as dali_math
+    from nvidia.dali.pipeline import pipeline_def
+    from nvidia.dali.auto_aug import auto_augment as dali_auto_augment
+    from nvidia.dali.auto_aug import rand_augment as dali_rand_augment
+    from nvidia.dali.auto_aug import trivial_augment as dali_trivial_augment
+
+    dali_rgb = getattr(types, "RGB")
+    dali_interp_linear = getattr(types, "INTERP_LINEAR")
+    dali_interp_nearest = getattr(types, "INTERP_NN")
+    dali_float = getattr(types, "FLOAT")
+    auto_augment_fill_value = _to_dali_fill_value(auto_augment_policy)
+    auto_augment_interp = _to_dali_interp_type(auto_augment_interpolation, types)
+    auto_augment_policy = _to_dali_auto_augment_policy(auto_augment_policy)
+    use_preset_v2_augmentations = preset_version == 2 and auto_augment_policy is None
+    preset_v2_fill_value = 0
+    preset_v2_interp = dali_interp_nearest
+
+    def apply_random_erasing(images):
+        if random_erase_prob <= 0.0:
+            return images
+
+        should_erase = fn.random.coin_flip(probability=random_erase_prob)
+        if should_erase:
+            erase_area_fraction = fn.random.uniform(range=[0.02, 0.33])
+            erase_ratio = dali_math.exp(fn.random.uniform(range=[math.log(0.3), math.log(3.3)]))
+            erase_height = dali_math.clamp(dali_math.sqrt(erase_area_fraction * erase_ratio), 0.0, 1.0)
+            erase_width = dali_math.clamp(dali_math.sqrt(erase_area_fraction / erase_ratio), 0.0, 1.0)
+            max_anchor_y = dali_math.max(1.0 - erase_height, 0.0)
+            max_anchor_x = dali_math.max(1.0 - erase_width, 0.0)
+            erase_anchor_y = fn.random.uniform(range=[0.0, 1.0]) * max_anchor_y
+            erase_anchor_x = fn.random.uniform(range=[0.0, 1.0]) * max_anchor_x
+            erase_anchor = fn.stack(erase_anchor_y, erase_anchor_x, axis=0)
+            erase_shape = fn.stack(erase_height, erase_width, axis=0)
+            images = fn.erase(
+                images,
+                anchor=erase_anchor,
+                shape=erase_shape,
+                axis_names="HW",
+                normalized_anchor=True,
+                normalized_shape=True,
+                fill_value=_DALI_RANDOM_ERASE_FILL,
+            )
+        return images
+
+    @pipeline_def(enable_conditionals=True)
+    def train_pipeline():
+        images, labels = fn.readers.file(**reader_kwargs)
+        images = fn.decoders.image_random_crop(
+            images,
+            device="cpu",
+            output_type=dali_rgb,
+            random_area=[0.08, 1.0],
+            random_aspect_ratio=[3.0 / 4.0, 4.0 / 3.0],
+            num_attempts=100,
+        )
+        images = images.gpu()
+        images = fn.resize(
+            images,
+            device="gpu",
+            resize_x=crop_size,
+            resize_y=crop_size,
+            interp_type=dali_interp_linear,
+        )
+        mirror = fn.random.coin_flip(probability=0.5)
+        images = fn.flip(images, horizontal=mirror)
+        if auto_augment_policy is not None:
+            images = dali_auto_augment.auto_augment(
+                images,
+                policy_name=auto_augment_policy,
+                shape=(crop_size, crop_size),
+                fill_value=auto_augment_fill_value,
+                interp_type=auto_augment_interp,
+            )
+        elif use_preset_v2_augmentations:
+            images = dali_trivial_augment.trivial_augment_wide(
+                images,
+                shape=(crop_size, crop_size),
+                fill_value=preset_v2_fill_value,
+                interp_type=preset_v2_interp,
+            )
+            images = dali_rand_augment.rand_augment(
+                images,
+                n=2,
+                m=9,
+                shape=(crop_size, crop_size),
+                fill_value=preset_v2_fill_value,
+                interp_type=preset_v2_interp,
+            )
+        images = fn.crop_mirror_normalize(  # type: ignore[call-overload]
+            images, # type: ignore
+            dtype=dali_float,
+            output_layout="CHW",
+            mean=_DALI_MEAN,
+            std=_DALI_STD,
+        )
+        images = apply_random_erasing(images)
+        return images, labels.gpu() if labels_on_gpu else labels
+
+    @pipeline_def
+    def eval_pipeline():
+        images, labels = fn.readers.file(**reader_kwargs)
+        images = fn.decoders.image(images, device="cpu", output_type=dali_rgb)
+        images = images.gpu()
+        images = fn.resize(
+            images,
+            device="gpu",
+            resize_shorter=resize_size,
+            interp_type=dali_interp_linear,
+        )
+        images = fn.crop_mirror_normalize(  # type: ignore[call-overload]
+            images, # type: ignore
+            dtype=dali_float,
+            output_layout="CHW",
+            crop=(crop_size, crop_size),
+            mean=_DALI_MEAN,
+            std=_DALI_STD,
+        )
+        return images, labels.gpu() if labels_on_gpu else labels
+
+    options = dict(batch_size=batch_size, num_threads=num_threads, device_id=device_id)
+    options.update(pipeline_kwargs or {})
+    return train_pipeline(**options) if training else eval_pipeline(**options)
+
+
 @dataclass
 class DaliImageNetDataset(Dataset):
     file_root: str
@@ -154,9 +294,6 @@ class DaliImageNetDataset(Dataset):
 
     def build_dataloader(self, default_batch_size: int, config, is_train: bool):
         try:
-            from nvidia.dali import fn, types
-            from nvidia.dali import math as dali_math
-            from nvidia.dali.pipeline import pipeline_def
             from nvidia.dali.plugin.pytorch import DALIGenericIterator
             from nvidia.dali.plugin.base_iterator import LastBatchPolicy
         except ImportError as exc:
@@ -165,15 +302,6 @@ class DaliImageNetDataset(Dataset):
                 "or rerun without --dali."
             ) from exc
 
-        from nvidia.dali.auto_aug import auto_augment as dali_auto_augment
-        from nvidia.dali.auto_aug import rand_augment as dali_rand_augment
-        from nvidia.dali.auto_aug import trivial_augment as dali_trivial_augment
-
-        dali_rgb = getattr(types, "RGB")
-        dali_interp_linear = getattr(types, "INTERP_LINEAR")
-        dali_interp_nearest = getattr(types, "INTERP_NN")
-        dali_float = getattr(types, "FLOAT")
-
         batch_size = config.batch_size or default_batch_size
         num_threads = max(1, config.num_workers or 4)
         drop_last = config.drop_last
@@ -181,13 +309,6 @@ class DaliImageNetDataset(Dataset):
         sample_count = min(len(self), config.num_samples) if config.num_samples is not None else len(self)
         repetitions = self.repeated_augmentation_repetitions if is_train and self.augmentation else 1
         use_mixup_cutmix = is_train and config.collate_fn is not None
-        auto_augment_policy = _to_dali_auto_augment_policy(self.auto_augment_policy)
-        auto_augment_fill_value = _to_dali_fill_value(self.auto_augment_policy)
-        auto_augment_interp = _to_dali_interp_type(self.auto_augment_interpolation, types)
-        use_preset_v2_augmentations = self.preset_version == 2 and auto_augment_policy is None
-        preset_v2_fill_value = 0
-        preset_v2_interp = dali_interp_nearest
-
         train_crop, val_resize, val_crop = _resolve_imagenet_sizes(
             self.preset_version,
             self.train_crop_size,
@@ -196,134 +317,16 @@ class DaliImageNetDataset(Dataset):
         )
         use_train_pipeline = is_train and self.split == "train" and self.augmentation
 
-        def apply_random_erasing(images):
-            if self.random_erase_prob <= 0.0:
-                return images
-
-            should_erase = fn.random.coin_flip(probability=self.random_erase_prob)
-            if should_erase:
-                erase_area_fraction = fn.random.uniform(range=[0.02, 0.33])
-                erase_ratio = dali_math.exp(fn.random.uniform(range=[math.log(0.3), math.log(3.3)]))
-                erase_height = dali_math.clamp(dali_math.sqrt(erase_area_fraction * erase_ratio), 0.0, 1.0)
-                erase_width = dali_math.clamp(dali_math.sqrt(erase_area_fraction / erase_ratio), 0.0, 1.0)
-                max_anchor_y = dali_math.max(1.0 - erase_height, 0.0)
-                max_anchor_x = dali_math.max(1.0 - erase_width, 0.0)
-                erase_anchor_y = fn.random.uniform(range=[0.0, 1.0]) * max_anchor_y
-                erase_anchor_x = fn.random.uniform(range=[0.0, 1.0]) * max_anchor_x
-                erase_anchor = fn.stack(erase_anchor_y, erase_anchor_x, axis=0)
-                erase_shape = fn.stack(erase_height, erase_width, axis=0)
-                images = fn.erase(
-                    images,
-                    anchor=erase_anchor,
-                    shape=erase_shape,
-                    axis_names="HW",
-                    normalized_anchor=True,
-                    normalized_shape=True,
-                    fill_value=_DALI_RANDOM_ERASE_FILL,
-                )
-            return images
-
-        @pipeline_def(enable_conditionals=True)
-        def train_pipeline(file_root: str, crop_size: int, random_shuffle: bool):
-            images, labels = fn.readers.file(
-                file_root=file_root,
-                random_shuffle=random_shuffle,
-                name="Reader",
-            )
-            images = fn.decoders.image_random_crop(
-                images,
-                device="cpu",
-                output_type=dali_rgb,
-                random_area=[0.08, 1.0],
-                random_aspect_ratio=[3.0 / 4.0, 4.0 / 3.0],
-                num_attempts=100,
-            )
-            images = images.gpu()
-            images = fn.resize(
-                images,
-                device="gpu",
-                resize_x=crop_size,
-                resize_y=crop_size,
-                interp_type=dali_interp_linear,
-            )
-            mirror = fn.random.coin_flip(probability=0.5)
-            images = fn.flip(images, horizontal=mirror)
-            if auto_augment_policy is not None:
-                images = dali_auto_augment.auto_augment(
-                    images,
-                    policy_name=auto_augment_policy,
-                    shape=(crop_size, crop_size),
-                    fill_value=auto_augment_fill_value,
-                    interp_type=auto_augment_interp,
-                )
-            elif use_preset_v2_augmentations:
-                images = dali_trivial_augment.trivial_augment_wide(
-                    images,
-                    shape=(crop_size, crop_size),
-                    fill_value=preset_v2_fill_value,
-                    interp_type=preset_v2_interp,
-                )
-                images = dali_rand_augment.rand_augment(
-                    images,
-                    n=2,
-                    m=9,
-                    shape=(crop_size, crop_size),
-                    fill_value=preset_v2_fill_value,
-                    interp_type=preset_v2_interp,
-                )
-            images = fn.crop_mirror_normalize(  # type: ignore[call-overload]
-                images, # type: ignore
-                dtype=dali_float,
-                output_layout="CHW",
-                mean=_DALI_MEAN,
-                std=_DALI_STD,
-            )
-            images = apply_random_erasing(images)
-            return images, labels
-
-        @pipeline_def
-        def eval_pipeline(file_root: str, resize_size: int, crop_size: int):
-            images, labels = fn.readers.file(
-                file_root=file_root,
-                random_shuffle=False,
-                name="Reader",
-            )
-            images = fn.decoders.image(images, device="cpu", output_type=dali_rgb)
-            images = images.gpu()
-            images = fn.resize(
-                images,
-                device="gpu",
-                resize_shorter=resize_size,
-                interp_type=dali_interp_linear,
-            )
-            images = fn.crop_mirror_normalize(  # type: ignore[call-overload]
-                images, # type: ignore
-                dtype=dali_float,
-                output_layout="CHW",
-                crop=(crop_size, crop_size),
-                mean=_DALI_MEAN,
-                std=_DALI_STD,
-            )
-            return images, labels
-
-        if use_train_pipeline:
-            pipeline = train_pipeline(
-                batch_size=batch_size,
-                num_threads=num_threads,
-                device_id=self.device_id,
-                file_root=self.file_root,
-                crop_size=train_crop,
-                random_shuffle=shuffle,
-            )
-        else:
-            pipeline = eval_pipeline(
-                batch_size=batch_size,
-                num_threads=num_threads,
-                device_id=self.device_id,
-                file_root=self.file_root,
-                resize_size=val_resize,
-                crop_size=val_crop,
-            )
+        pipeline = build_dali_imagenet_pipeline(
+            reader_kwargs={"file_root": self.file_root,
+                           "random_shuffle": shuffle if use_train_pipeline else False, "name": "Reader"},
+            training=use_train_pipeline,
+            crop_size=train_crop if use_train_pipeline else val_crop, resize_size=val_resize,
+            batch_size=batch_size, num_threads=num_threads, device_id=self.device_id,
+            preset_version=self.preset_version, auto_augment_policy=self.auto_augment_policy,
+            auto_augment_interpolation=self.auto_augment_interpolation,
+            random_erase_prob=self.random_erase_prob,
+        )
 
         dali_iterator = DALIGenericIterator(
             [pipeline],

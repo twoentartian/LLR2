@@ -72,3 +72,20 @@ in `summary.json`. Other model families retain their existing evaluation path.
 This records final-layer token norms, not per-layer norms or attention maps.
 The existing `misalignment_measure` definition and gradient update rules are
 unchanged.
+
+## Shared DALI preprocessing
+
+The misalignment and high-accuracy generators both call
+`py_src.ml_setup_dataset.dataset_imagenet.build_dali_imagenet_pipeline`.
+The image operations are extracted from the high-accuracy generator's existing
+implementation: CPU decode, followed by GPU resize and normalization. With
+`--augmentation none`, both partitions use its deterministic evaluation recipe
+(short edge 256 and center crop 224 for these ViTs). Levels 1 and 2 select its
+basic and advanced training recipes, with the configured crop size.
+
+The misalignment adapter supplies explicit A/B file/label manifests, fixed
+reader order, and an independent pass seed. Mixup/CutMix and repeated dataset
+passes are not enabled. JPEG fancy upsampling, explicit resize antialiasing and
+the separate Python random-erase implementation from the former misalignment
+pipeline have been removed in favor of the shared image operations. Result
+metadata records `decoder_device=cpu` and the shared preprocessing source.

@@ -45,6 +45,13 @@ these fixed-224px models; use `none` or level 1 unless overriding crop size.
 
 ## Norm output
 
+Each training epoch displays a `tqdm` bar in an interactive terminal, with the
+direction, epoch number, completed batches, processing rate (`batch/s`) and ETA.
+One batch here means one paired A/B optimizer update. Use `--progress` to force
+display when output is redirected, or `--no-progress` to disable it. The rate
+covers the training loop; epoch-end evaluation and checkpoint writes follow
+after the bar completes.
+
 ViT norm measurement is enabled automatically. Use `--no-token_norms` to disable
 it, or `--token_norm_threshold VALUE` to change the reporting threshold. This
 threshold is a diagnostic choice, not a universal definition of artifacts.

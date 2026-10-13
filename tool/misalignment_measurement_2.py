@@ -71,6 +71,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
+from tqdm.auto import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -501,6 +502,21 @@ def _write_csv_rows(
         outfile.flush()
 
 
+def _paired_epoch_progress(loader_a, loader_b, *, epoch: int, epochs: int,
+                           label: str = "", enabled: bool | None = None):
+    """Show paired optimizer-update speed without reading CUDA tensors.
+
+    Auto mode keeps redirected logs plain; --progress can force rendering.
+    One progress unit is one pair of A/B batches, i.e. one optimizer update.
+    """
+    show_progress = sys.stderr.isatty() if enabled is None else enabled
+    return tqdm(
+        zip(loader_a, loader_b, strict=True), total=len(loader_a),
+        desc=f"{label} epoch {epoch + 1}/{epochs}".strip(),
+        unit="batch", dynamic_ncols=True, mininterval=0.5, disable=not show_progress,
+    )
+
+
 def train_symmetric_objective(
     model: nn.Module,
     loader_a: DataLoader,
@@ -523,6 +539,8 @@ def train_symmetric_objective(
     tokenizer_monitor: TokenizerOutputMonitor | None = None,
     token_norm_monitor: TokenNormMonitor | None = None,
     token_norm_recorder: TokenNormRecorder | None = None,
+    progress_enabled: bool | None = None,
+    progress_label: str = "",
 ) -> list[dict[str, float]]:
     if epochs <= 0:
         raise ValueError("epochs must be positive")
@@ -556,7 +574,10 @@ def train_symmetric_objective(
         )
         model.train()
         batches = 0
-        for raw_a, raw_b in zip(loader_a, loader_b, strict=True):
+        for raw_a, raw_b in _paired_epoch_progress(
+            loader_a, loader_b, epoch=epoch, epochs=epochs,
+            label=progress_label, enabled=progress_enabled,
+        ):
             batch_a = _move_batch(raw_a, device)
             batch_b = _move_batch(raw_b, device)
             autocast_context = (
@@ -873,6 +894,8 @@ def train_normalized_two_sided(
     token_norm_monitor: TokenNormMonitor | None = None,
     token_norm_recorder: TokenNormRecorder | None = None,
     gradient_combiner: NormalizedGradientCombiner | None = None,
+    progress_enabled: bool | None = None,
+    progress_label: str = "",
 ) -> list[dict[str, float]]:
     """Run the normalized train-descent/val-ascent update from initialization."""
     if epochs <= 0:
@@ -924,7 +947,10 @@ def train_normalized_two_sided(
         collect_geometry = epoch in geometry_sample_epochs
         statistic_fields = GRADIENT_GEOMETRY_FIELDS if collect_geometry else ("train_val_gradient_cosine",)
         geometry_accumulator = GradientGeometryAccumulator(parameter_names, statistic_fields, device)
-        for raw_a, raw_b in zip(loader_a, loader_b, strict=True):
+        for raw_a, raw_b in _paired_epoch_progress(
+            loader_a, loader_b, epoch=epoch, epochs=epochs,
+            label=progress_label, enabled=progress_enabled,
+        ):
             batch_a = _move_batch(raw_a, device)
             train_gradients = _compute_batch_gradients(
                 model, batch_a, criterion, device=device, modular=modular,
@@ -1457,6 +1483,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--report_interval", type=int, default=1)
     parser.add_argument(
+        "--progress", action=argparse.BooleanOptionalAction, default=None,
+        help="show per-epoch tqdm progress, batch/s and ETA (default: automatic for interactive terminals)",
+    )
+    parser.add_argument(
         "--token_norms", action=argparse.BooleanOptionalAction, default=True,
         help="record pre-LayerNorm token norms during ViT epoch evaluation (default: enabled for ViT)",
     )
@@ -1675,6 +1705,7 @@ def _run_direction(
                 tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
                 token_norm_recorder=token_norm_recorder,
                 gradient_combiner=gradient_combiner,
+                progress_enabled=getattr(args, "progress", None), progress_label=direction_name,
             )
         else:
             rows = train_symmetric_objective(
@@ -1697,6 +1728,7 @@ def _run_direction(
                 epoch_callback=record_epoch,
                 tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
                 token_norm_recorder=token_norm_recorder,
+                progress_enabled=getattr(args, "progress", None), progress_label=direction_name,
             )
         save_model_state(str(final_model_path), model.state_dict(), model_type_name, dataset_type_name)
 

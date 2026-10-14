@@ -48,9 +48,11 @@ these fixed-224px models; use `none` or level 1 unless overriding crop size.
 Each training epoch displays a `tqdm` bar in an interactive terminal, with the
 direction, epoch number, completed batches, processing rate (`batch/s`) and ETA.
 One batch here means one paired A/B optimizer update. Use `--progress` to force
-display when output is redirected, or `--no-progress` to disable it. The rate
-covers the training loop; epoch-end evaluation and checkpoint writes follow
-after the bar completes.
+display when output is redirected, or `--no-progress` to disable it. Separate
+`eval train` and `eval val` bars show full-partition evaluation after training.
+The epoch log and optimization CSV record `train_seconds`, `eval_train_seconds`,
+`eval_val_seconds`, `checkpoint_seconds` and `epoch_seconds`. The symmetric
+objectives also report `baseline_eval_seconds`.
 
 ViT norm measurement is enabled automatically. Use `--no-token_norms` to disable
 it, or `--token_norm_threshold VALUE` to change the reporting threshold. This
@@ -96,3 +98,28 @@ passes are not enabled. JPEG fancy upsampling, explicit resize antialiasing and
 the separate Python random-erase implementation from the former misalignment
 pipeline have been removed in favor of the shared image operations. Result
 metadata records `decoder_device=cpu` and the shared preprocessing source.
+
+## Evaluation throughput
+
+Use `--eval_num_workers` to tune evaluation decoding independently of training,
+and `--eval_batch_size` to set its inference batch size. Both default to the
+training values. Full A/B partitions and token norm statistics are still
+measured every epoch; evaluation has no subsampling or skipped epochs.
+Final metrics reuse the last epoch's evaluation instead of repeating both
+complete passes after training.
+
+On the RTX 5090 server, an 8,192-image probe at batch size 128 improved from
+about 3,360 images/s with 4 decoder threads to 5,266 images/s with 12 threads.
+Keeping batch size 128 preserved loss, accuracy and norm statistics exactly
+in this probe. Batch sizes 256/512 were faster but introduced small BF16
+rounding differences, so the conservative setting is:
+
+```bash
+--batch_size 128 --num_workers 4 --eval_batch_size 128 --eval_num_workers 12
+```
+
+A full partition check with 665,583 images at batch size 128 and 12 threads
+took 125.1 seconds (5,322 images/s). Loss, accuracy and all token norm statistics
+matched the saved run exactly. With the original training loop taking about
+350 seconds, two evaluation passes at this rate would put an epoch near
+10 minutes; a complete training epoch with these settings has not been timed.

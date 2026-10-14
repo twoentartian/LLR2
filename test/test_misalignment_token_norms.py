@@ -163,7 +163,8 @@ class TestTokenNorms(unittest.TestCase):
                     relative_flatness_batches=1, relative_flatness_seed=2718, augmentation="none", dataset="mnist",
                     token_norms=True, token_norm_threshold=8.0,
                 )
-                with self.assertLogs("misalignment_measurement_2", level="INFO"):
+                with self.assertLogs("misalignment_measurement_2", level="INFO"), \
+                     patch.object(measurement, "evaluate_partition", wraps=measurement.evaluate_partition) as evaluate:
                     result = measurement._run_direction(
                         direction_name="a_as_train_b_as_val", train_partition_name="a", val_partition_name="b",
                         train_loader=loader, val_loader=loader, flatness_train_loader=loader, flatness_val_loader=loader,
@@ -172,6 +173,14 @@ class TestTokenNorms(unittest.TestCase):
                         criterion=nn.CrossEntropyLoss(), device=torch.device("cpu"), batch_size=2,
                         epochs=2, args=args, output_folder=Path(directory), model_type_name="toy", dataset_type_name="mnist",
                     )
+                # Reuse the final full A/B evaluation rather than doing two
+                # additional full ImageNet sweeps at the end of training.
+                self.assertEqual(evaluate.call_count, 4 if objective == "normalized_two_sided" else 8)
+                self.assertEqual(result["final_metrics_source"], "last_epoch_full_partition_evaluation")
+                self.assertEqual(result["final"]["train"]["loss"], result["optimization_last_row"]["loss_a"])
+                self.assertEqual(result["final"]["val"]["loss"], result["optimization_last_row"]["loss_b"])
+                for field in measurement.EPOCH_TIMING_FIELDS:
+                    self.assertGreaterEqual(result["optimization_last_row"][field], 0.0)
                 with (Path(directory) / result["files"]["token_norms"]).open() as infile:
                     rows = list(csv.DictReader(infile))
                 self.assertEqual(len(rows), 2 * 2 * 6)

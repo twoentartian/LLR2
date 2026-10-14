@@ -61,6 +61,7 @@ import re
 import secrets
 import subprocess
 import sys
+import time
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -360,6 +361,8 @@ def evaluate_partition(
     token_norm_monitor: TokenNormMonitor | None = None,
     amp_enabled: bool = False,
     amp_dtype: torch.dtype | None = None,
+    progress_enabled: bool | None = None,
+    progress_label: str | None = None,
 ) -> LossMetrics:
     """Evaluate a complete partition, optionally using the training AMP dtype.
 
@@ -377,7 +380,14 @@ def evaluate_partition(
         else contextlib.nullcontext()
     )
     with capture_context, norm_capture_context, autocast_context:
-        for raw_batch in loader:
+        batches = loader
+        if progress_label is not None:
+            batches = tqdm(
+                loader, total=len(loader), desc=progress_label, unit="batch", dynamic_ncols=True,
+                mininterval=0.5,
+                disable=not (sys.stderr.isatty() if progress_enabled is None else progress_enabled),
+            )
+        for raw_batch in batches:
             batch = _move_batch(raw_batch, device)
             loss, accuracy = _loss_and_accuracy(model, batch, criterion, modular=modular, eq_position=eq_position)
             count = int(batch["text"].shape[0] if modular else batch[0].shape[0])
@@ -512,9 +522,27 @@ def _paired_epoch_progress(loader_a, loader_b, *, epoch: int, epochs: int,
     show_progress = sys.stderr.isatty() if enabled is None else enabled
     return tqdm(
         zip(loader_a, loader_b, strict=True), total=len(loader_a),
-        desc=f"{label} epoch {epoch + 1}/{epochs}".strip(),
+        desc=f"{label} epoch {epoch + 1}/{epochs} train".strip(),
         unit="batch", dynamic_ncols=True, mininterval=0.5, disable=not show_progress,
     )
+
+
+EPOCH_TIMING_FIELDS = (
+    "train_seconds", "eval_train_seconds", "eval_val_seconds",
+    "baseline_eval_seconds", "checkpoint_seconds", "epoch_seconds",
+)
+
+
+def _finish_epoch_timing(row, *, epoch_start, train_seconds, eval_train_seconds,
+                         eval_val_seconds, baseline_eval_seconds, epoch_callback):
+    row.update(train_seconds=train_seconds, eval_train_seconds=eval_train_seconds,
+               eval_val_seconds=eval_val_seconds, baseline_eval_seconds=baseline_eval_seconds)
+    checkpoint_start = time.perf_counter()
+    if epoch_callback is not None:
+        epoch_callback(row)
+    row["checkpoint_seconds"] = time.perf_counter() - checkpoint_start
+    row["epoch_seconds"] = time.perf_counter() - epoch_start
+    return "".join(f" {name}={row[name]:.2f}" for name in EPOCH_TIMING_FIELDS)
 
 
 def train_symmetric_objective(
@@ -541,9 +569,14 @@ def train_symmetric_objective(
     token_norm_recorder: TokenNormRecorder | None = None,
     progress_enabled: bool | None = None,
     progress_label: str = "",
+    eval_loader_a: Iterable | None = None,
+    eval_loader_b: Iterable | None = None,
+    final_metrics_callback: Callable[[LossMetrics, LossMetrics], None] | None = None,
 ) -> list[dict[str, float]]:
     if epochs <= 0:
         raise ValueError("epochs must be positive")
+    eval_loader_a = loader_a if eval_loader_a is None else eval_loader_a
+    eval_loader_b = loader_b if eval_loader_b is None else eval_loader_b
     rows: list[dict[str, float]] = []
     optimization_fields = [
         "epoch", "loss_a", "loss_b", "train_accuracy", "val_accuracy", "mean_loss",
@@ -551,22 +584,29 @@ def train_symmetric_objective(
     ]
     if tokenizer_monitor is not None and tokenizer_monitor.available:
         optimization_fields.extend(TOKENIZER_RATIO_FIELDS)
+    optimization_fields.extend(EPOCH_TIMING_FIELDS)
     _write_csv_rows(csv_path, rows, optimization_fields)
     for epoch in range(epochs):
+        epoch_start = time.perf_counter()
+        epoch_label = f"{progress_label} epoch {epoch + 1}/{epochs}".strip()
         model.train()
         _set_augmentation_epoch(loader_a.dataset, epoch)
         _set_augmentation_epoch(loader_b.dataset, epoch)
         # First evaluate the two complete halves to obtain the objective
         # coefficients.  Each paired mini-batch is then differentiated and
         # applied immediately, matching ordinary mini-batch optimization.
+        baseline_start = time.perf_counter()
         baseline_a = evaluate_partition(
-            model, loader_a, criterion, device=device, modular=modular, eq_position=eq_position,
+            model, eval_loader_a, criterion, device=device, modular=modular, eq_position=eq_position,
             amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+            progress_enabled=progress_enabled, progress_label=f"{epoch_label} baseline eval train",
         )
         baseline_b = evaluate_partition(
-            model, loader_b, criterion, device=device, modular=modular, eq_position=eq_position,
+            model, eval_loader_b, criterion, device=device, modular=modular, eq_position=eq_position,
             amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+            progress_enabled=progress_enabled, progress_label=f"{epoch_label} baseline eval val",
         )
+        baseline_eval_seconds = time.perf_counter() - baseline_start
         _, _, coefficient_a, coefficient_b, _ = (
             _objective_value_and_coefficients(
                 baseline_a.loss, baseline_b.loss, objective_mode=objective_mode
@@ -574,6 +614,7 @@ def train_symmetric_objective(
         )
         model.train()
         batches = 0
+        training_start = time.perf_counter()
         for raw_a, raw_b in _paired_epoch_progress(
             loader_a, loader_b, epoch=epoch, epochs=epochs,
             label=progress_label, enabled=progress_enabled,
@@ -613,16 +654,25 @@ def train_symmetric_objective(
             if scheduler is not None:
                 scheduler.step()
             batches += 1
+        train_seconds = time.perf_counter() - training_start
+        eval_start = time.perf_counter()
         current_a = evaluate_partition(
-            model, loader_a, criterion, device=device, modular=modular, eq_position=eq_position,
+            model, eval_loader_a, criterion, device=device, modular=modular, eq_position=eq_position,
             tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
             amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+            progress_enabled=progress_enabled, progress_label=f"{epoch_label} eval train",
         )
+        eval_train_seconds = time.perf_counter() - eval_start
+        eval_start = time.perf_counter()
         current_b = evaluate_partition(
-            model, loader_b, criterion, device=device, modular=modular, eq_position=eq_position,
+            model, eval_loader_b, criterion, device=device, modular=modular, eq_position=eq_position,
             tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
             amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+            progress_enabled=progress_enabled, progress_label=f"{epoch_label} eval val",
         )
+        eval_val_seconds = time.perf_counter() - eval_start
+        if epoch == epochs - 1 and final_metrics_callback is not None:
+            final_metrics_callback(current_a, current_b)
         mean_a = current_a.loss
         mean_b = current_b.loss
         (
@@ -651,8 +701,11 @@ def train_symmetric_objective(
         tokenizer_log = _append_tokenizer_metrics(row, current_a, current_b)
         tokenizer_log += _record_token_norms(token_norm_recorder, epoch, current_a, current_b)
         rows.append(row)
-        if epoch_callback is not None:
-            epoch_callback(row)
+        tokenizer_log += _finish_epoch_timing(
+            row, epoch_start=epoch_start, train_seconds=train_seconds,
+            eval_train_seconds=eval_train_seconds, eval_val_seconds=eval_val_seconds,
+            baseline_eval_seconds=baseline_eval_seconds, epoch_callback=epoch_callback,
+        )
         _write_csv_rows(csv_path, rows, optimization_fields)
         if epoch % max(1, report_interval) == 0 or epoch == epochs - 1:
             logger.info(
@@ -896,6 +949,9 @@ def train_normalized_two_sided(
     gradient_combiner: NormalizedGradientCombiner | None = None,
     progress_enabled: bool | None = None,
     progress_label: str = "",
+    eval_loader_a: Iterable | None = None,
+    eval_loader_b: Iterable | None = None,
+    final_metrics_callback: Callable[[LossMetrics, LossMetrics], None] | None = None,
 ) -> list[dict[str, float]]:
     """Run the normalized train-descent/val-ascent update from initialization."""
     if epochs <= 0:
@@ -910,6 +966,8 @@ def train_normalized_two_sided(
     val_weight_function = _compile_gradient_weight_expression(
         val_gradient_weight_function, name="val gradient weight"
     )
+    eval_loader_a = loader_a if eval_loader_a is None else eval_loader_a
+    eval_loader_b = loader_b if eval_loader_b is None else eval_loader_b
     rows: list[dict[str, float]] = []
     geometry_rows: list[dict[str, float | str]] = []
     geometry_sample_epochs = _gradient_geometry_sample_epochs(epochs)
@@ -926,9 +984,12 @@ def train_normalized_two_sided(
         "train_gradient_weight", "val_gradient_weight", "relative_train_gradient",
         "relative_combined_gradient",
     ]
+    optimization_fields.extend(EPOCH_TIMING_FIELDS)
     _write_csv_rows(csv_path, rows, optimization_fields)
     _write_csv_rows(gradient_geometry_csv_path, geometry_rows, geometry_fields)
     for epoch in range(epochs):
+        epoch_start = time.perf_counter()
+        epoch_label = f"{progress_label} epoch {epoch + 1}/{epochs}".strip()
         # Keep dropout and other train-time layers enabled during optimization.
         # evaluate_partition switches back to eval mode for epoch metrics.
         model.train()
@@ -947,6 +1008,7 @@ def train_normalized_two_sided(
         collect_geometry = epoch in geometry_sample_epochs
         statistic_fields = GRADIENT_GEOMETRY_FIELDS if collect_geometry else ("train_val_gradient_cosine",)
         geometry_accumulator = GradientGeometryAccumulator(parameter_names, statistic_fields, device)
+        training_start = time.perf_counter()
         for raw_a, raw_b in _paired_epoch_progress(
             loader_a, loader_b, epoch=epoch, epochs=epochs,
             label=progress_label, enabled=progress_enabled,
@@ -994,16 +1056,26 @@ def train_normalized_two_sided(
         for stats in gradient_stats:
             stats["train_gradient_weight"] = train_gradient_weight
             stats["val_gradient_weight"] = val_gradient_weight
+        train_seconds = time.perf_counter() - training_start
+        baseline_eval_seconds = 0.0
+        eval_start = time.perf_counter()
         current_a = evaluate_partition(
-            model, loader_a, criterion, device=device, modular=modular, eq_position=eq_position,
+            model, eval_loader_a, criterion, device=device, modular=modular, eq_position=eq_position,
             tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
             amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+            progress_enabled=progress_enabled, progress_label=f"{epoch_label} eval train",
         )
+        eval_train_seconds = time.perf_counter() - eval_start
+        eval_start = time.perf_counter()
         current_b = evaluate_partition(
-            model, loader_b, criterion, device=device, modular=modular, eq_position=eq_position,
+            model, eval_loader_b, criterion, device=device, modular=modular, eq_position=eq_position,
             tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
             amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+            progress_enabled=progress_enabled, progress_label=f"{epoch_label} eval val",
         )
+        eval_val_seconds = time.perf_counter() - eval_start
+        if epoch == epochs - 1 and final_metrics_callback is not None:
+            final_metrics_callback(current_a, current_b)
         mean_loss = 0.5 * (current_a.loss + current_b.loss)
         absolute_gap = abs(current_a.loss - current_b.loss)
         relative_gap = absolute_gap / (current_a.loss + current_b.loss + OBJECTIVE_OFFSET)
@@ -1036,8 +1108,11 @@ def train_normalized_two_sided(
         tokenizer_log = _append_tokenizer_metrics(row, current_a, current_b)
         tokenizer_log += _record_token_norms(token_norm_recorder, epoch, current_a, current_b)
         rows.append(row)
-        if epoch_callback is not None:
-            epoch_callback(row)
+        tokenizer_log += _finish_epoch_timing(
+            row, epoch_start=epoch_start, train_seconds=train_seconds,
+            eval_train_seconds=eval_train_seconds, eval_val_seconds=eval_val_seconds,
+            baseline_eval_seconds=baseline_eval_seconds, epoch_callback=epoch_callback,
+        )
         _write_csv_rows(csv_path, rows, optimization_fields)
         if epoch in geometry_sample_epochs:
             for stats in gradient_stats:
@@ -1471,6 +1546,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=None)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--eval_batch_size", type=int, default=None,
+                        help="batch size for full-partition epoch evaluation; defaults to training batch size")
+    parser.add_argument("--eval_num_workers", type=int, default=None,
+                        help="decoder/loader workers for epoch evaluation; defaults to --num_workers")
     parser.add_argument(
         "--loader_backend", "--loader-backend", choices=["auto", "pytorch", "dali"], default="auto",
         help="auto (default): DALI for ImageNet, PyTorch otherwise; DALI requires CUDA and NVIDIA DALI",
@@ -1589,6 +1668,8 @@ def _run_direction(
     output_folder: Path,
     model_type_name: str,
     dataset_type_name: str,
+    eval_train_loader: Iterable | None = None,
+    eval_val_loader: Iterable | None = None,
 ) -> dict[str, Any]:
     """Run one train/val orientation from the same initial state."""
     set_seed(args.random_seed)
@@ -1675,6 +1756,12 @@ def _run_direction(
     token_norm_path = output_folder / f"token_norms_{direction_name}.csv"
     token_norm_recorder = TokenNormRecorder(token_norm_path, token_norm_monitor)
     gradient_combiner = None
+    final_metrics = None
+
+    def retain_final_metrics(train, val):
+        nonlocal final_metrics
+        final_metrics = (train, val)
+
     try:
         if args.objective == "normalized_two_sided":
             combine_compile = getattr(args, "compile_gradient_combination", None)
@@ -1706,6 +1793,8 @@ def _run_direction(
                 token_norm_recorder=token_norm_recorder,
                 gradient_combiner=gradient_combiner,
                 progress_enabled=getattr(args, "progress", None), progress_label=direction_name,
+                eval_loader_a=eval_train_loader, eval_loader_b=eval_val_loader,
+                final_metrics_callback=retain_final_metrics,
             )
         else:
             rows = train_symmetric_objective(
@@ -1729,25 +1818,21 @@ def _run_direction(
                 tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
                 token_norm_recorder=token_norm_recorder,
                 progress_enabled=getattr(args, "progress", None), progress_label=direction_name,
+                eval_loader_a=eval_train_loader, eval_loader_b=eval_val_loader,
+                final_metrics_callback=retain_final_metrics,
             )
         save_model_state(str(final_model_path), model.state_dict(), model_type_name, dataset_type_name)
 
-        final_train = evaluate_partition(
-            runtime_model, train_loader, criterion, device=device, modular=bundle.modular,
-            eq_position=bundle.eq_position, tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
-            amp_enabled=amp_enabled, amp_dtype=amp_dtype,
-        )
-        final_val = evaluate_partition(
-            runtime_model, val_loader, criterion, device=device, modular=bundle.modular,
-            eq_position=bundle.eq_position, tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
-            amp_enabled=amp_enabled, amp_dtype=amp_dtype,
-        )
+        if final_metrics is None:
+            raise RuntimeError("training did not provide final epoch evaluation metrics")
+        final_train, final_val = final_metrics
+
     finally:
         tokenizer_monitor.close()
         token_norm_monitor.close()
         # Do not keep the training decoder/preprocessing pools resident while
         # building the separate second-order flatness microbatch pipelines.
-        close_dali_loaders(train_loader, val_loader)
+        close_dali_loaders(train_loader, val_loader, eval_train_loader, eval_val_loader)
     layers = _resolve_flatness_layers(model, args.relative_flatness_layers)
 
     def measure_current_model():
@@ -1800,6 +1885,8 @@ def _run_direction(
             "loader": {
                 "train": loader_runtime_info(train_loader),
                 "val": loader_runtime_info(val_loader),
+                "eval_train": loader_runtime_info(eval_train_loader if eval_train_loader is not None else train_loader),
+                "eval_val": loader_runtime_info(eval_val_loader if eval_val_loader is not None else val_loader),
                 "flatness_train": loader_runtime_info(flatness_train_loader),
                 "flatness_val": loader_runtime_info(flatness_val_loader),
             },
@@ -1858,6 +1945,7 @@ def _run_direction(
             "measurement": "epoch_end_full_partition_eval_mode",
             "format": ".3E (4 significant digits)",
         },
+        "final_metrics_source": "last_epoch_full_partition_evaluation",
         "token_norm_diagnostics": token_norm_monitor.metadata(),
         "optimization_last_row": rows[-1] if rows else None,
     }
@@ -1970,6 +2058,10 @@ def main() -> None:
         raise ValueError("--epochs must be positive")
     if args.num_workers < 0:
         raise ValueError("--num_workers must be non-negative")
+    if args.eval_batch_size is not None and args.eval_batch_size <= 0:
+        raise ValueError("--eval_batch_size must be positive")
+    if args.eval_num_workers is not None and args.eval_num_workers < 0:
+        raise ValueError("--eval_num_workers must be non-negative")
     if args.prefetch_factor <= 0:
         raise ValueError("--prefetch_factor must be positive")
     if args.relative_flatness_batches == 0 or args.relative_flatness_samples <= 0:
@@ -2026,6 +2118,21 @@ def main() -> None:
     if bundle.modular:
         loader_a = _DeviceCachedLoader(loader_a, device)
         loader_b = _DeviceCachedLoader(loader_b, device)
+    eval_batch_size = args.eval_batch_size or batch_size
+    eval_num_workers = args.num_workers if args.eval_num_workers is None else args.eval_num_workers
+    eval_loader_a, eval_loader_b = loader_a, loader_b
+    if eval_batch_size != batch_size or eval_num_workers != args.num_workers:
+        eval_loader_a = _build_loader(
+            bundle.partition_a, eval_batch_size, device=device, num_workers=eval_num_workers,
+            seed=args.random_seed + 101, prefetch_factor=args.prefetch_factor,
+            loader_backend=loader_backend, augmentation_config=augmentation_config,
+        )
+        eval_loader_b = _build_loader(
+            bundle.partition_b, eval_batch_size, device=device, num_workers=eval_num_workers,
+            seed=args.random_seed + 202, prefetch_factor=args.prefetch_factor,
+            loader_backend=loader_backend, augmentation_config=augmentation_config,
+        )
+    logger.info("epoch evaluation batch_size=%d num_workers=%d", eval_batch_size, eval_num_workers)
     # Training on the whole modular partition is intentional, but using the
     # same multi-million-example batch for create_graph=True flatness would
     # retain all forward activations and trigger a CUDA OOM.  Flatness is an
@@ -2135,6 +2242,8 @@ def main() -> None:
             val_partition_name=val_partition_name,
             train_loader=train_loader,
             val_loader=val_loader,
+            eval_train_loader=(eval_loader_a if train_partition_name == "a" else eval_loader_b),
+            eval_val_loader=(eval_loader_b if val_partition_name == "b" else eval_loader_a),
             flatness_train_loader=(flatness_loader_a if train_partition_name == "a" else flatness_loader_b),
             flatness_val_loader=(flatness_loader_b if val_partition_name == "b" else flatness_loader_a),
             bundle=bundle,

@@ -103,7 +103,9 @@ metadata records `decoder_device=cpu` and the shared preprocessing source.
 
 Use `--eval_num_workers` to tune evaluation decoding independently of training,
 and `--eval_batch_size` to set its inference batch size. Both default to the
-training values. Full A/B partitions and token norm statistics are still
+training values. Loader workers default to 8 (`--num_workers 8`); DALI uses
+this as the decoder thread count per pipeline. Full A/B partitions and token
+norm statistics are still
 measured every epoch; evaluation has no subsampling or skipped epochs.
 Final metrics reuse the last epoch's evaluation instead of repeating both
 complete passes after training.

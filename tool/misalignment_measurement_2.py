@@ -1545,7 +1545,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--learning_rate", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=None)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=8,
+                        help="loader workers / DALI decoder threads per pipeline (default: 8)")
     parser.add_argument("--eval_batch_size", type=int, default=None,
                         help="batch size for full-partition epoch evaluation; defaults to training batch size")
     parser.add_argument("--eval_num_workers", type=int, default=None,

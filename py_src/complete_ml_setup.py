@@ -203,7 +203,7 @@ class FastTrainingSetup:
                 # ImageNet-21K/22K Transformer pretraining (not a CCT recipe):
                 # https://github.com/microsoft/Swin-Transformer/blob/main/configs/swin/swin_base_patch4_window7_224_22k.yaml
                 warmup_epochs, epochs = 5, 90
-                weight_decay, initial_lr = 5e-2, 1e-4
+                weight_decay, initial_lr = 5e-2, 3e-4
                 warmup_lr, min_lr = 0.000001, 0.00001
             else:
                 raise err

@@ -56,6 +56,7 @@
 - 默认执行两个方向：A 作 train、B 作 val，以及 B 作 train、A 作 val；每个方向从同一个初始模型状态开始。
 - 支持 `normalized_two_sided`、raw difference 和 mean-relative-gap 目标；normalized two-sided 路径会对 train/val 梯度逐参数归一化、加权、合并并重缩放。
 - 训练过程中写出每 epoch 的优化指标、梯度几何和权重方差；结束后对指定层执行 Hutchinson/Hessian 相对平坦度测量。
+- 每 epoch 的日志和优化 CSV 还包含 `running_train_loss` / `running_val_loss`，复用训练 forward 的原始 loss 按样本数加权，跳过末尾 eval 时仍汇报；val 权重为 0、未执行该侧 forward 时记 `NaN`。完整 eval 的日志字段为 `eval_train_loss` / `eval_val_loss`，CSV 仍为 `loss_a` / `loss_b`。
 - 会保留 accuracy gap 和 loss gap 最大的 checkpoint，并对这些 checkpoint 追加相对平坦度测量。
 - `--eval_last_10_percent` 可将 epoch 末全量 A/B 评估限制到最后 `ceil(epochs/10)` 个 epoch（默认每 epoch 评估）。跳过时优化 CSV 标记 `evaluated=0`，loss/accuracy/gap 为 `NaN`；范数和 gap checkpoint 仅记录已评估 epoch，权重方差和梯度几何照常记录。对称目标更新所需的 baseline eval 保留。
 - 主要输出为 `optimization_*.csv`、`gradient_geometry_*.csv`、`weight_variance_*.csv`、`relative_flatness_*.csv`、`selected_relative_flatness_*.csv`、模型 checkpoint 和 `summary.json`。

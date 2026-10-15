@@ -533,6 +533,17 @@ EPOCH_TIMING_FIELDS = (
 )
 
 
+TRAINING_LOSS_FIELDS = ("running_train_loss", "running_val_loss")
+
+
+def _epoch_training_losses(totals: torch.Tensor, counts: list[int]) -> dict[str, float]:
+    """Read sample-weighted training-mode losses with one transfer per epoch."""
+    return {
+        name: total / count if count else float("nan")
+        for name, total, count in zip(TRAINING_LOSS_FIELDS, totals.cpu().tolist(), counts, strict=True)
+    }
+
+
 def _epoch_evaluation_start(epochs: int, last_10_percent: bool) -> int:
     """First zero-based evaluation epoch, rounding the final tenth up."""
     if epochs <= 0:
@@ -593,6 +604,7 @@ def train_symmetric_objective(
     ]
     if tokenizer_monitor is not None and tokenizer_monitor.available:
         optimization_fields.extend(TOKENIZER_RATIO_FIELDS)
+    optimization_fields.extend(TRAINING_LOSS_FIELDS)
     optimization_fields.extend(EPOCH_TIMING_FIELDS)
     _write_csv_rows(csv_path, rows, optimization_fields)
     for epoch in range(epochs):
@@ -623,6 +635,8 @@ def train_symmetric_objective(
         )
         model.train()
         batches = 0
+        training_loss_totals = torch.zeros(2, dtype=torch.float64, device=device)
+        training_example_counts = [0, 0]
         training_start = time.perf_counter()
         for raw_a, raw_b in _paired_epoch_progress(
             loader_a, loader_b, epoch=epoch, epochs=epochs,
@@ -646,6 +660,9 @@ def train_symmetric_objective(
             count_b = int(batch_b["text"].shape[0] if modular else batch_b[0].shape[0])
             if count_a != count_b:
                 raise RuntimeError("paired A/B batches must contain equal numbers of examples")
+            training_loss_totals.add_(torch.stack((loss_a.detach(), loss_b.detach())).to(torch.float64), alpha=count_a)
+            training_example_counts[0] += count_a
+            training_example_counts[1] += count_b
             surrogate = (
                 coefficient_a * (count_a / len(loader_a.dataset)) * loss_a
                 + coefficient_b * (count_b / len(loader_b.dataset)) * loss_b
@@ -663,6 +680,7 @@ def train_symmetric_objective(
             if scheduler is not None:
                 scheduler.step()
             batches += 1
+        running_losses = _epoch_training_losses(training_loss_totals, training_example_counts)
         train_seconds = time.perf_counter() - training_start
         evaluated = epoch >= first_eval_epoch
         eval_train_seconds = eval_val_seconds = 0.0
@@ -701,6 +719,7 @@ def train_symmetric_objective(
         row = {
             "epoch": float(epoch),
             "evaluated": float(evaluated),
+            **running_losses,
             "loss_a": mean_a,
             "loss_b": mean_b,
             "train_accuracy": current_a.accuracy,
@@ -713,9 +732,9 @@ def train_symmetric_objective(
             "batches": float(batches),
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
         }
-        tokenizer_log = ""
+        tokenizer_log = "".join(f" {name}={row[name]:.6g}" for name in TRAINING_LOSS_FIELDS)
         if evaluated:
-            tokenizer_log = _append_tokenizer_metrics(row, current_a, current_b)
+            tokenizer_log += _append_tokenizer_metrics(row, current_a, current_b)
             tokenizer_log += _record_token_norms(token_norm_recorder, epoch, current_a, current_b)
         rows.append(row)
         tokenizer_log += _finish_epoch_timing(
@@ -730,7 +749,7 @@ def train_symmetric_objective(
                             optimizer.param_groups[0]["lr"], tokenizer_log)
                 continue
             logger.info(
-                "epoch %d/%d: train_loss=%.6g val_loss=%.6g train_acc=%.6g val_acc=%.6g mean_loss=%.6g abs_gap=%.6g relative_gap=%.6g objective=%.6g lr=%.6g%s",
+                "epoch %d/%d: eval_train_loss=%.6g eval_val_loss=%.6g train_acc=%.6g val_acc=%.6g mean_loss=%.6g abs_gap=%.6g relative_gap=%.6g objective=%.6g lr=%.6g%s",
                 epoch,
                 epochs,
                 mean_a,
@@ -790,6 +809,7 @@ def _compute_batch_gradients(
     amp_enabled: bool = False,
     amp_dtype: torch.dtype | None = None,
     scaler=None,
+    loss_total: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     """Compute a mean-loss gradient for one mini-batch.
 
@@ -797,6 +817,7 @@ def _compute_batch_gradients(
     not apply a dataset-size weight.  The caller uses the resulting gradient
     for one optimizer update immediately after the paired train/validation
     mini-batches have been evaluated.
+    Optional loss totals capture detached, unscaled losses for epoch logging.
     """
     autocast_context = (
         torch.autocast(device_type=device.type, dtype=amp_dtype)
@@ -807,6 +828,9 @@ def _compute_batch_gradients(
         loss, _ = _loss_and_accuracy(
             model, batch, criterion, modular=modular, eq_position=eq_position
         )
+        if loss_total is not None:
+            count = int(batch["text"].shape[0] if modular else batch[0].shape[0])
+            loss_total.add_(loss.detach().to(dtype=loss_total.dtype), alpha=count)
         if scaler is not None:
             loss = scaler.scale(loss)
     gradients = torch.autograd.grad(
@@ -1008,6 +1032,7 @@ def train_normalized_two_sided(
         "relative_combined_gradient",
     ]
     optimization_fields.extend(EPOCH_TIMING_FIELDS)
+    optimization_fields.extend(TRAINING_LOSS_FIELDS)
     _write_csv_rows(csv_path, rows, optimization_fields)
     _write_csv_rows(gradient_geometry_csv_path, geometry_rows, geometry_fields)
     for epoch in range(epochs):
@@ -1031,6 +1056,9 @@ def train_normalized_two_sided(
         collect_geometry = epoch in geometry_sample_epochs
         statistic_fields = GRADIENT_GEOMETRY_FIELDS if collect_geometry else ("train_val_gradient_cosine",)
         geometry_accumulator = GradientGeometryAccumulator(parameter_names, statistic_fields, device)
+        training_loss_totals = torch.zeros(2, dtype=torch.float64, device=device)
+        train_loss_total, val_loss_total = training_loss_totals.unbind()
+        training_example_counts = [0, 0]
         training_start = time.perf_counter()
         for raw_a, raw_b in _paired_epoch_progress(
             loader_a, loader_b, epoch=epoch, epochs=epochs,
@@ -1041,7 +1069,9 @@ def train_normalized_two_sided(
                 model, batch_a, criterion, device=device, modular=modular,
                 eq_position=eq_position, parameters=parameters,
                 amp_enabled=amp_enabled, amp_dtype=amp_dtype, scaler=scaler,
+                loss_total=train_loss_total,
             )
+            training_example_counts[0] += int(batch_a["text"].shape[0] if modular else batch_a[0].shape[0])
             if val_gradient_weight == 0.0:
                 # Avoid an unnecessary validation forward/backward pass.  In
                 # particular, this keeps train-only runs from consuming extra
@@ -1053,7 +1083,9 @@ def train_normalized_two_sided(
                     model, batch_b, criterion, device=device, modular=modular,
                     eq_position=eq_position, parameters=parameters,
                     amp_enabled=amp_enabled, amp_dtype=amp_dtype, scaler=scaler,
+                    loss_total=val_loss_total,
                 )
+                training_example_counts[1] += int(batch_b["text"].shape[0] if modular else batch_b[0].shape[0])
             if gradient_combiner is None:
                 combined_gradients, batch_stats = _combine_normalized_train_val_gradients(
                     model, train_gradients, val_gradients, parameters=parameters,
@@ -1079,6 +1111,7 @@ def train_normalized_two_sided(
         for stats in gradient_stats:
             stats["train_gradient_weight"] = train_gradient_weight
             stats["val_gradient_weight"] = val_gradient_weight
+        running_losses = _epoch_training_losses(training_loss_totals, training_example_counts)
         train_seconds = time.perf_counter() - training_start
         baseline_eval_seconds = 0.0
         evaluated = epoch >= first_eval_epoch
@@ -1119,6 +1152,7 @@ def train_normalized_two_sided(
         row = {
             "epoch": float(epoch),
             "evaluated": float(evaluated),
+            **running_losses,
             "loss_a": current_a.loss,
             "loss_b": current_b.loss,
             "train_accuracy": current_a.accuracy,
@@ -1134,9 +1168,9 @@ def train_normalized_two_sided(
             "train_gradient_weight": train_gradient_weight,
             "val_gradient_weight": val_gradient_weight,
         }
-        tokenizer_log = ""
+        tokenizer_log = "".join(f" {name}={row[name]:.6g}" for name in TRAINING_LOSS_FIELDS)
         if evaluated:
-            tokenizer_log = _append_tokenizer_metrics(row, current_a, current_b)
+            tokenizer_log += _append_tokenizer_metrics(row, current_a, current_b)
             tokenizer_log += _record_token_norms(token_norm_recorder, epoch, current_a, current_b)
         rows.append(row)
         tokenizer_log += _finish_epoch_timing(
@@ -1156,7 +1190,7 @@ def train_normalized_two_sided(
                             val_gradient_weight, tokenizer_log)
                 continue
             logger.info(
-                "epoch %d/%d: train_loss=%.6g val_loss=%.6g train_acc=%.6g val_acc=%.6g mean_loss=%.6g abs_gap=%.6g relative_gap=%.6g objective=train-val=%.6g lr=%.6g train_w=%.6g val_w=%.6g%s",
+                "epoch %d/%d: eval_train_loss=%.6g eval_val_loss=%.6g train_acc=%.6g val_acc=%.6g mean_loss=%.6g abs_gap=%.6g relative_gap=%.6g objective=train-val=%.6g lr=%.6g train_w=%.6g val_w=%.6g%s",
                 epoch,
                 epochs,
                 current_a.loss,

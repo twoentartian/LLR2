@@ -54,6 +54,19 @@ The epoch log and optimization CSV record `train_seconds`, `eval_train_seconds`,
 `eval_val_seconds`, `checkpoint_seconds` and `epoch_seconds`. The symmetric
 objectives also report `baseline_eval_seconds`.
 
+Every epoch also records `running_train_loss` and `running_val_loss` in the log
+and optimization CSV. These are sample-weighted averages of the raw losses
+from the existing training-mode mini-batch forwards, before loss scaling or
+the optimizer update. They remain available when epoch-end evaluation is
+skipped. No extra forwards are run, and GPU loss totals are read once per epoch.
+With zero validation gradient weight, the validation training forward remains
+disabled and `running_val_loss` is `NaN`.
+
+When full evaluation runs, its losses are logged separately as
+`eval_train_loss` and `eval_val_loss`; the CSV keeps the existing `loss_a` and
+`loss_b` fields for these values. Running losses describe the changing model
+during the epoch, while evaluation losses describe its final state.
+
 ViT norm measurement is enabled automatically. Use `--no-token_norms` to disable
 it, or `--token_norm_threshold VALUE` to change the reporting threshold. This
 threshold is a diagnostic choice, not a universal definition of artifacts.
@@ -114,7 +127,7 @@ Add `--eval_last_10_percent` to skip diagnostic epoch-end evaluation until the
 final `ceil(epochs / 10)` epochs. For 90 epochs, only epochs 82-90 are evaluated;
 for 60, only epochs 55-60 (both examples use 1-based numbering). At least the
 final epoch is always evaluated. The optimization CSV still contains every
-epoch, with `evaluated=0` and `NaN` loss/accuracy/gap fields on skipped epochs;
+epoch, with `evaluated=0` and `NaN` evaluation loss/accuracy/gap fields on skipped epochs;
 the log says `eval skipped`. Gradient updates, the learning-rate schedule,
 gradient geometry and weight variance continue throughout training. Token
 norm records and gap checkpoint rankings use evaluated epochs only.

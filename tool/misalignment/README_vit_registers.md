@@ -1,5 +1,7 @@
 # ViT-B/32 register comparison
 
+For independent RoPE and SwiGLU comparisons, see [ViT-B/32 variants](README_vit_variants.md).
+
 Model names are `vit_b_32` and `vit_b_32_reg4`. Both are randomly initialized
 224px ViT-B/32 classifiers. The latter adds exactly four learnable tokens
 (3,072 parameters), after positional embeddings have been added to CLS and

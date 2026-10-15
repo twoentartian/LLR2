@@ -48,15 +48,25 @@ def vit_b_32_imagenet1k(preset: int = 1, override_dataset: Optional[DatasetSetup
     except that the optimizer lr / weight decay come from the local DeiT-style tuning in
     ``complete_ml_setup.py``.
     """
-    return _vit_b_32_imagenet1k(preset, override_dataset, registers=False)
+    return _vit_b_32_imagenet1k(preset, override_dataset, model_type=ModelType.vit_b_32)
 
 
 def vit_b_32_reg4_imagenet1k(preset: int = 1, override_dataset: Optional[DatasetSetup] = None) -> MLSetup:
     """ViT-B/32 with four registers and the same recipe as the baseline."""
-    return _vit_b_32_imagenet1k(preset, override_dataset, registers=True)
+    return _vit_b_32_imagenet1k(preset, override_dataset, model_type=ModelType.vit_b_32_reg4)
 
 
-def _vit_b_32_imagenet1k(preset, override_dataset, *, registers: bool) -> MLSetup:
+def vit_b_32_rope_imagenet1k(preset: int = 1, override_dataset: Optional[DatasetSetup] = None) -> MLSetup:
+    """ViT-B/32 with 2D RoPE-Mixed and the baseline training recipe."""
+    return _vit_b_32_imagenet1k(preset, override_dataset, model_type=ModelType.vit_b_32_rope)
+
+
+def vit_b_32_swiglu_imagenet1k(preset: int = 1, override_dataset: Optional[DatasetSetup] = None) -> MLSetup:
+    """ViT-B/32 with SwiGLU FFNs and the baseline training recipe."""
+    return _vit_b_32_imagenet1k(preset, override_dataset, model_type=ModelType.vit_b_32_swiglu)
+
+
+def _vit_b_32_imagenet1k(preset, override_dataset, *, model_type: ModelType) -> MLSetup:
     from torchvision import models
 
     if preset not in (0, 1):
@@ -74,14 +84,20 @@ def _vit_b_32_imagenet1k(preset, override_dataset, *, registers: bool) -> MLSetu
     collate_fn = _vit_b_32_torchvision_collate_fn()
     sampler_fn = _vit_b_32_torchvision_sampler_fn
 
-    if registers:
+    if model_type == ModelType.vit_b_32_reg4:
         from py_src.ml_setup_model.vit_registers import vit_b_32_reg4
 
         model = vit_b_32_reg4(num_classes=1000)
-        model_type = ModelType.vit_b_32_reg4
+    elif model_type == ModelType.vit_b_32_rope:
+        from py_src.ml_setup_model.vit_rope import vit_b_32_rope
+
+        model = vit_b_32_rope(num_classes=1000)
+    elif model_type == ModelType.vit_b_32_swiglu:
+        from py_src.ml_setup_model.vit_swiglu import vit_b_32_swiglu
+
+        model = vit_b_32_swiglu(num_classes=1000)
     else:
         model = models.vit_b_32(progress=False, weights=None, num_classes=1000)
-        model_type = ModelType.vit_b_32
     return make_setup(
         model,
         model_type,

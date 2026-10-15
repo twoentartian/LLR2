@@ -47,4 +47,6 @@ class ModelType(Enum):
     bnn = auto()
     bnn_floating = auto()
     binary_attention_cct_7_3x1_32 = auto()
+    vit_b_32_rope = auto()
+    vit_b_32_swiglu = auto()
     

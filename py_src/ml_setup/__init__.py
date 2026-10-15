@@ -20,7 +20,10 @@ from .shufflenet import shufflenet_v2_cifar10, shufflenet_v2_cifar100
 from .simplenet import simplenet_cifar10, simplenet_cifar100
 from .squeezenet import squeezenet1_1_imagenet1k
 from .vgg import vgg11_bn_cifar10, vgg11_bn_imagenet1k, vgg11_no_bn_cifar10
-from .vit import vit_b_32_imagenet1k, vit_b_32_reg4_imagenet1k
+from .vit import (
+    vit_b_32_imagenet1k, vit_b_32_reg4_imagenet1k,
+    vit_b_32_rope_imagenet1k, vit_b_32_swiglu_imagenet1k,
+)
 
 from .cct import (
     binary_attention_cct_7_3x1_cifar10,
@@ -60,6 +63,8 @@ __all__ = [
     "vgg11_bn_cifar10", "vgg11_bn_imagenet1k", "vgg11_no_bn_cifar10",
     "vit_b_32_imagenet1k",
     "vit_b_32_reg4_imagenet1k",
+    "vit_b_32_rope_imagenet1k",
+    "vit_b_32_swiglu_imagenet1k",
     "binary_attention_cct_7_3x1_cifar10",
     "cct_7_3x1_cifar10", "cct_7_3x1_cifar100", "cct14_7x2_imagenet1k", "cct14_7x2_imagenet21k_p",
     "ddpm_cifar10", "ddpm_flowers102",

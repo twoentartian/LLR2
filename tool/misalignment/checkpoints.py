@@ -11,6 +11,7 @@ from typing import Any
 from torch import nn
 
 from py_src.model_opti_save_load import save_model_state
+from py_src import distributed
 
 
 logger = logging.getLogger("misalignment_measurement_2")
@@ -41,7 +42,8 @@ class GapCheckpointTracker:
         self.model = model
         self.output_folder = Path(output_folder)
         self.checkpoint_folder = self.output_folder / f"gap_checkpoints_{direction_name}"
-        self.checkpoint_folder.mkdir(parents=True, exist_ok=False)
+        if distributed.is_main():
+            self.checkpoint_folder.mkdir(parents=True, exist_ok=False)
         self.manifest_path = self.checkpoint_folder / "selection.json"
         self.model_type_name = model_type_name
         self.dataset_type_name = dataset_type_name
@@ -54,6 +56,8 @@ class GapCheckpointTracker:
 
     def observe(self, row: dict[str, float]) -> None:
         """Consider a completed epoch, saving weights only if it enters top-k."""
+        if not distributed.is_main():
+            return
         epoch = int(row["epoch"])
         if epoch <= self._last_epoch:
             raise ValueError("checkpoint observations must have increasing epochs")
@@ -132,5 +136,7 @@ class GapCheckpointTracker:
         }
 
     def _write_manifest(self) -> None:
+        if not distributed.is_main():
+            return
         with self.manifest_path.open("w", encoding="utf-8") as outfile:
             json.dump(self.selection(), outfile, indent=2, sort_keys=True, allow_nan=False)

@@ -1,8 +1,11 @@
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import Optional, Callable, Any, Iterable
 
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset, Sampler, Subset
+from torch.utils.data.distributed import DistributedSampler
+
+from py_src import distributed
 
 
 # ---------------------------------------------------------------------------
@@ -26,6 +29,8 @@ class DataloaderConfig:
     sampler: Optional[Any] = None
     prefetch_factor: Optional[int] = None
     persistent_workers: Optional[bool] = None
+    distributed: bool = True
+    seed: int = 0
 
 
 def move_batch_to_device(batch: Any, device: torch.device) -> Any:
@@ -96,6 +101,8 @@ def build_dataloader(
 
     # --- already an iterable (IterableDataset, existing DataLoader, etc.) ---
     if isinstance(dataset, (IterableDataset, DataLoader)):
+        if cfg.distributed and distributed.enabled():
+            raise ValueError("Distributed training requires a shardable dataset or a DALI backend")
         return dataset
 
     # --- map-style Dataset: we can build a proper DataLoader ----------------
@@ -103,16 +110,29 @@ def build_dataloader(
 
     # subsample
     if cfg.num_samples is not None and cfg.num_samples < len(actual_dataset):  # type: ignore[arg-type]
-        indices = torch.randperm(len(actual_dataset))[:cfg.num_samples].tolist()  # type: ignore[arg-type]
+        generator = torch.Generator().manual_seed(cfg.seed) if distributed.enabled() else None
+        indices = torch.randperm(len(actual_dataset), generator=generator)[:cfg.num_samples].tolist()  # type: ignore[arg-type]
         actual_dataset = Subset(actual_dataset, indices)
 
     batch_size = cfg.batch_size or default_batch_size
+    use_distributed = cfg.distributed and distributed.enabled()
+    if use_distributed:
+        batch_size = distributed.local_batch_size(batch_size)
     shuffle = cfg.shuffle if cfg.shuffle is not None else is_train
     collate_fn = cfg.collate_fn or default_collate_fn
     assert default_sampler_fn is None or cfg.sampler is None, "default_sampler_fn and cfg.sampler cannot be set at the same time"
     sampler = cfg.sampler if cfg.sampler is not None else default_sampler_fn
     if sampler is not None and not isinstance(sampler, Sampler) and callable(sampler):
         sampler = sampler(actual_dataset)
+    if use_distributed and sampler is not None:
+        if (getattr(sampler, "num_replicas", None) != distributed.world_size()
+                or getattr(sampler, "rank", None) != distributed.rank()):
+            raise ValueError("A custom distributed sampler must expose the current rank and num_replicas")
+    if use_distributed and sampler is None:
+        sampler = (
+            DistributedSampler(actual_dataset, shuffle=shuffle, seed=cfg.seed)
+            if is_train else distributed.EvaluationSampler(actual_dataset)
+        )
 
     loader_kwargs: dict = dict(
         dataset=actual_dataset,
@@ -124,6 +144,8 @@ def build_dataloader(
         collate_fn=collate_fn,
     )
     if cfg.num_workers > 0:
+        if use_distributed:
+            loader_kwargs["multiprocessing_context"] = "spawn"
         prefetch_factor = cfg.prefetch_factor if cfg.prefetch_factor is not None else default_prefetch_factor
         persistent_workers = (
             cfg.persistent_workers

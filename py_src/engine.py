@@ -28,11 +28,11 @@ from typing import Iterable, Optional
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from py_src.adapters import ModelAdapter
 from py_src.util import MovingAverage
+from py_src import distributed
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +53,7 @@ class Device:
     def auto(cls) -> "Device":
         """Pick the best single device available."""
         if torch.cuda.is_available():
-            return cls("cuda:0")
+            return cls.cuda(torch.cuda.current_device() if distributed.enabled() else 0)
         if cls._is_xpu_available():
             return cls("xpu:0")
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -259,7 +259,12 @@ def train(
                 else gradient_accumulate_every
             )
 
-            with step_context():
+            sync_context = (
+                model.no_sync()
+                if isinstance(model, DDP) and backpropagation and not step_optimizer
+                else nullcontext()
+            )
+            with sync_context, step_context():
                 out = adapter.train_step(
                     batch=batch,
                     batch_idx=batch_idx,
@@ -287,7 +292,13 @@ def train(
                 adapter.post_train_step()
 
             if moving_average is not None:
-                result.moving_average_loss = moving_average.add(out.loss)
+                loss = out.loss
+                if distributed.enabled():
+                    totals = torch.tensor([loss * out.sample_count, out.sample_count],
+                                          dtype=torch.float64, device=device.device)
+                    distributed.sum_tensor(totals)
+                    loss = float((totals[0] / totals[1]).item())
+                result.moving_average_loss = moving_average.add(loss)
                 if (
                     loss_threshold is not None
                     and result.iterations >= min_rounds_value
@@ -309,6 +320,7 @@ def train(
         if max_rounds is not None and result.iterations >= max_rounds:
             result.stop_reason = "max_rounds"
 
+    _reduce_result(result, device)
     return result
 
 
@@ -316,7 +328,7 @@ def train(
 # Val
 # ---------------------------------------------------------------------------
 
-def val(
+def _val_local(
     adapter: ModelAdapter,
     dataloader: Iterable,
     *,
@@ -359,4 +371,37 @@ def val(
             result.total_correct = epoch_metrics["correct_count"]
         result.extra.update(epoch_metrics)
 
+    return result
+
+
+def _reduce_result(result: TrainResult | ValResult, device: Device) -> None:
+    if not distributed.enabled():
+        return
+    totals = torch.tensor(
+        [result.total_loss, result.total_count, result.total_correct or 0,
+         int(result.total_correct is not None)], dtype=torch.float64, device=device.device,
+    )
+    distributed.sum_tensor(totals)
+    loss, count, correct, has_correct = totals.tolist()
+    result.total_loss = loss
+    result.total_count = int(count)
+    result.total_correct = int(correct) if has_correct else None
+
+
+def val(adapter: ModelAdapter, dataloader: Iterable, *, device: Device) -> ValResult:
+    """Evaluate exact shards, allowing different numbers of batches per rank.
+
+    DDP forwards can broadcast buffers, so validation uses the underlying
+    module after one buffer broadcast rather than entering DDP collectives.
+    """
+    model = adapter.get_model()
+    distributed.broadcast_model(model, buffers_only=True)
+    if isinstance(model, DDP):
+        adapter._model = model.module
+    try:
+        result = _val_local(adapter, dataloader, device=device)
+    finally:
+        if isinstance(model, DDP):
+            adapter._model = model
+    _reduce_result(result, device)
     return result

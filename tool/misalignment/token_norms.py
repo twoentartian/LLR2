@@ -11,6 +11,7 @@ from pathlib import Path
 import torch
 from torch import nn
 from torchvision.models.vision_transformer import VisionTransformer
+from py_src import distributed
 
 
 class TokenNormMonitor:
@@ -98,6 +99,15 @@ class TokenNormMonitor:
             }
         return result
 
+    def synchronize(self) -> None:
+        if self.available and distributed.enabled():
+            maxima = self._stats[:, 3].clone()
+            torch.distributed.all_reduce(maxima, op=torch.distributed.ReduceOp.MAX)
+            self._stats[:, 3].zero_()
+            distributed.sum_tensor(self._stats)
+            self._stats[:, 3].copy_(maxima)
+            distributed.sum_tensor(self._histograms)
+
     def metadata(self) -> dict:
         return {
             "enabled": self.available,
@@ -144,6 +154,8 @@ class TokenNormRecorder:
         self._write()
 
     def _write(self) -> None:
+        if not distributed.is_main():
+            return
         with self.path.open("w", newline="", encoding="utf-8") as outfile:
             writer = csv.DictWriter(outfile, fieldnames=self.FIELDS)
             writer.writeheader()

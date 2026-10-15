@@ -72,6 +72,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
+from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -97,6 +98,7 @@ from py_src.ml_setup.grokking import arithmetic_addition_grokking, build_grokkin
 from py_src.ml_setup_dataset import ArithmeticDataset, DatasetSetup, DatasetType
 from py_src.model_opti_save_load import load_model_state_file, save_model_state
 from py_src.util import set_seed, setup_logging
+from py_src import distributed
 
 logger = logging.getLogger("misalignment_measurement_2")
 
@@ -369,6 +371,7 @@ def evaluate_partition(
     Loss/accuracy totals stay on the device until the partition is complete.
     Relative-flatness measurements use a separate, full-precision path.
     """
+    distributed.broadcast_model(model, buffers_only=True)
     model.eval()
     totals = torch.zeros(2, dtype=torch.float64, device=device)
     example_count = 0
@@ -385,7 +388,7 @@ def evaluate_partition(
             batches = tqdm(
                 loader, total=len(loader), desc=progress_label, unit="batch", dynamic_ncols=True,
                 mininterval=0.5,
-                disable=not (sys.stderr.isatty() if progress_enabled is None else progress_enabled),
+                disable=not (distributed.is_main() and (sys.stderr.isatty() if progress_enabled is None else progress_enabled)),
             )
         for raw_batch in batches:
             batch = _move_batch(raw_batch, device)
@@ -393,9 +396,16 @@ def evaluate_partition(
             count = int(batch["text"].shape[0] if modular else batch[0].shape[0])
             totals.add_(torch.stack((loss, accuracy)).to(dtype=torch.float64), alpha=count)
             example_count += count
+    totals = torch.cat((totals, totals.new_tensor([example_count])))
+    distributed.sum_tensor(totals)
+    loss_sum, correct_sum, example_count = totals.cpu().tolist()
+    example_count = int(example_count)
+    if tokenizer_monitor is not None:
+        tokenizer_monitor.synchronize()
+    if token_norm_monitor is not None:
+        token_norm_monitor.synchronize()
     if example_count == 0:
         raise ValueError("cannot evaluate an empty partition")
-    loss_sum, correct_sum = totals.cpu().tolist()
     return LossMetrics(
         loss=loss_sum / example_count, accuracy=correct_sum / example_count, examples=example_count,
         tokenizer_nonzero_ratio=tokenizer_monitor.nonzero_ratio if tokenizer_monitor is not None else None,
@@ -497,6 +507,8 @@ def _write_csv_rows(
     fieldnames: list[str],
 ) -> None:
     """Rewrite a small experiment CSV with compact numeric values."""
+    if not distributed.is_main():
+        return
     formatted_rows = [
         {
             fieldname: format(value, ".3E" if fieldname in TOKENIZER_RATIO_FIELDS else ".5g")
@@ -519,7 +531,7 @@ def _paired_epoch_progress(loader_a, loader_b, *, epoch: int, epochs: int,
     Auto mode keeps redirected logs plain; --progress can force rendering.
     One progress unit is one pair of A/B batches, i.e. one optimizer update.
     """
-    show_progress = sys.stderr.isatty() if enabled is None else enabled
+    show_progress = distributed.is_main() and (sys.stderr.isatty() if enabled is None else enabled)
     return tqdm(
         zip(loader_a, loader_b, strict=True), total=len(loader_a),
         desc=f"{label} epoch {epoch + 1}/{epochs} train".strip(),
@@ -538,6 +550,11 @@ TRAINING_LOSS_FIELDS = ("running_train_loss", "running_val_loss")
 
 def _epoch_training_losses(totals: torch.Tensor, counts: list[int]) -> dict[str, float]:
     """Read sample-weighted training-mode losses with one transfer per epoch."""
+    if distributed.enabled():
+        values = torch.cat((totals, totals.new_tensor(counts)))
+        distributed.sum_tensor(values)
+        totals = values[:2]
+        counts = values[2:].tolist()
     return {
         name: total / count if count else float("nan")
         for name, total, count in zip(TRAINING_LOSS_FIELDS, totals.cpu().tolist(), counts, strict=True)
@@ -642,6 +659,7 @@ def train_symmetric_objective(
             loader_a, loader_b, epoch=epoch, epochs=epochs,
             label=progress_label, enabled=progress_enabled,
         ):
+            distributed.broadcast_model(model, buffers_only=True)
             batch_a = _move_batch(raw_a, device)
             batch_b = _move_batch(raw_b, device)
             autocast_context = (
@@ -671,13 +689,21 @@ def train_symmetric_objective(
                 surrogate = scaler.scale(surrogate)
             optimizer.zero_grad(set_to_none=True)
             surrogate.backward()
+            if distributed.enabled():
+                parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+                for parameter in parameters:
+                    if parameter.grad is None:
+                        parameter.grad = torch.zeros_like(parameter)
+                # The surrogate already divides by the full partition size.
+                distributed.reduce_gradients([parameter.grad for parameter in parameters], average=False)
             if scaler is not None:
+                previous_scale = scaler.get_scale()
                 scaler.unscale_(optimizer)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 optimizer.step()
-            if scheduler is not None:
+            if scheduler is not None and (scaler is None or scaler.get_scale() >= previous_scale):
                 scheduler.step()
             batches += 1
         running_losses = _epoch_training_losses(training_loss_totals, training_example_counts)
@@ -848,6 +874,7 @@ def _apply_gradient_update(optimizer, scheduler, parameters, gradients, scaler=N
     for parameter, gradient in zip(parameters, gradients, strict=True):
         parameter.grad = gradient
     if scaler is not None:
+        previous_scale = scaler.get_scale()
         # ``gradients`` are still loss-scaled.  Unscaling here lets GradScaler
         # detect overflow before the optimizer update while preserving the
         # normalized train/val combination above.
@@ -856,7 +883,7 @@ def _apply_gradient_update(optimizer, scheduler, parameters, gradients, scaler=N
         scaler.update()
     else:
         optimizer.step()
-    if scheduler is not None:
+    if scheduler is not None and (scaler is None or scaler.get_scale() >= previous_scale):
         scheduler.step()
 
 
@@ -1064,6 +1091,7 @@ def train_normalized_two_sided(
             loader_a, loader_b, epoch=epoch, epochs=epochs,
             label=progress_label, enabled=progress_enabled,
         ):
+            distributed.broadcast_model(model, buffers_only=True)
             batch_a = _move_batch(raw_a, device)
             train_gradients = _compute_batch_gradients(
                 model, batch_a, criterion, device=device, modular=modular,
@@ -1072,6 +1100,8 @@ def train_normalized_two_sided(
                 loss_total=train_loss_total,
             )
             training_example_counts[0] += int(batch_a["text"].shape[0] if modular else batch_a[0].shape[0])
+            # Training shards have equal per-step sample counts on every rank.
+            distributed.reduce_gradients(train_gradients)
             if val_gradient_weight == 0.0:
                 # Avoid an unnecessary validation forward/backward pass.  In
                 # particular, this keeps train-only runs from consuming extra
@@ -1086,6 +1116,7 @@ def train_normalized_two_sided(
                     loss_total=val_loss_total,
                 )
                 training_example_counts[1] += int(batch_b["text"].shape[0] if modular else batch_b[0].shape[0])
+                distributed.reduce_gradients(val_gradients)
             if gradient_combiner is None:
                 combined_gradients, batch_stats = _combine_normalized_train_val_gradients(
                     model, train_gradients, val_gradients, parameters=parameters,
@@ -1465,6 +1496,8 @@ def _build_loader(
     prefetch_factor: int = 4,
     loader_backend: str = "pytorch",
     augmentation_config: dict[str, Any] | None = None,
+    is_train: bool = True,
+    distributed_loader: bool = True,
 ) -> DataLoader | DaliImageNetLoader:
     if prefetch_factor <= 0:
         raise ValueError("prefetch_factor must be positive")
@@ -1474,11 +1507,17 @@ def _build_loader(
         return DaliImageNetLoader(
             dataset, batch_size, device=device, num_workers=num_workers, seed=seed,
             prefetch_factor=prefetch_factor, augmentation_config=augmentation_config,
+            is_train=is_train, distributed_loader=distributed_loader,
         )
     if loader_backend != "pytorch":
         raise ValueError(f"unsupported loader backend {loader_backend!r}")
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed))
+    sampler = None
+    if distributed_loader and distributed.enabled():
+        batch_size = distributed.local_batch_size(batch_size)
+        sampler = (DistributedSampler(dataset, shuffle=False, seed=seed)
+                   if is_train else distributed.EvaluationSampler(dataset))
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -1486,6 +1525,7 @@ def _build_loader(
         # A/B exchange test deterministic; augmentation randomness is seeded
         # by source index and epoch in AugmentedDataset.
         shuffle=False,
+        sampler=sampler,
         generator=generator,
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
@@ -1493,6 +1533,7 @@ def _build_loader(
         # This is batches prefetched per worker, not a fraction of the data.
         # Single-process loading does not support multiprocessing prefetch.
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        **({"multiprocessing_context": "spawn"} if num_workers > 0 and distributed.enabled() else {}),
     )
 
 
@@ -1517,6 +1558,8 @@ class _DeviceCachedLoader:
 
 
 def _write_json(path: str, payload: dict[str, Any]) -> None:
+    if not distributed.is_main():
+        return
     with open(path, "w", encoding="utf-8") as outfile:
         json.dump(payload, outfile, indent=2, sort_keys=True, default=str)
 
@@ -1594,7 +1637,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="seed for initialization, dropout and augmentation; omitted draws a fresh seed per run (recorded in summary.json)",
     )
-    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="global paired mini-batch size per partition across all GPUs")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--optimizer_preset", type=int, default=0)
     parser.add_argument("--optimizer", choices=["auto", "sgd", "adam", "adamw"], default="auto")
@@ -1678,6 +1722,10 @@ def parse_args() -> argparse.Namespace:
         help="microbatch size used only for second-order relative-flatness measurement",
     )
     parser.add_argument("--relative_flatness_seed", type=int, default=2718)
+    parser.add_argument("--relative_flatness", action=argparse.BooleanOptionalAction, default=None,
+                        help="measure flatness after training (default: on for single device, off for torchrun)")
+    parser.add_argument("--skip_relative_flatness", dest="relative_flatness", action="store_false",
+                        default=argparse.SUPPRESS, help="save models and defer flatness measurement")
     parser.add_argument(
         "--flatness_from_checkpoint",
         default=None,
@@ -1746,7 +1794,7 @@ def _run_direction(
     eval_val_loader: Iterable | None = None,
 ) -> dict[str, Any]:
     """Run one train/val orientation from the same initial state."""
-    set_seed(args.random_seed)
+    set_seed(args.random_seed + distributed.rank())
     model.load_state_dict(initial_state, strict=True)
     optimizer, scheduler, _ = build_optimizer_and_scheduler(
         bundle.ml_setup,
@@ -1808,12 +1856,13 @@ def _run_direction(
     flatness_path = output_folder / f"relative_flatness_{direction_name}.csv"
     initial_model_path = output_folder / f"initial_{direction_name}.model.pt"
     final_model_path = output_folder / f"final_{direction_name}.model.pt"
-    save_model_state(
-        str(initial_model_path),
-        {name: value.detach().cpu().clone() for name, value in initial_state.items()},
-        model_type_name,
-        dataset_type_name,
-    )
+    if distributed.is_main():
+        save_model_state(
+            str(initial_model_path),
+            {name: value.detach().cpu().clone() for name, value in initial_state.items()},
+            model_type_name,
+            dataset_type_name,
+        )
     gap_tracker = GapCheckpointTracker(
         model, output_folder, direction_name, model_type_name, dataset_type_name,
     )
@@ -1902,7 +1951,8 @@ def _run_direction(
                 final_metrics_callback=retain_final_metrics,
                 eval_last_10_percent=getattr(args, "eval_last_10_percent", False),
             )
-        save_model_state(str(final_model_path), model.state_dict(), model_type_name, dataset_type_name)
+        if distributed.is_main():
+            save_model_state(str(final_model_path), model.state_dict(), model_type_name, dataset_type_name)
 
         if final_metrics is None:
             raise RuntimeError("training did not provide final epoch evaluation metrics")
@@ -1914,32 +1964,34 @@ def _run_direction(
         # Do not keep the training decoder/preprocessing pools resident while
         # building the separate second-order flatness microbatch pipelines.
         close_dali_loaders(train_loader, val_loader, eval_train_loader, eval_val_loader)
-    layers = _resolve_flatness_layers(model, args.relative_flatness_layers)
+    do_flatness = getattr(args, "relative_flatness", True)
+    if do_flatness:
+        layers = _resolve_flatness_layers(model, args.relative_flatness_layers)
 
-    def measure_current_model():
-        try:
-            return _measure_direction_relative_flatness(
-                model, flatness_train_loader, flatness_val_loader, criterion,
-                device=device, modular=bundle.modular, eq_position=bundle.eq_position,
-                layers=layers, train_partition_name=train_partition_name,
-                val_partition_name=val_partition_name, args=args,
-            )
-        finally:
-            close_dali_loaders(flatness_train_loader, flatness_val_loader)
+        def measure_current_model():
+            try:
+                return _measure_direction_relative_flatness(
+                    model, flatness_train_loader, flatness_val_loader, criterion,
+                    device=device, modular=bundle.modular, eq_position=bundle.eq_position,
+                    layers=layers, train_partition_name=train_partition_name,
+                    val_partition_name=val_partition_name, args=args,
+                )
+            finally:
+                close_dali_loaders(flatness_train_loader, flatness_val_loader)
 
-    final_flatness_result = measure_current_model()
-    relative_flatness, misalignment_measure, flatness_rows = final_flatness_result
-    _write_csv_rows(
-        str(flatness_path),
-        flatness_rows,
-        list(flatness_rows[0].keys()) if flatness_rows else [],
-    )
-
-    gap_checkpoints = _measure_gap_checkpoint_union(
-        tracker=gap_tracker, model=model, direction_name=direction_name,
-        final_epoch=epochs - 1, final_checkpoint_path=final_model_path,
-        final_result=final_flatness_result, measure_model=measure_current_model,
-    )
+        final_flatness_result = measure_current_model()
+        relative_flatness, misalignment_measure, flatness_rows = final_flatness_result
+        _write_csv_rows(str(flatness_path), flatness_rows,
+                        list(flatness_rows[0].keys()) if flatness_rows else [])
+        gap_checkpoints = _measure_gap_checkpoint_union(
+            tracker=gap_tracker, model=model, direction_name=direction_name,
+            final_epoch=epochs - 1, final_checkpoint_path=final_model_path,
+            final_result=final_flatness_result, measure_model=measure_current_model,
+        )
+    else:
+        relative_flatness = misalignment_measure = None
+        gap_checkpoints = {**gap_tracker.selection(), "relative_flatness_status": "deferred"}
+        _write_json(str(output_folder / f"selected_checkpoints_{direction_name}.json"), gap_checkpoints)
     final_objective, final_relative_gap, _, _, final_mean_loss = _objective_value_and_coefficients(
         final_train.loss, final_val.loss, objective_mode=args.objective
     )
@@ -1963,13 +2015,18 @@ def _run_direction(
         "model_type": model_type_name,
         "device": str(device),
         "runtime": {
+            "world_size": distributed.world_size(),
+            "local_batch_size": distributed.local_batch_size(batch_size),
+            "batch_size_definition": "global_per_partition_before_accumulation",
+            "training_sampler_padding": (math.ceil(len(bundle.partition_a) / distributed.world_size())
+                                         * distributed.world_size() - len(bundle.partition_a)),
             "loader": {
                 "train": loader_runtime_info(train_loader),
                 "val": loader_runtime_info(val_loader),
                 "eval_train": loader_runtime_info(eval_train_loader if eval_train_loader is not None else train_loader),
                 "eval_val": loader_runtime_info(eval_val_loader if eval_val_loader is not None else val_loader),
-                "flatness_train": loader_runtime_info(flatness_train_loader),
-                "flatness_val": loader_runtime_info(flatness_val_loader),
+                "flatness_train": loader_runtime_info(flatness_train_loader) if do_flatness else None,
+                "flatness_val": loader_runtime_info(flatness_val_loader) if do_flatness else None,
             },
             "torch_compile": compile_enabled,
             "gradient_combination": gradient_combiner.runtime_info() if gradient_combiner is not None else None,
@@ -1999,11 +2056,11 @@ def _run_direction(
             "optimization": optimization_path.name,
             "gradient_geometry": geometry_path.name if args.objective == "normalized_two_sided" else None,
             "weight_variance": variance_path.name,
-            "relative_flatness": flatness_path.name,
+            "relative_flatness": flatness_path.name if do_flatness else None,
             "initial_model": initial_model_path.name,
             "final_model": final_model_path.name,
             "gap_checkpoint_selection": str(gap_tracker.manifest_path.relative_to(output_folder)),
-            "selected_relative_flatness": f"selected_relative_flatness_{direction_name}.csv",
+            "selected_relative_flatness": f"selected_relative_flatness_{direction_name}.csv" if do_flatness else None,
             "selected_checkpoint_summary": f"selected_checkpoints_{direction_name}.json",
             "token_norms": token_norm_path.name if token_norm_monitor.available else None,
         },
@@ -2019,6 +2076,7 @@ def _run_direction(
             "objective": final_objective,
         },
         "relative_flatness": relative_flatness,
+        "relative_flatness_status": "measured" if do_flatness else "deferred",
         "misalignment_measure": misalignment_measure,
         "gap_checkpoints": gap_checkpoints,
         "weight_variance": {
@@ -2138,6 +2196,13 @@ def _measure_flatness_from_checkpoint(
 
 def main() -> None:
     args = parse_args()
+    distributed_device = distributed.initialize(use_cpu=args.device == "cpu")
+    if args.relative_flatness is None:
+        args.relative_flatness = not distributed.enabled()
+    if distributed.enabled() and (args.relative_flatness or args.flatness_from_checkpoint):
+        raise ValueError("Multi-GPU execution supports training/evaluation; run flatness separately on one GPU")
+    if not distributed.is_main():
+        args.progress = False
     if args.dataset == "modular" and not args.dataset_path:
         raise ValueError("--dataset_path is required for --dataset modular")
     if args.batch_size is not None and args.batch_size <= 0:
@@ -2159,6 +2224,8 @@ def main() -> None:
     if args.num_threads is not None:
         torch.set_num_threads(max(1, args.num_threads))
     setup_logging(logger, "main")
+    if not distributed.is_main():
+        logger.setLevel(logging.WARNING)
     if args.random_seed is None:
         # Each invocation gets an independent seed.  It is still applied
         # explicitly so both directions share the same dropout stream and the
@@ -2167,6 +2234,7 @@ def main() -> None:
         logger.info("random seed not given; drew random_seed = %d", args.random_seed)
     else:
         logger.info("random_seed = %d", args.random_seed)
+    args.random_seed = distributed.shared_seed(args.random_seed)
     if args.split_seed is None:
         args.split_seed = args.random_seed
     logger.info("split_seed = %d", args.split_seed)
@@ -2175,6 +2243,8 @@ def main() -> None:
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--device cuda requested but CUDA is unavailable")
     device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else args.device if args.device != "auto" else "cpu")
+    if distributed_device is not None:
+        device = distributed_device
     logger.info("device = %s", device)
     loader_backend = resolve_loader_backend(args.dataset, args.loader_backend)
     if loader_backend == "dali" and device.type != "cuda":
@@ -2184,6 +2254,7 @@ def main() -> None:
 
     bundle = load_dataset_bundle(args)
     model = bundle.ml_setup.model.to(device)
+    distributed.broadcast_model(model)
     criterion = bundle.ml_setup.criterion or nn.CrossEntropyLoss()
     if args.batch_size is not None:
         batch_size = args.batch_size
@@ -2209,16 +2280,18 @@ def main() -> None:
     eval_batch_size = args.eval_batch_size or batch_size
     eval_num_workers = args.num_workers if args.eval_num_workers is None else args.eval_num_workers
     eval_loader_a, eval_loader_b = loader_a, loader_b
-    if eval_batch_size != batch_size or eval_num_workers != args.num_workers:
+    if eval_batch_size != batch_size or eval_num_workers != args.num_workers or distributed.enabled():
         eval_loader_a = _build_loader(
             bundle.partition_a, eval_batch_size, device=device, num_workers=eval_num_workers,
             seed=args.random_seed + 101, prefetch_factor=args.prefetch_factor,
             loader_backend=loader_backend, augmentation_config=augmentation_config,
+            is_train=False,
         )
         eval_loader_b = _build_loader(
             bundle.partition_b, eval_batch_size, device=device, num_workers=eval_num_workers,
             seed=args.random_seed + 202, prefetch_factor=args.prefetch_factor,
             loader_backend=loader_backend, augmentation_config=augmentation_config,
+            is_train=False,
         )
     logger.info("epoch evaluation batch_size=%d num_workers=%d", eval_batch_size, eval_num_workers)
     # Training on the whole modular partition is intentional, but using the
@@ -2234,7 +2307,8 @@ def main() -> None:
         seed=args.random_seed + 303,
         prefetch_factor=args.prefetch_factor,
         loader_backend=loader_backend, augmentation_config=augmentation_config,
-    )
+        is_train=False, distributed_loader=False,
+    ) if args.relative_flatness or args.flatness_from_checkpoint else None
     flatness_loader_b = _build_loader(
         bundle.partition_b,
         flatness_batch_size,
@@ -2243,7 +2317,8 @@ def main() -> None:
         seed=args.random_seed + 404,
         prefetch_factor=args.prefetch_factor,
         loader_backend=loader_backend, augmentation_config=augmentation_config,
-    )
+        is_train=False, distributed_loader=False,
+    ) if args.relative_flatness or args.flatness_from_checkpoint else None
     model_type_name = bundle.ml_setup.model_type.name
     dataset_type_name = bundle.dataset_type_name
     if args.flatness_from_checkpoint is not None:
@@ -2299,9 +2374,12 @@ def main() -> None:
         else Path(f"misalignment_measurement_2_{datetime.now(timezone.utc).strftime('%Y-%m-%d_%H-%M-%S_%f')}")
     )
     output_folder = output_folder if output_folder.is_absolute() else Path.cwd() / output_folder
-    output_folder.mkdir(parents=True, exist_ok=False)
-    (output_folder / "command.txt").write_text(" ".join([sys.executable, *sys.argv]), encoding="utf-8")
-    torch.save(bundle.permutation, output_folder / "split_permutation.pt")
+    output_folder = Path(distributed.broadcast_object(str(output_folder)))
+    if distributed.is_main():
+        output_folder.mkdir(parents=True, exist_ok=False)
+        (output_folder / "command.txt").write_text(" ".join([sys.executable, *sys.argv]), encoding="utf-8")
+        torch.save(bundle.permutation, output_folder / "split_permutation.pt")
+    distributed.barrier()
     initial_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
     logger.info(
         "dataset=%s source_examples=%d half_size=%d augmentation=%s batch_size=%d flatness_batch_size=%d epochs=%d",
@@ -2348,6 +2426,7 @@ def main() -> None:
         )
     measure_values = {
         name: run["misalignment_measure"]["overall_mean"] for name, run in runs.items()
+        if run["misalignment_measure"] is not None
     }
     measure_items = list(measure_values.values())
     aggregate = {
@@ -2365,7 +2444,7 @@ def main() -> None:
         "runs": runs,
         "aggregate": {
             "misalignment_measure_by_direction": measure_values,
-            "mean_misalignment_measure": sum(measure_items) / max(1, len(measure_items)),
+            "mean_misalignment_measure": sum(measure_items) / len(measure_items) if measure_items else None,
             "absolute_direction_difference": (
                 abs(measure_items[0] - measure_items[1]) if len(measure_items) == 2 else None
             ),
@@ -2376,4 +2455,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        distributed.shutdown()

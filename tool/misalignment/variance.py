@@ -7,6 +7,7 @@ from pathlib import Path
 
 import torch
 from torch import nn
+from py_src import distributed
 
 
 class EpochWeightVarianceRecorder:
@@ -24,11 +25,15 @@ class EpochWeightVarianceRecorder:
         self.model = model
         self.csv_path = Path(csv_path)
         self.layer_names = [name for name in model.state_dict() if "weight" in name]
+        if not distributed.is_main():
+            return
         with self.csv_path.open("x", newline="", encoding="utf-8") as outfile:
             csv.writer(outfile).writerow(["epoch", *self.layer_names])
 
     @torch.no_grad()
     def record(self, epoch: int) -> None:
+        if not distributed.is_main():
+            return
         state = self.model.state_dict()
         # Reduce on the weights' devices; only scalar results move to CPU.
         # Grouping by device avoids a separate GPU synchronization per layer.

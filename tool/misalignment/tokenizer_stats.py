@@ -6,6 +6,7 @@ from contextlib import contextmanager
 
 import torch
 from torch import nn
+from py_src import distributed
 
 
 TOKENIZER_RATIO_FIELDS = ("train_tokenizer_nonzero_ratio", "val_tokenizer_nonzero_ratio")
@@ -63,6 +64,10 @@ class TokenizerOutputMonitor:
             return None
         nonzero, elements = self._counts.tolist()
         return nonzero / elements if elements else None
+
+    def synchronize(self) -> None:
+        if self.available:
+            distributed.sum_tensor(self._counts)
 
     def close(self) -> None:
         self.active = False

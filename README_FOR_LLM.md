@@ -19,6 +19,7 @@
 - 支持从头初始化、指定初始模型、迁移学习、从 `training_checkpoint.pt` 恢复，以及用另一个模型构造 opposite-direction 初始化。
 - 每个模型会写出 `.model.pt`、`.optimizer.pt`、`*.log.csv`；启用中间保存时还会写 epoch checkpoint。输出目录还包含 `info.json`、训练配置和可恢复训练状态。
 - `training_model()` 是单个模型的主要训练流程；`save_training_checkpoint()` / `load_training_checkpoint()` 负责可恢复训练。
+- `torchrun --standalone --nproc-per-node=2/4` 支持单节点、单模型 DDP 分类训练和 DALI；batch size 为全局大小，rank 0 写文件，checkpoint 保存各 rank RNG。公共运行时在 `py_src/distributed.py`，用法与 Snellius 脚本见 `tool/README_multi_gpu.md`。
 
 ### `tool/generate_grokking.py`
 
@@ -58,6 +59,7 @@
 - 训练过程中写出每 epoch 的优化指标、梯度几何和权重方差；结束后对指定层执行 Hutchinson/Hessian 相对平坦度测量。
 - 每 epoch 的日志和优化 CSV 还包含 `running_train_loss` / `running_val_loss`，复用训练 forward 的原始 loss 按样本数加权，跳过末尾 eval 时仍汇报；val 权重为 0、未执行该侧 forward 时记 `NaN`。完整 eval 的日志字段为 `eval_train_loss` / `eval_val_loss`，CSV 仍为 `loss_a` / `loss_b`。
 - 会保留 accuracy gap 和 loss gap 最大的 checkpoint，并对这些 checkpoint 追加相对平坦度测量。
+- 单节点 2/4 卡通过显式 all-reduce 同步原始 train/val 梯度后再归一化组合，同时支持 PyTorch/DALI 分片。多卡默认延后 flatness，单设备可用 `--skip_relative_flatness` 显式延后；仍保存最终模型、gap checkpoint、split seed 等，summary 记 `deferred`/`null`。多卡 flatness 尚未实现。
 - `--eval_last_10_percent` 可将 epoch 末全量 A/B 评估限制到最后 `ceil(epochs/10)` 个 epoch（默认每 epoch 评估）。跳过时优化 CSV 标记 `evaluated=0`，loss/accuracy/gap 为 `NaN`；范数和 gap checkpoint 仅记录已评估 epoch，权重方差和梯度几何照常记录。对称目标更新所需的 baseline eval 保留。
 - 主要输出为 `optimization_*.csv`、`gradient_geometry_*.csv`、`weight_variance_*.csv`、`relative_flatness_*.csv`、`selected_relative_flatness_*.csv`、模型 checkpoint 和 `summary.json`。
 - `summary.json` 还记录数据分区、loader、AMP/compile、optimizer、checkpoint 选择和 `git_provenance`。最近一次修改后，Git commit、branch 和 tracked working-tree 状态会在运行时写入结果。

@@ -20,6 +20,7 @@ from torchvision import transforms, datasets
 from torchvision.transforms.autoaugment import TrivialAugmentWide
 from torchvision.transforms.v2 import RandAugment
 from torch.utils.data import Dataset
+from py_src import distributed
 
 from .dataset_types import DatasetSetup, DatasetType
 from .dataset_default import (
@@ -50,6 +51,8 @@ class _DaliImageNetIterator:
         drop_last: bool,
         repetitions: int = 1,
         batch_transform: Optional[Callable] = None,
+        reader_sample_count: Optional[int] = None,
+        iterator_factory: Optional[Callable] = None,
     ):
         self._dali_iterator = dali_iterator
         self._sample_count = sample_count
@@ -57,6 +60,15 @@ class _DaliImageNetIterator:
         self._drop_last = drop_last
         self._repetitions = repetitions
         self._batch_transform = batch_transform
+        self._reader_sample_count = reader_sample_count
+        self._iterator_factory = iterator_factory
+        self._epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        if self._iterator_factory is not None and epoch != self._epoch:
+            self._dali_iterator = None
+            self._dali_iterator = self._iterator_factory(epoch)
+            self._epoch = epoch
 
     def _finalize_batch(self, data, label):
         batch = (data, label)
@@ -65,17 +77,25 @@ class _DaliImageNetIterator:
         return batch
 
     def __iter__(self):
+        if self._sample_count == 0:
+            return
         consumed = 0
         pending_data = None
         pending_label = None
 
         try:
             for repetition in range(self._repetitions):
+                reader_consumed = 0
                 for batch in self._dali_iterator:
                     if isinstance(batch, list):
                         batch = batch[0]
                     data = batch["data"]
                     label = batch["label"].reshape(-1).long()
+                    if self._reader_sample_count is not None:
+                        remaining_in_reader = self._reader_sample_count - reader_consumed
+                        data = data[:max(0, remaining_in_reader)]
+                        label = label[:max(0, remaining_in_reader)]
+                        reader_consumed += data.size(0)
 
                     remaining = self._sample_count - consumed
                     if remaining <= 0:
@@ -303,10 +323,33 @@ class DaliImageNetDataset(Dataset):
             ) from exc
 
         batch_size = config.batch_size or default_batch_size
+        use_distributed = config.distributed and distributed.enabled()
+        size = distributed.world_size() if use_distributed else 1
+        rank = distributed.rank() if use_distributed else 0
+        if use_distributed:
+            batch_size = distributed.local_batch_size(batch_size)
+            if config.sampler is not None:
+                raise ValueError("DALI uses reader sharding rather than a PyTorch sampler")
+            if config.num_samples is not None and config.num_samples < len(self):
+                raise ValueError("Distributed DALI currently requires the complete dataset (omit num_samples)")
         num_threads = max(1, config.num_workers or 4)
         drop_last = config.drop_last
         shuffle = config.shuffle if config.shuffle is not None else is_train
         sample_count = min(len(self), config.num_samples) if config.num_samples is not None else len(self)
+        reader_sample_count = None
+        reader_kwargs = {"file_root": self.file_root, "name": "Reader"}
+        if use_distributed:
+            reader_kwargs.update(shard_id=rank, num_shards=size, stick_to_shard=True,
+                                 pad_last_batch=True, seed=config.seed)
+            if is_train:
+                # Equal training steps on every rank, padding at most W-1
+                # source images per reader pass. Trim batch-level padding.
+                reader_sample_count = math.ceil(self.base_sample_count / size)
+                sample_count = math.ceil(sample_count / size)
+            else:
+                reader_sample_count = ((rank + 1) * self.base_sample_count // size
+                                       - rank * self.base_sample_count // size)
+                sample_count = reader_sample_count
         repetitions = self.repeated_augmentation_repetitions if is_train and self.augmentation else 1
         use_mixup_cutmix = is_train and config.collate_fn is not None
         train_crop, val_resize, val_crop = _resolve_imagenet_sizes(
@@ -317,31 +360,38 @@ class DaliImageNetDataset(Dataset):
         )
         use_train_pipeline = is_train and self.split == "train" and self.augmentation
 
-        pipeline = build_dali_imagenet_pipeline(
-            reader_kwargs={"file_root": self.file_root,
-                           "random_shuffle": shuffle if use_train_pipeline else False, "name": "Reader"},
-            training=use_train_pipeline,
-            crop_size=train_crop if use_train_pipeline else val_crop, resize_size=val_resize,
-            batch_size=batch_size, num_threads=num_threads, device_id=self.device_id,
-            preset_version=self.preset_version, auto_augment_policy=self.auto_augment_policy,
-            auto_augment_interpolation=self.auto_augment_interpolation,
-            random_erase_prob=self.random_erase_prob,
-        )
+        reader_kwargs["random_shuffle"] = shuffle if use_train_pipeline else False
 
-        dali_iterator = DALIGenericIterator(
-            [pipeline],
-            output_map=["data", "label"],
-            reader_name="Reader",
-            auto_reset=False,
-            last_batch_policy=LastBatchPolicy.PARTIAL,
-        )
+        def make_iterator(epoch):
+            readers = dict(reader_kwargs)
+            pipeline_options = None
+            if use_distributed:
+                readers["seed"] = config.seed + epoch
+                pipeline_options = {"seed": config.seed + rank + 1_000_003 * epoch,
+                                    "prefetch_queue_depth": config.prefetch_factor or 2}
+            pipeline = build_dali_imagenet_pipeline(
+                reader_kwargs=readers, training=use_train_pipeline,
+                crop_size=train_crop if use_train_pipeline else val_crop, resize_size=val_resize,
+                batch_size=batch_size, num_threads=num_threads, device_id=self.device_id,
+                preset_version=self.preset_version, auto_augment_policy=self.auto_augment_policy,
+                auto_augment_interpolation=self.auto_augment_interpolation,
+                random_erase_prob=self.random_erase_prob, pipeline_kwargs=pipeline_options,
+            )
+            return DALIGenericIterator(
+                [pipeline], output_map=["data", "label"], reader_name="Reader", auto_reset=False,
+                last_batch_policy=LastBatchPolicy.FILL if use_distributed and is_train else LastBatchPolicy.PARTIAL,
+                prepare_first_batch=False,
+            )
+
         return _DaliImageNetIterator(
-            dali_iterator,
+            make_iterator(0),
             sample_count,
             batch_size,
             drop_last,
             repetitions=repetitions,
             batch_transform=config.collate_fn if use_mixup_cutmix else None,
+            reader_sample_count=reader_sample_count,
+            iterator_factory=make_iterator if use_distributed else None,
         )
 
 

@@ -14,6 +14,7 @@ from typing import Any
 
 import torch
 from torch.utils.data import ConcatDataset, Dataset, Subset
+from py_src import distributed
 
 
 def resolve_loader_backend(dataset_name: str, requested: str = "auto") -> str:
@@ -91,6 +92,8 @@ class DaliImageNetLoader:
         self, dataset: Dataset, batch_size: int, *, device: torch.device,
         num_workers: int, seed: int, prefetch_factor: int,
         augmentation_config: dict[str, Any],
+        is_train: bool = True,
+        distributed_loader: bool = True,
     ) -> None:
         if device.type != "cuda" or not torch.cuda.is_available():
             raise ValueError("DALI ImageNet loading requires CUDA; use --loader_backend pytorch on CPU")
@@ -103,13 +106,31 @@ class DaliImageNetLoader:
             raise ValueError("DALI ImageNet augmentation supports none/0, 1 and 2")
         self.crop_size = int(augmentation_config["input_size"])
         self.dataset = dataset
-        self.batch_size = int(batch_size)
+        self.world_size = distributed.world_size() if distributed_loader else 1
+        self.rank = distributed.rank() if distributed_loader else 0
+        self.batch_size = distributed.local_batch_size(batch_size) if self.world_size > 1 else int(batch_size)
         self.device_id = device.index if device.index is not None else torch.cuda.current_device()
         self.num_threads = max(1, int(num_workers))
-        self.seed = int(seed)
+        self.seed = int(seed) + self.rank
         self.prefetch_factor = int(prefetch_factor)
         self._dali_api = _import_dali()
-        self.files, self.labels = image_file_manifest(dataset)
+        self.padded_examples = 0
+        if self.world_size > 1:
+            # Shard the canonical fixed-order sequence, so each paired global
+            # batch contains the same source examples as the PyTorch backend.
+            indices = list(range(self.rank, len(dataset), self.world_size))
+            if is_train:
+                total = math.ceil(len(dataset) / self.world_size) * self.world_size
+                self.padded_examples = total - len(dataset)
+                indices.extend(index % len(dataset) for index in range(len(dataset), total)
+                               if index % self.world_size == self.rank)
+            local_dataset = Subset(dataset, indices)
+            if indices:
+                self.files, self.labels = image_file_manifest(local_dataset)
+            else:
+                self.files, self.labels = [], []
+        else:
+            self.files, self.labels = image_file_manifest(dataset)
         self._pipeline = None
         self._iterator = None
         self._active = False
@@ -121,6 +142,8 @@ class DaliImageNetLoader:
         return {
             "backend": "dali", "dali_version": self._dali_api[0].__version__,
             "device_id": self.device_id, "num_threads": self.num_threads,
+            "rank": self.rank, "world_size": self.world_size,
+            "local_examples": len(self.files), "padded_training_examples_global": self.padded_examples,
             "prefetch_queue_depth": self.prefetch_factor, "decoder_device": "cpu",
             "resize_normalize_device": "gpu", "input_size": self.crop_size,
             "last_batch_policy": "partial", "shuffle": False,
@@ -156,6 +179,8 @@ class DaliImageNetLoader:
         )
 
     def __iter__(self):
+        if not self.files:
+            return
         if self._active:
             raise RuntimeError("Cannot traverse a DALI partition concurrently")
         self._active = True

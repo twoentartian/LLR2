@@ -2,6 +2,7 @@ import argparse
 import concurrent.futures
 import copy
 import json
+import io
 import logging
 import math
 import os
@@ -14,7 +15,6 @@ from typing import Any, Optional, TypeAlias, cast
 import numpy as np
 import numpy.typing as npt
 import torch
-from PIL import Image
 import lightning as L
 from tqdm.auto import tqdm
 
@@ -24,9 +24,9 @@ from py_src.util import setup_logging, set_seed, re_initialize_model
 from py_src.model_opti_save_load import save_model_state, save_optimizer_state, load_model_state_file
 from py_src.ml_setup import ApplicationType, get_ml_setup_from_config, MLSetup
 from py_src.complete_ml_setup import FastTrainingSetup, TransferTrainingSetup
-from py_src.ml_setup_model import ModelType
 from py_src.ml_setup_dataset import DatasetType
 from py_src.engine import Device, train, val
+from py_src import distributed
 from py_src.ml_setup.dataloader_util import DataloaderConfig
 import py_src.adapters as _adapters
 
@@ -186,7 +186,11 @@ def _capture_rng_state() -> dict[str, Any]:
             "cached_gaussian": numpy_state[4],
         },
         "torch": torch.get_rng_state().cpu(),
-        "cuda": [state.cpu() for state in torch.cuda.get_rng_state_all()] if torch.cuda.is_available() else None,
+        "cuda": (
+            [torch.cuda.get_rng_state().cpu()] if distributed.enabled()
+            else [state.cpu() for state in torch.cuda.get_rng_state_all()]
+        ) if torch.cuda.is_available() and (not distributed.enabled() or torch.distributed.get_backend() == "nccl") else None,
+        "cuda_current_device_only": distributed.enabled(),
     }
 
 
@@ -221,7 +225,10 @@ def _restore_rng_state(rng_state: Optional[dict[str, Any]], child_logger: loggin
     if not torch.cuda.is_available():
         child_logger.info("checkpoint contains CUDA RNG state but CUDA is unavailable; skipping CUDA RNG restore")
         return
-    torch.cuda.set_rng_state_all([state.cpu() for state in cuda_states])
+    if rng_state.get("cuda_current_device_only"):
+        torch.cuda.set_rng_state(cuda_states[0].cpu())
+    else:
+        torch.cuda.set_rng_state_all([state.cpu() for state in cuda_states])
 
 
 def save_training_checkpoint(
@@ -238,6 +245,12 @@ def save_training_checkpoint(
     output_folder: str,
     run_config: dict[str, Any],
 ) -> None:
+    rng_states = None
+    if distributed.enabled():
+        rng_states = [None] * distributed.world_size()
+        torch.distributed.all_gather_object(rng_states, _capture_rng_state())
+        if not distributed.is_main():
+            return
     checkpoint = {
         "checkpoint_type": TRAINING_CHECKPOINT_TYPE,
         "checkpoint_version": TRAINING_CHECKPOINT_VERSION,
@@ -261,6 +274,8 @@ def save_training_checkpoint(
         "output_folder": os.path.abspath(output_folder),
         "run_config": copy.deepcopy(run_config),
         "rng_state": _capture_rng_state(),
+        "rng_states_by_rank": rng_states,
+        "world_size": distributed.world_size(),
     }
     temp_path = f"{path}.tmp"
     torch.save(checkpoint, temp_path)
@@ -340,12 +355,14 @@ def training_model(
     run_config: dict[str, Any],
     load_checkpoint_path: Optional[str],
 ):
-    thread_per_process = arg_total_cpu_count // arg_worker_count
+    thread_per_process = max(1, arg_total_cpu_count // arg_worker_count // distributed.world_size())
     thread_per_process = min(thread_per_process, MAX_THREAD_PER_PROCESS)
     torch.set_num_threads(thread_per_process)
 
     child_logger = logging.getLogger(f"generate_high_accuracy_model.{index}")
     setup_logging(child_logger, str(index))
+    if not distributed.is_main():
+        child_logger.setLevel(logging.WARNING)
 
     if random_seed is not None:
         set_seed(random_seed)
@@ -361,18 +378,25 @@ def training_model(
     if isinstance(adapter, (_adapters.StandardAdapter, _adapters.DiffusionAdapter,
                              _adapters.LightningAdapter, _adapters.CustomStepAdapter)):
         adapter._model = model # type: ignore
+    if distributed.enabled() and not isinstance(adapter, _adapters.StandardAdapter):
+        raise ValueError("Single-model multi-GPU training currently supports StandardAdapter classifiers")
+    if distributed.enabled() and (arg_ml_setup.override_train_loader is not None
+                                   or arg_ml_setup.override_test_loader is not None):
+        raise ValueError("Multi-GPU training requires shardable datasets instead of prebuilt override loaders")
 
     num_workers = min(thread_per_process, MAX_THREAD_PER_PROCESS)
     prefetch_factor = arg_ml_setup.default_prefetch_factor
 
     dataloader = arg_ml_setup.train_dataloader(
-        DataloaderConfig(num_workers=num_workers, prefetch_factor=prefetch_factor)
+        DataloaderConfig(batch_size=run_config.get("batch_size"), num_workers=num_workers,
+                         prefetch_factor=prefetch_factor, seed=random_seed or 0)
     )
     steps_per_epoch = len(dataloader) # type: ignore
 
     if enable_validation and arg_ml_setup.application_type==ApplicationType.classifier:
         dataloader_test = arg_ml_setup.val_dataloader(
-            DataloaderConfig(num_workers=num_workers, prefetch_factor=prefetch_factor)
+            DataloaderConfig(batch_size=run_config.get("batch_size"), num_workers=num_workers,
+                             prefetch_factor=prefetch_factor, seed=random_seed or 0)
         )
     else:
         dataloader_test = None
@@ -505,7 +529,11 @@ def training_model(
         elif scaler_state is not None:
             child_logger.info("checkpoint contains AMP scaler state but the current device does not use a GradScaler")
 
-        _restore_rng_state(resume_checkpoint.get("rng_state"), child_logger)
+        saved_size = resume_checkpoint.get("world_size", 1)
+        if saved_size != distributed.world_size():
+            raise ValueError(f"Resume requires the saved world size ({saved_size}); use model weights for a new run")
+        rank_states = resume_checkpoint.get("rng_states_by_rank")
+        _restore_rng_state(rank_states[distributed.rank()] if rank_states else resume_checkpoint.get("rng_state"), child_logger)
 
         start_epoch = int(resume_checkpoint["next_epoch"])
         if epochs is None:
@@ -516,7 +544,9 @@ def training_model(
             )
 
     log_csv_path = os.path.join(output_folder, f"{str(index).zfill(digit_width)}.log.csv")
-    if resume_checkpoint is None:
+    if not distributed.is_main():
+        log_csv = io.StringIO()
+    elif resume_checkpoint is None:
         log_csv = open(log_csv_path, "w", encoding="utf-8")
         log_csv.write(LOG_CSV_HEADER)
     else:
@@ -531,15 +561,25 @@ def training_model(
         model.set_batches_per_epoch(len(dataloader)) # type: ignore
 
     maybe_enable_torch_compile(model, adapter, device, child_logger, arg_compile)
+    if distributed.enabled():
+        adapter._model = device.wrap_ddp(adapter.get_model())
+        # The initialization is shared; dropout/worker RNG streams are per rank.
+        if resume_checkpoint is None:
+            set_seed((random_seed or 0) + distributed.rank())
+        child_logger.info("single-model distributed training: rank=%d world_size=%d global_batch_size=%d",
+                          distributed.rank(), distributed.world_size(),
+                          run_config.get("batch_size") or arg_ml_setup.default_batch_size)
 
     checkpoint_run_config = copy.deepcopy(run_config)
     checkpoint_run_config["epoch_override"] = arg_epoch_override
 
-    progress_enabled = _should_enable_progress_bar(arg_worker_count)
+    progress_enabled = distributed.is_main() and _should_enable_progress_bar(arg_worker_count)
     if arg_worker_count == 1 and not progress_enabled:
         child_logger.info("progress bar disabled for non-interactive output")
 
     for epoch in range(start_epoch, epochs):
+        if hasattr(dataloader, "set_epoch"):
+            dataloader.set_epoch(epoch)
         train_sampler = getattr(dataloader, "sampler", None)
         if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
@@ -597,7 +637,7 @@ def training_model(
             )
         log_csv.flush()
 
-        if ckpt_folder is not None and epoch % arg_save_interval == 0:
+        if distributed.is_main() and ckpt_folder is not None and epoch % arg_save_interval == 0:
             ckpt_path = os.path.join(ckpt_folder, f"epoch{epoch}.pt")
             save_model_state(
                 ckpt_path, model.state_dict(),
@@ -636,8 +676,9 @@ def training_model(
 
     model_out = os.path.join(output_folder, f"{str(index).zfill(digit_width)}.model.pt")
     opt_out = os.path.join(output_folder, f"{str(index).zfill(digit_width)}.optimizer.pt")
-    save_model_state(model_out, model.state_dict(), arg_ml_setup.model_type.name, arg_ml_setup.dataset_type.name)
-    save_optimizer_state(opt_out, optimizer.state_dict(), arg_ml_setup.model_type.name, arg_ml_setup.dataset_type.name) # type: ignore
+    if distributed.is_main():
+        save_model_state(model_out, model.state_dict(), arg_ml_setup.model_type.name, arg_ml_setup.dataset_type.name)
+        save_optimizer_state(opt_out, optimizer.state_dict(), arg_ml_setup.model_type.name, arg_ml_setup.dataset_type.name) # type: ignore
 
     torch.cuda.empty_cache()
 
@@ -646,8 +687,8 @@ def training_model(
 # Entry point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    torch.multiprocessing.set_start_method('spawn')
+def main():
+    torch.multiprocessing.set_start_method('spawn', force=True)
 
     parser = argparse.ArgumentParser(description="Generate high-accuracy model checkpoints")
     parser.add_argument("-n", "--number_of_models", type=int, default=1)
@@ -657,6 +698,8 @@ if __name__ == "__main__":
                         help="number of models to train in parallel")
     parser.add_argument("-m", "--model_type", type=str, default="lenet5")
     parser.add_argument("-d", "--dataset_type", type=str, default="default")
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="global mini-batch size across all GPUs, before gradient accumulation")
     parser.add_argument("--cpu", action="store_true", help="force CPU training")
     parser.add_argument("--dali", action=argparse.BooleanOptionalAction, default=False, help="use NVIDIA DALI for ImageNet dataloading")
     parser.add_argument("--dali_device_id", type=int, default=0, help="CUDA device id used by DALI pipelines")
@@ -687,6 +730,17 @@ if __name__ == "__main__":
                         help="resume training from a training checkpoint created by this script")
 
     args = parser.parse_args()
+    saved_run = load_training_checkpoint(args.load_checkpoint) if args.load_checkpoint is not None else None
+    distributed.initialize(use_cpu=bool(saved_run["run_config"]["cpu"] if saved_run else args.cpu))
+    if distributed.enabled():
+        if args.worker != 1 or args.number_of_models != 1:
+            parser.error("torchrun single-model training requires --worker 1 --number_of_models 1")
+        if saved_run is None:
+            args.random_seed = distributed.shared_seed(args.random_seed)
+        use_cpu = saved_run["run_config"]["cpu"] if saved_run else args.cpu
+        args.dali_device_id = torch.cuda.current_device() if not use_cpu else 0
+    if args.batch_size is not None and args.batch_size <= 0:
+        parser.error("--batch_size must be positive")
     if args.cpu and args.dali:
         parser.error("--dali requires CUDA; do not combine it with --cpu")
 
@@ -695,6 +749,8 @@ if __name__ == "__main__":
     total_cpu_cores = args.core
 
     setup_logging(logger, "main")
+    if not distributed.is_main():
+        logger.setLevel(logging.WARNING)
     logger.info("logging ready")
 
     if args.load_checkpoint is None and args.opposite_init_model is not None:
@@ -731,6 +787,10 @@ if __name__ == "__main__":
 
         resume_checkpoint = load_training_checkpoint(args.load_checkpoint)
         run_config = copy.deepcopy(resume_checkpoint["run_config"])
+        if distributed.enabled() and run_config["dali"]:
+            run_config["dali_device_id"] = torch.cuda.current_device()
+        if args.batch_size is not None:
+            parser.error("--batch_size cannot override the saved configuration during resume")
 
         current_ml_setup = get_ml_setup_from_config(
             run_config["model_type"],
@@ -792,7 +852,10 @@ if __name__ == "__main__":
             output_folder_path = os.path.join(os.curdir, f"{os.path.basename(__file__)}_{time_str}")
         else:
             output_folder_path = os.path.join(os.curdir, args.output_folder_name)
-        os.mkdir(output_folder_path)
+        output_folder_path = distributed.broadcast_object(output_folder_path)
+        if distributed.is_main():
+            os.mkdir(output_folder_path)
+        distributed.barrier()
 
         info = {
             "model_type": current_ml_setup.model_type.name,
@@ -804,13 +867,17 @@ if __name__ == "__main__":
             "torch_compile": args.compile,
             "opposite_init_model": args.opposite_init_model,
         }
-        with open(os.path.join(output_folder_path, "info.json"), "w", encoding="utf-8") as f:
-            json.dump(info, f)
+        info["world_size"] = distributed.world_size()
+        info["batch_size"] = args.batch_size or current_ml_setup.default_batch_size
+        if distributed.is_main():
+            with open(os.path.join(output_folder_path, "info.json"), "w", encoding="utf-8") as f:
+                json.dump(info, f)
 
         if worker_count > number_of_models:
             worker_count = number_of_models
 
         run_config = {
+            "batch_size": args.batch_size,
             "model_type": current_ml_setup.model_type.name,
             "dataset_type": current_ml_setup.dataset_type.name,
             "cpu": args.cpu,
@@ -848,3 +915,10 @@ if __name__ == "__main__":
             futures = [executor.submit(training_model, *task) for task in task_args]
             for future in concurrent.futures.as_completed(futures):
                 future.result()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        distributed.shutdown()

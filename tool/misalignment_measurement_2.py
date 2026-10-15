@@ -533,6 +533,13 @@ EPOCH_TIMING_FIELDS = (
 )
 
 
+def _epoch_evaluation_start(epochs: int, last_10_percent: bool) -> int:
+    """First zero-based evaluation epoch, rounding the final tenth up."""
+    if epochs <= 0:
+        raise ValueError("epochs must be positive")
+    return epochs - (epochs + 9) // 10 if last_10_percent else 0
+
+
 def _finish_epoch_timing(row, *, epoch_start, train_seconds, eval_train_seconds,
                          eval_val_seconds, baseline_eval_seconds, epoch_callback):
     row.update(train_seconds=train_seconds, eval_train_seconds=eval_train_seconds,
@@ -572,14 +579,16 @@ def train_symmetric_objective(
     eval_loader_a: Iterable | None = None,
     eval_loader_b: Iterable | None = None,
     final_metrics_callback: Callable[[LossMetrics, LossMetrics], None] | None = None,
+    eval_last_10_percent: bool = False,
 ) -> list[dict[str, float]]:
     if epochs <= 0:
         raise ValueError("epochs must be positive")
     eval_loader_a = loader_a if eval_loader_a is None else eval_loader_a
     eval_loader_b = loader_b if eval_loader_b is None else eval_loader_b
+    first_eval_epoch = _epoch_evaluation_start(epochs, eval_last_10_percent)
     rows: list[dict[str, float]] = []
     optimization_fields = [
-        "epoch", "loss_a", "loss_b", "train_accuracy", "val_accuracy", "mean_loss",
+        "epoch", "evaluated", "loss_a", "loss_b", "train_accuracy", "val_accuracy", "mean_loss",
         "abs_accuracy_gap", "abs_loss_gap", "relative_gap", "objective", "batches", "learning_rate",
     ]
     if tokenizer_monitor is not None and tokenizer_monitor.available:
@@ -655,22 +664,27 @@ def train_symmetric_objective(
                 scheduler.step()
             batches += 1
         train_seconds = time.perf_counter() - training_start
-        eval_start = time.perf_counter()
-        current_a = evaluate_partition(
-            model, eval_loader_a, criterion, device=device, modular=modular, eq_position=eq_position,
-            tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
-            amp_enabled=amp_enabled, amp_dtype=amp_dtype,
-            progress_enabled=progress_enabled, progress_label=f"{epoch_label} eval train",
-        )
-        eval_train_seconds = time.perf_counter() - eval_start
-        eval_start = time.perf_counter()
-        current_b = evaluate_partition(
-            model, eval_loader_b, criterion, device=device, modular=modular, eq_position=eq_position,
-            tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
-            amp_enabled=amp_enabled, amp_dtype=amp_dtype,
-            progress_enabled=progress_enabled, progress_label=f"{epoch_label} eval val",
-        )
-        eval_val_seconds = time.perf_counter() - eval_start
+        evaluated = epoch >= first_eval_epoch
+        eval_train_seconds = eval_val_seconds = 0.0
+        if evaluated:
+            eval_start = time.perf_counter()
+            current_a = evaluate_partition(
+                model, eval_loader_a, criterion, device=device, modular=modular, eq_position=eq_position,
+                tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
+                amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+                progress_enabled=progress_enabled, progress_label=f"{epoch_label} eval train",
+            )
+            eval_train_seconds = time.perf_counter() - eval_start
+            eval_start = time.perf_counter()
+            current_b = evaluate_partition(
+                model, eval_loader_b, criterion, device=device, modular=modular, eq_position=eq_position,
+                tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
+                amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+                progress_enabled=progress_enabled, progress_label=f"{epoch_label} eval val",
+            )
+            eval_val_seconds = time.perf_counter() - eval_start
+        else:
+            current_a = current_b = LossMetrics(loss=float("nan"), accuracy=float("nan"), examples=0)
         if epoch == epochs - 1 and final_metrics_callback is not None:
             final_metrics_callback(current_a, current_b)
         mean_a = current_a.loss
@@ -683,9 +697,10 @@ def train_symmetric_objective(
             mean_loss_current,
         ) = _objective_value_and_coefficients(
             mean_a, mean_b, objective_mode=objective_mode
-        )
+        ) if evaluated else (float("nan"),) * 5
         row = {
             "epoch": float(epoch),
+            "evaluated": float(evaluated),
             "loss_a": mean_a,
             "loss_b": mean_b,
             "train_accuracy": current_a.accuracy,
@@ -698,8 +713,10 @@ def train_symmetric_objective(
             "batches": float(batches),
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
         }
-        tokenizer_log = _append_tokenizer_metrics(row, current_a, current_b)
-        tokenizer_log += _record_token_norms(token_norm_recorder, epoch, current_a, current_b)
+        tokenizer_log = ""
+        if evaluated:
+            tokenizer_log = _append_tokenizer_metrics(row, current_a, current_b)
+            tokenizer_log += _record_token_norms(token_norm_recorder, epoch, current_a, current_b)
         rows.append(row)
         tokenizer_log += _finish_epoch_timing(
             row, epoch_start=epoch_start, train_seconds=train_seconds,
@@ -708,6 +725,10 @@ def train_symmetric_objective(
         )
         _write_csv_rows(csv_path, rows, optimization_fields)
         if epoch % max(1, report_interval) == 0 or epoch == epochs - 1:
+            if not evaluated:
+                logger.info("epoch %d/%d: eval skipped lr=%.6g%s", epoch, epochs,
+                            optimizer.param_groups[0]["lr"], tokenizer_log)
+                continue
             logger.info(
                 "epoch %d/%d: train_loss=%.6g val_loss=%.6g train_acc=%.6g val_acc=%.6g mean_loss=%.6g abs_gap=%.6g relative_gap=%.6g objective=%.6g lr=%.6g%s",
                 epoch,
@@ -952,6 +973,7 @@ def train_normalized_two_sided(
     eval_loader_a: Iterable | None = None,
     eval_loader_b: Iterable | None = None,
     final_metrics_callback: Callable[[LossMetrics, LossMetrics], None] | None = None,
+    eval_last_10_percent: bool = False,
 ) -> list[dict[str, float]]:
     """Run the normalized train-descent/val-ascent update from initialization."""
     if epochs <= 0:
@@ -968,11 +990,12 @@ def train_normalized_two_sided(
     )
     eval_loader_a = loader_a if eval_loader_a is None else eval_loader_a
     eval_loader_b = loader_b if eval_loader_b is None else eval_loader_b
+    first_eval_epoch = _epoch_evaluation_start(epochs, eval_last_10_percent)
     rows: list[dict[str, float]] = []
     geometry_rows: list[dict[str, float | str]] = []
     geometry_sample_epochs = _gradient_geometry_sample_epochs(epochs)
     optimization_fields = [
-        "epoch", "loss_a", "loss_b", "train_accuracy", "val_accuracy", "mean_loss",
+        "epoch", "evaluated", "loss_a", "loss_b", "train_accuracy", "val_accuracy", "mean_loss",
         "abs_accuracy_gap", "abs_loss_gap", "relative_gap", "objective", "batches", "learning_rate",
         "train_val_gradient_cosine", "train_gradient_weight", "val_gradient_weight",
     ]
@@ -1058,22 +1081,27 @@ def train_normalized_two_sided(
             stats["val_gradient_weight"] = val_gradient_weight
         train_seconds = time.perf_counter() - training_start
         baseline_eval_seconds = 0.0
-        eval_start = time.perf_counter()
-        current_a = evaluate_partition(
-            model, eval_loader_a, criterion, device=device, modular=modular, eq_position=eq_position,
-            tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
-            amp_enabled=amp_enabled, amp_dtype=amp_dtype,
-            progress_enabled=progress_enabled, progress_label=f"{epoch_label} eval train",
-        )
-        eval_train_seconds = time.perf_counter() - eval_start
-        eval_start = time.perf_counter()
-        current_b = evaluate_partition(
-            model, eval_loader_b, criterion, device=device, modular=modular, eq_position=eq_position,
-            tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
-            amp_enabled=amp_enabled, amp_dtype=amp_dtype,
-            progress_enabled=progress_enabled, progress_label=f"{epoch_label} eval val",
-        )
-        eval_val_seconds = time.perf_counter() - eval_start
+        evaluated = epoch >= first_eval_epoch
+        eval_train_seconds = eval_val_seconds = 0.0
+        if evaluated:
+            eval_start = time.perf_counter()
+            current_a = evaluate_partition(
+                model, eval_loader_a, criterion, device=device, modular=modular, eq_position=eq_position,
+                tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
+                amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+                progress_enabled=progress_enabled, progress_label=f"{epoch_label} eval train",
+            )
+            eval_train_seconds = time.perf_counter() - eval_start
+            eval_start = time.perf_counter()
+            current_b = evaluate_partition(
+                model, eval_loader_b, criterion, device=device, modular=modular, eq_position=eq_position,
+                tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
+                amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+                progress_enabled=progress_enabled, progress_label=f"{epoch_label} eval val",
+            )
+            eval_val_seconds = time.perf_counter() - eval_start
+        else:
+            current_a = current_b = LossMetrics(loss=float("nan"), accuracy=float("nan"), examples=0)
         if epoch == epochs - 1 and final_metrics_callback is not None:
             final_metrics_callback(current_a, current_b)
         mean_loss = 0.5 * (current_a.loss + current_b.loss)
@@ -1090,6 +1118,7 @@ def train_normalized_two_sided(
         )
         row = {
             "epoch": float(epoch),
+            "evaluated": float(evaluated),
             "loss_a": current_a.loss,
             "loss_b": current_b.loss,
             "train_accuracy": current_a.accuracy,
@@ -1105,8 +1134,10 @@ def train_normalized_two_sided(
             "train_gradient_weight": train_gradient_weight,
             "val_gradient_weight": val_gradient_weight,
         }
-        tokenizer_log = _append_tokenizer_metrics(row, current_a, current_b)
-        tokenizer_log += _record_token_norms(token_norm_recorder, epoch, current_a, current_b)
+        tokenizer_log = ""
+        if evaluated:
+            tokenizer_log = _append_tokenizer_metrics(row, current_a, current_b)
+            tokenizer_log += _record_token_norms(token_norm_recorder, epoch, current_a, current_b)
         rows.append(row)
         tokenizer_log += _finish_epoch_timing(
             row, epoch_start=epoch_start, train_seconds=train_seconds,
@@ -1119,6 +1150,11 @@ def train_normalized_two_sided(
                 geometry_rows.append({"epoch": float(epoch), **stats})
             _write_csv_rows(gradient_geometry_csv_path, geometry_rows, geometry_fields)
         if epoch % max(1, report_interval) == 0 or epoch == epochs - 1:
+            if not evaluated:
+                logger.info("epoch %d/%d: eval skipped lr=%.6g train_w=%.6g val_w=%.6g%s",
+                            epoch, epochs, optimizer.param_groups[0]["lr"], train_gradient_weight,
+                            val_gradient_weight, tokenizer_log)
+                continue
             logger.info(
                 "epoch %d/%d: train_loss=%.6g val_loss=%.6g train_acc=%.6g val_acc=%.6g mean_loss=%.6g abs_gap=%.6g relative_gap=%.6g objective=train-val=%.6g lr=%.6g train_w=%.6g val_w=%.6g%s",
                 epoch,
@@ -1551,6 +1587,9 @@ def parse_args() -> argparse.Namespace:
                         help="batch size for full-partition epoch evaluation; defaults to training batch size")
     parser.add_argument("--eval_num_workers", type=int, default=None,
                         help="decoder/loader workers for epoch evaluation; defaults to --num_workers")
+    parser.add_argument("--eval_last_10_percent", "--eval-last-10-percent", action="store_true",
+                        help="only run epoch-end train/val evaluation in the final ceil(epochs/10) epochs; "
+                             "symmetric-objective baseline evaluations required for updates are retained")
     parser.add_argument(
         "--loader_backend", "--loader-backend", choices=["auto", "pytorch", "dali"], default="auto",
         help="auto (default): DALI for ImageNet, PyTorch otherwise; DALI requires CUDA and NVIDIA DALI",
@@ -1725,6 +1764,10 @@ def _run_direction(
         train_partition_name,
         val_partition_name,
     )
+    if getattr(args, "eval_last_10_percent", False):
+        first_eval_epoch = _epoch_evaluation_start(epochs, True)
+        logger.info("epoch-end evaluation restricted to epochs %d-%d (1-based); gap checkpoints use these epochs",
+                    first_eval_epoch + 1, epochs)
     optimization_path = output_folder / f"optimization_{direction_name}.csv"
     geometry_path = output_folder / f"gradient_geometry_{direction_name}.csv"
     variance_path = output_folder / f"weight_variance_{direction_name}.csv"
@@ -1744,7 +1787,8 @@ def _run_direction(
 
     def record_epoch(row: dict[str, float]) -> None:
         variance_recorder.record(int(row["epoch"]))
-        gap_tracker.observe(row)
+        if row["evaluated"]:
+            gap_tracker.observe(row)
 
     # torch.compile is lazy: install the fixed hook before its first forward.
     # Captures are active only in epoch-end/final evaluation, never during the
@@ -1796,6 +1840,7 @@ def _run_direction(
                 progress_enabled=getattr(args, "progress", None), progress_label=direction_name,
                 eval_loader_a=eval_train_loader, eval_loader_b=eval_val_loader,
                 final_metrics_callback=retain_final_metrics,
+                eval_last_10_percent=getattr(args, "eval_last_10_percent", False),
             )
         else:
             rows = train_symmetric_objective(
@@ -1821,6 +1866,7 @@ def _run_direction(
                 progress_enabled=getattr(args, "progress", None), progress_label=direction_name,
                 eval_loader_a=eval_train_loader, eval_loader_b=eval_val_loader,
                 final_metrics_callback=retain_final_metrics,
+                eval_last_10_percent=getattr(args, "eval_last_10_percent", False),
             )
         save_model_state(str(final_model_path), model.state_dict(), model_type_name, dataset_type_name)
 
@@ -1901,6 +1947,13 @@ def _run_direction(
         },
         "batch_size": batch_size,
         "epochs": epochs,
+        "epoch_evaluation": {
+            "policy": "last_10_percent" if getattr(args, "eval_last_10_percent", False) else "every_epoch",
+            "first_epoch": _epoch_evaluation_start(epochs, getattr(args, "eval_last_10_percent", False)),
+            "last_epoch": epochs - 1,
+            "epoch_definition": "zero_based_epoch_after_updates",
+            "gap_checkpoint_scope": "evaluated_epochs_only",
+        },
         "objective_mode": args.objective,
         "gradient_weight_functions": {
             "train": args.train_gradient_weight_function,

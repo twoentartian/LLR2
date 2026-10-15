@@ -58,7 +58,7 @@ ViT norm measurement is enabled automatically. Use `--no-token_norms` to disable
 it, or `--token_norm_threshold VALUE` to change the reporting threshold. This
 threshold is a diagnostic choice, not a universal definition of artifacts.
 
-Each direction writes `token_norms_<direction>.csv`. Every epoch has separate
+Each direction writes `token_norms_<direction>.csv`. Each evaluated epoch has separate
 train/val rows for `patch`, `cls`, and (in the register model) `register_0` through
 `register_3`. Columns are:
 
@@ -104,11 +104,25 @@ metadata records `decoder_device=cpu` and the shared preprocessing source.
 Use `--eval_num_workers` to tune evaluation decoding independently of training,
 and `--eval_batch_size` to set its inference batch size. Both default to the
 training values. Loader workers default to 8 (`--num_workers 8`); DALI uses
-this as the decoder thread count per pipeline. Full A/B partitions and token
-norm statistics are still
-measured every epoch; evaluation has no subsampling or skipped epochs.
+this as the decoder thread count per pipeline. Evaluations cover full A/B
+partitions and token norm statistics, with no subsampling. By default they run
+every epoch.
 Final metrics reuse the last epoch's evaluation instead of repeating both
 complete passes after training.
+
+Add `--eval_last_10_percent` to skip diagnostic epoch-end evaluation until the
+final `ceil(epochs / 10)` epochs. For 90 epochs, only epochs 82-90 are evaluated;
+for 60, only epochs 55-60 (both examples use 1-based numbering). At least the
+final epoch is always evaluated. The optimization CSV still contains every
+epoch, with `evaluated=0` and `NaN` loss/accuracy/gap fields on skipped epochs;
+the log says `eval skipped`. Gradient updates, the learning-rate schedule,
+gradient geometry and weight variance continue throughout training. Token
+norm records and gap checkpoint rankings use evaluated epochs only.
+`summary.json` records the evaluation policy and its zero-based epoch range.
+For `difference` and `mean_relative_gap`, baseline evaluations used by the
+existing training algorithm are retained; this flag only skips the additional
+epoch-end diagnostic passes. The default `normalized_two_sided` update has no
+baseline evaluation passes.
 
 On the RTX 5090 server, an 8,192-image probe at batch size 128 improved from
 about 3,360 images/s with 4 decoder threads to 5,266 images/s with 12 threads.

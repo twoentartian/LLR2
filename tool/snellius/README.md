@@ -106,6 +106,15 @@ historical FP32 evaluation. Versioned preset 0/1/2 checkpoints retain their own
 recipes on resume; LLR2_PRESET applies to fresh runs. To compare historical
 FP32 validation metrics in a fresh run, set LLR2_EVAL_PRECISION=fp32.
 
+Updated local source uses persistent DALI pipelines for fresh ordinary training
+runs and saves each rank's training/validation reader and RNG state in the
+training checkpoint. Resume keeps this state across new scratch allocations;
+GPU count, batch, DALI version, recipe and underlying dataset must match.
+Old checkpoints without DALI state retain epoch-seeded pipeline recreation
+for compatibility. Logs and `run_config.dali_loader.pipeline_lifecycle`
+identify `persistent` versus `epoch_seeded`. Updating local source does not
+change a server training process that is already running.
+
 ## References
 
 - SURF filesystems: https://servicedesk.surf.nl/wiki/spaces/WIKI/pages/85295828/Snellius+filesystems

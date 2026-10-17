@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 from datetime import timedelta
 import json
 from pathlib import Path
@@ -21,6 +22,20 @@ from py_src.adapters import StandardAdapter
 from py_src.engine import Device, train, val
 from py_src.ml_setup.dataloader_util import DataloaderConfig, build_dataloader
 from py_src import distributed
+
+
+class _RankStateLoader:
+    def __init__(self, rank):
+        self.value = {"reader_rank": rank, "position": rank + 7}
+
+    def state_dict(self):
+        return dict(self.value)
+
+    def load_state_dict(self, state):
+        self.value = dict(state)
+
+    def runtime_info(self):
+        return {"backend": "test"}
 
 
 def _engine_worker(rank, size, directory):
@@ -58,18 +73,24 @@ def _engine_worker(rank, size, directory):
         assert actual_val.total_correct == expected_val.total_correct
 
         # Cover the rank-zero-only file write and every rank's saved RNG state.
-        from tool.generate_high_accuracy_model import save_training_checkpoint, load_training_checkpoint
+        from tool.generate_high_accuracy_model import save_training_checkpoint, load_training_checkpoint, restore_dataloader_states
         path = f"{directory}/checkpoint.pt"
+        loader = _RankStateLoader(rank)
         save_training_checkpoint(
             path, model=original, optimizer=None, lr_scheduler=None, scaler=None,
             completed_epoch=0, total_epochs=1, index=0, number_of_models=1,
             output_folder=directory, run_config={"model_type": "test", "dataset_type": "test"},
+            dataloader=loader,
         )
         distributed.barrier()
+        checkpoint = load_training_checkpoint(path)
+        loader.value = {}
+        restore_dataloader_states(checkpoint, loader, None, logging.getLogger(__name__))
+        assert loader.value == {"reader_rank": rank, "position": rank + 7}
         if rank == 0:
-            checkpoint = load_training_checkpoint(path)
             assert checkpoint["world_size"] == size
             assert len(checkpoint["rng_states_by_rank"]) == size
+            assert [states["train"]["reader_rank"] for states in checkpoint["dataloader_states_by_rank"]] == list(range(size))
             assert all(not name.startswith("module.") for name in checkpoint["state_dict"])
     finally:
         distributed.shutdown()

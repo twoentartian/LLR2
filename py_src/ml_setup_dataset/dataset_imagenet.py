@@ -56,6 +56,8 @@ class _DaliImageNetIterator:
         batch_transform: Optional[Callable] = None,
         reader_sample_count: Optional[int] = None,
         iterator_factory: Optional[Callable] = None,
+        checkpoint_signature: Optional[dict[str, Any]] = None,
+        epoch_seeded: bool = False,
     ):
         self._dali_iterator = dali_iterator
         self._sample_count = sample_count
@@ -65,13 +67,68 @@ class _DaliImageNetIterator:
         self._batch_transform = batch_transform
         self._reader_sample_count = reader_sample_count
         self._iterator_factory = iterator_factory
+        self._checkpoint_signature = checkpoint_signature
+        self._epoch_seeded = epoch_seeded
         self._epoch = 0
+        self._next_epoch = 0
+        self._checkpoint = None
+        self._active = False
+        self._last_pass_complete = True
 
     def set_epoch(self, epoch: int) -> None:
-        if self._iterator_factory is not None and epoch != self._epoch:
+        if self._active:
+            raise RuntimeError("Cannot change epoch during a DALI traversal")
+        if not self._epoch_seeded and epoch != self._next_epoch:
+            raise ValueError("DALI epoch does not match the reader state; restore the loader checkpoint first")
+        if self._epoch_seeded and epoch != self._epoch:
             self._dali_iterator = None
-            self._dali_iterator = self._iterator_factory(epoch)
-            self._epoch = epoch
+            self._checkpoint = None
+        self._epoch = epoch
+        self._next_epoch = epoch
+
+    def _ensure_iterator(self):
+        if self._dali_iterator is None:
+            self._dali_iterator = self._iterator_factory(
+                self._next_epoch, checkpoint=self._checkpoint, epoch_seeded=self._epoch_seeded,
+            )
+        if not self._epoch_seeded and self._checkpoint is None:
+            self._checkpoint = self._dali_iterator.checkpoints()[0]
+
+    def state_dict(self) -> dict[str, Any]:
+        """State at a completed logical epoch, including all repeated reader passes."""
+        if self._active or not self._last_pass_complete:
+            raise RuntimeError("Save DALI state only after a complete epoch")
+        return {"version": 1, "signature": self._checkpoint_signature,
+                "next_epoch": self._next_epoch, "epoch_seeded": self._epoch_seeded,
+                "checkpoint": self._checkpoint}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if self._active:
+            raise RuntimeError("Cannot restore an active DALI traversal")
+        if state.get("version") != 1 or state.get("signature") != self._checkpoint_signature:
+            raise ValueError("Incompatible DALI loader checkpoint (recipe, batch, sharding or DALI version changed)")
+        next_epoch = int(state["next_epoch"])
+        if next_epoch < 0 or (next_epoch > 0 and self._sample_count and
+                              not state["epoch_seeded"] and not state["checkpoint"]):
+            raise ValueError("DALI loader checkpoint is missing its reader state")
+        self._dali_iterator = None
+        self._checkpoint = state["checkpoint"]
+        self._epoch_seeded = state["epoch_seeded"]
+        self._epoch = self._next_epoch = next_epoch
+        self._last_pass_complete = True
+
+    def load_legacy_epoch(self, epoch: int) -> None:
+        """Old distributed checkpoints had epoch seeds instead of reader state."""
+        if self._active:
+            raise RuntimeError("Cannot restore an active DALI traversal")
+        self._epoch_seeded = True
+        self._dali_iterator = None
+        self._checkpoint = None
+        self._epoch = self._next_epoch = epoch
+
+    def runtime_info(self) -> dict[str, Any]:
+        return {"backend": "dali", "pipeline_lifecycle": "epoch_seeded" if self._epoch_seeded else "persistent",
+                "checkpoint_version": 1}
 
     def _finalize_batch(self, data, label):
         batch = (data, label)
@@ -80,8 +137,16 @@ class _DaliImageNetIterator:
         return batch
 
     def __iter__(self):
+        if self._active:
+            raise RuntimeError("Cannot traverse a DALI loader concurrently")
         if self._sample_count == 0:
+            self._next_epoch += 1
             return
+        self._ensure_iterator()
+        self._epoch = self._next_epoch
+        self._active = True
+        self._last_pass_complete = False
+        completed = False
         consumed = 0
         pending_data = None
         pending_label = None
@@ -135,8 +200,30 @@ class _DaliImageNetIterator:
 
             if pending_data is not None and not self._drop_last:
                 yield self._finalize_batch(pending_data, pending_label)
+            completed = True
         finally:
-            self._dali_iterator.reset()
+            self._active = False
+            if completed:
+                if self._epoch_seeded:
+                    self._dali_iterator = None
+                    self._checkpoint = None
+                else:
+                    # The global RA budget may stop partway through the last
+                    # padded reader pass. Finish that pass before reset (DALI
+                    # ignores resets of an unfinished reader epoch).
+                    while True:
+                        try:
+                            next(self._dali_iterator)
+                        except StopIteration:
+                            break
+                    self._dali_iterator.reset()
+                    self._checkpoint = self._dali_iterator.checkpoints()[0]
+                self._next_epoch += 1
+                self._last_pass_complete = True
+            else:
+                # A cancelled/short diagnostic traversal can restart from its
+                # saved epoch boundary without ever resetting an unfinished reader.
+                self._dali_iterator = None
 
     def __len__(self) -> int:
         if self._drop_last:
@@ -352,6 +439,7 @@ class DaliImageNetDataset(Dataset):
 
     def build_dataloader(self, default_batch_size: int, config, is_train: bool):
         try:
+            import nvidia.dali as dali
             from nvidia.dali.plugin.pytorch import DALIGenericIterator
             from nvidia.dali.plugin.base_iterator import LastBatchPolicy
         except ImportError as exc:
@@ -400,13 +488,17 @@ class DaliImageNetDataset(Dataset):
 
         reader_kwargs["random_shuffle"] = shuffle if use_train_pipeline else False
 
-        def make_iterator(epoch):
+        def make_iterator(epoch, *, checkpoint=None, epoch_seeded=False):
             readers = dict(reader_kwargs)
-            pipeline_options = None
-            if use_distributed:
+            pipeline_options = {"enable_checkpointing": not epoch_seeded}
+            if epoch_seeded:
                 readers["seed"] = config.seed + epoch
-                pipeline_options = {"seed": config.seed + rank + 1_000_003 * epoch,
-                                    "prefetch_queue_depth": config.prefetch_factor or 2}
+            pipeline_options.update(
+                seed=config.seed + rank + (1_000_003 * epoch if epoch_seeded else 0),
+                prefetch_queue_depth=config.prefetch_factor or 2,
+            )
+            if checkpoint is not None:
+                pipeline_options["checkpoint"] = checkpoint
             pipeline = build_dali_imagenet_pipeline(
                 reader_kwargs=readers, training=use_train_pipeline,
                 crop_size=train_crop if use_train_pipeline else val_crop, resize_size=val_resize,
@@ -422,14 +514,30 @@ class DaliImageNetDataset(Dataset):
             )
 
         return _DaliImageNetIterator(
-            make_iterator(0),
+            None,
             sample_count,
             batch_size,
             drop_last,
             repetitions=repetitions,
             batch_transform=config.collate_fn if use_mixup_cutmix else None,
             reader_sample_count=reader_sample_count,
-            iterator_factory=make_iterator if use_distributed else None,
+            iterator_factory=make_iterator,
+            # Explicit sub-sampling does not exhaust the reader; recreate only
+            # for this opt-in diagnostic mode, never for normal full epochs.
+            epoch_seeded=config.num_samples is not None and config.num_samples < len(self),
+            checkpoint_signature={
+                "dali_version": dali.__version__,
+                "rank": rank, "world_size": size, "batch_size": batch_size,
+                "base_sample_count": self.base_sample_count, "sample_count": sample_count,
+                # Node-local scratch roots can change across Slurm allocations.
+                # The underlying files/order must remain the same on restore.
+                "classes": self.classes, "is_train": is_train, "augmentation": self.augmentation,
+                "crop": (train_crop, val_resize, val_crop), "preset": self.preset_version,
+                "policy": self.auto_augment_policy, "interpolation": str(self.auto_augment_interpolation),
+                "erase": self.random_erase_prob, "repetitions": repetitions, "seed": config.seed,
+                "drop_last": drop_last, "shuffle": shuffle,
+                "prefetch_factor": config.prefetch_factor or 2,
+            },
         )
 
 

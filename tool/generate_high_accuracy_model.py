@@ -36,7 +36,7 @@ logger = logging.getLogger("generate_high_accuracy_model")
 
 LOG_CSV_HEADER = "epoch,training_loss,training_accuracy,validation_loss,validation_accuracy,lrs\n"
 TRAINING_CHECKPOINT_TYPE = "generate_high_accuracy_model"
-TRAINING_CHECKPOINT_VERSION = 1
+TRAINING_CHECKPOINT_VERSION = 2
 MAX_THREAD_PER_PROCESS = 8
 NumpyRngStateTuple: TypeAlias = tuple[str, npt.NDArray[np.uint32], int, int, float]
 TorchStateDict: TypeAlias = dict[str, Any]
@@ -246,13 +246,24 @@ def save_training_checkpoint(
     number_of_models: int,
     output_folder: str,
     run_config: dict[str, Any],
+    dataloader: Any = None,
+    validation_dataloader: Any = None,
 ) -> None:
+    loader_states = {
+        name: loader.state_dict() for name, loader in
+        (("train", dataloader), ("validation", validation_dataloader))
+        if callable(getattr(loader, "state_dict", None))
+    }
+    local_state = {"rng": _capture_rng_state(), "loaders": loader_states}
     rng_states = None
+    loader_states_by_rank = None
     if distributed.enabled():
-        rng_states = [None] * distributed.world_size()
-        torch.distributed.all_gather_object(rng_states, _capture_rng_state())
+        gathered_states: list[Any] = [None] * distributed.world_size()
+        torch.distributed.all_gather_object(gathered_states, local_state)
         if not distributed.is_main():
             return
+        rng_states = [state["rng"] for state in gathered_states]
+        loader_states_by_rank = [state["loaders"] for state in gathered_states]
     checkpoint = {
         "checkpoint_type": TRAINING_CHECKPOINT_TYPE,
         "checkpoint_version": TRAINING_CHECKPOINT_VERSION,
@@ -275,13 +286,39 @@ def save_training_checkpoint(
         "number_of_models": number_of_models,
         "output_folder": os.path.abspath(output_folder),
         "run_config": copy.deepcopy(run_config),
-        "rng_state": _capture_rng_state(),
+        "rng_state": local_state["rng"],
         "rng_states_by_rank": rng_states,
+        "dataloader_state": loader_states,
+        "dataloader_states_by_rank": loader_states_by_rank,
         "world_size": distributed.world_size(),
     }
     temp_path = f"{path}.tmp"
     torch.save(checkpoint, temp_path)
     os.replace(temp_path, path)
+
+
+def restore_dataloader_states(checkpoint: dict[str, Any], dataloader: Any,
+                              validation_dataloader: Any, child_logger: logging.Logger) -> None:
+    """Restore DALI before iteration; old runs retain their epoch-seeded streams."""
+    states_by_rank = checkpoint.get("dataloader_states_by_rank")
+    if states_by_rank is not None:
+        if len(states_by_rank) != distributed.world_size():
+            raise ValueError("DALI loader checkpoint world size does not match this run")
+        states = states_by_rank[distributed.rank()]
+    else:
+        states = checkpoint.get("dataloader_state", {})
+    for name, loader in (("train", dataloader), ("validation", validation_dataloader)):
+        if name in states:
+            if not callable(getattr(loader, "load_state_dict", None)):
+                raise ValueError(f"The saved {name} loader state requires a compatible backend")
+            loader.load_state_dict(states[name])
+            child_logger.info("restored %s loader state", name)
+        elif callable(getattr(loader, "load_legacy_epoch", None)):
+            if checkpoint.get("checkpoint_version", 1) >= 2:
+                raise ValueError(f"The {name} DALI state is missing from this checkpoint")
+            loader.load_legacy_epoch(int(checkpoint["next_epoch"]))
+            child_logger.warning("legacy %s DALI checkpoint has no reader state; using epoch-seeded "
+                                 "pipeline recreation for this run (old single-GPU DALI RNG cannot be replayed)", name)
 
 
 def load_training_checkpoint(path: str) -> dict[str, Any]:
@@ -293,10 +330,10 @@ def load_training_checkpoint(path: str) -> dict[str, Any]:
             f"{path} is not a generate_high_accuracy_model training checkpoint "
             f"(checkpoint_type={checkpoint_type!r})"
         )
-    if checkpoint_version != TRAINING_CHECKPOINT_VERSION:
+    if checkpoint_version not in (1, TRAINING_CHECKPOINT_VERSION):
         raise RuntimeError(
             f"{path} uses checkpoint_version={checkpoint_version}; "
-            f"expected {TRAINING_CHECKPOINT_VERSION}"
+            f"expected 1 (legacy) or {TRAINING_CHECKPOINT_VERSION}"
         )
     return checkpoint
 
@@ -538,6 +575,7 @@ def training_model(
         saved_size = resume_checkpoint.get("world_size", 1)
         if saved_size != distributed.world_size():
             raise ValueError(f"Resume requires the saved world size ({saved_size}); use model weights for a new run")
+        restore_dataloader_states(resume_checkpoint, dataloader, dataloader_test, child_logger)
         rank_states = resume_checkpoint.get("rng_states_by_rank")
         _restore_rng_state(rank_states[distributed.rank()] if rank_states else resume_checkpoint.get("rng_state"), child_logger)
 
@@ -578,6 +616,11 @@ def training_model(
 
     checkpoint_run_config = copy.deepcopy(run_config)
     checkpoint_run_config["epoch_override"] = arg_epoch_override
+    for name, loader in (("train", dataloader), ("validation", dataloader_test)):
+        if callable(getattr(loader, "runtime_info", None)):
+            child_logger.info("%s loader: %s", name, loader.runtime_info())
+    if callable(getattr(dataloader, "runtime_info", None)):
+        checkpoint_run_config["dali_loader"] = dataloader.runtime_info()
 
     progress_enabled = distributed.is_main() and _should_enable_progress_bar(arg_worker_count)
     if arg_worker_count == 1 and not progress_enabled:
@@ -669,6 +712,8 @@ def training_model(
             number_of_models=number_of_models,
             output_folder=output_folder,
             run_config=checkpoint_run_config,
+            dataloader=dataloader,
+            validation_dataloader=dataloader_test,
         )
         child_logger.info(
             "saved resumable training checkpoint after epoch %d to %s",

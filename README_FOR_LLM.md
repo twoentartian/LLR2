@@ -112,6 +112,7 @@
 - `_build()` 根据模型和数据集组合选择 LeNet、ResNet、CCT、Transformer/grokking、扩散模型等配置。
 - 这里还集中处理 ImageNet DALI setup 的选择和 `dali_device_id` 传递。
 - 高准确率训练和 misalignment 的 ImageNet DALI 图像操作共同使用 `py_src/ml_setup_dataset/dataset_imagenet.py` 的 `build_dali_imagenet_pipeline()`：CPU 解码、GPU 缩放和归一化。misalignment loader 只适配 A/B 文件列表、固定顺序和每轮 seed。
+- 普通训练的新 DALI loader 跨完整 epoch 复用 pipeline，增强 RNG 连续推进；checkpoint 保存训练/验证 loader 的 reader/RNG/iterator 状态，多卡按 rank 保存。旧 checkpoint 没有这些状态时继续使用逐 epoch 种子的兼容模式，不静默切换随机流。`run_config.dali_loader.pipeline_lifecycle` 标记 `persistent` 或 `epoch_seeded`。v3 的增强、RA3、label smoothing 0.11 和训练步数不变，但新运行不与旧逐轮重建运行逐位相同；misalignment 自己的 pass 重放规则保持独立。
 - 当一个模型和数据集组合没有实现时，会抛出 `NotImplementedError`；分析脚本遇到 “no setup” 时应先检查这里的分派逻辑。
 - CCT14 支持 `cct_14_7x2_224` + `imagenet21k_p`（CLI 也接受 `imagenet21k-p`）；入口为 `py_src/ml_setup/cct.py` 中的 `cct14_7x2_imagenet21k_p()`。默认数据根目录为 `~/dataset/imagenet21k_resized`，读取 `imagenet21k_train/` 和 `imagenet21k_val/`，分类头按实际类别目录数构建（服务器上为 10,450 类）。根路径可通过 `dataset_env.py` 的 `imagenet21k_p_path` 覆盖。
 

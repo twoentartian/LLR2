@@ -34,9 +34,18 @@ torchrun --standalone --nnodes=1 --nproc-per-node=4 \
 ```
 
 恢复沿用 checkpoint 的配置，不再重复传 `--dali`、`--amp` 或 `--batch_size`。
-DALI 的分布式训练 pipeline 按 epoch 重新设定 reader/augmentation seed，
-可以直接恢复到对应 epoch。PyTorch 多 worker 的随机增强仍不保证逐位重放。
+DALI 普通训练的新运行跨 epoch 复用训练/验证 pipeline，只重置完成的 reader pass。
+训练 checkpoint 保存各 rank 的 DALI reader、增强 RNG 和 iterator 状态，恢复后继续原来的随机流。
+恢复需保持 GPU 数、batch、DALI 版本、增强配方和数据文件/排序一致；数据根目录可以随
+Slurm 的 node-local scratch 改变。旧 checkpoint 没有 DALI 状态时，兼容模式仍按 epoch
+重建并恢复旧种子规则；日志和新 checkpoint 的 `run_config.dali_loader` 会标明
+`persistent` / `epoch_seeded`。旧单卡 DALI 未保存的随机流无法精确恢复。
+新的训练 checkpoint 格式为 `checkpoint_version=2`，新版仍读取格式 1；旧版程序会拒绝格式 2，
+避免忽略 DALI 状态后错误续训。该版本号与 `vit_preset_version` 独立。
+PyTorch 多 worker 的随机增强仍不保证逐位重放。
 分布式 DALI 暂不支持 `DataloaderConfig.num_samples` 子采样。
+单卡显式子采样属于诊断模式，因未读完整个 reader，仍按 epoch 重建。
+这项生命周期变更仅作用于普通训练；misalignment 的随机增强 pass 仍保留原有的 A/B 对称和重放规则。
 
 ## Misalignment
 

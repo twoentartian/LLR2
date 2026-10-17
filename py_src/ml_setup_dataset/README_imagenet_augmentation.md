@@ -119,6 +119,19 @@ DALI 2.3 自带的自动增强仍调用废弃别名 `fn.experimental.equalize`�
 不改动安装包或全局屏蔽警告。策略名称、操作顺序、概率和幅度保持原样，固定种子的实际 GPU
 图像/标签已与修复前管线逐项对照一致；此接口修复不构成新的增强配方。
 
+**普通训练的 DALI 生命周期：** 新运行保留训练和验证 pipeline，跨完整 epoch 复用 reader、
+增强图、解码线程和预取缓冲区，随机流连续推进。每个逻辑 epoch 仍执行相应的 RA3/RA4 预算；
+末尾只补读未结束的 reader 尾部以完成 reset，补读样本不进入训练。训练 checkpoint 保存各 rank 的
+训练/验证 loader 状态（包括 DALI reader、增强 RNG 和 iterator），恢复后可继续同一随机流。
+旧 checkpoint 缺少 loader 状态时，显式使用逐 epoch 重建/重新设种子的兼容模式，避免改变旧 DDP
+实验的后续随机流；旧单卡 DALI 的未保存 RNG 无法精确重放。
+`run_config.dali_loader.pipeline_lifecycle` 及日志记录 `persistent` / `epoch_seeded`。
+新的训练 checkpoint 使用格式 `checkpoint_version=2`，仍能读取旧格式 1；此版本号与 ViT preset
+语义版本独立，旧版训练程序会拒绝新版 checkpoint，避免忽略 reader 状态后静默改变随机流。
+单卡显式 `num_samples` 子采样仍需重建；正常完整训练无需重建。
+新生命周期不更改 v3 的增强选项、RA3、标签平滑或步数，但其随机序列与旧逐 epoch 设种子方案不同。
+该变更针对普通训练，misalignment 自己的 pass 生命周期不由此推断。
+
 ## 5. misalignment2 使用独立的 augmentation 参数
 
 `tool/misalignment_measurement_2.py` 通过 `--augmentation none/0/1/2` 控制图像增强，
@@ -188,5 +201,7 @@ optimizer/scheduler、随机种子和精度。普通训练的新运行默认 BF1
   [test_inference_precision.py](../../test/test_inference_precision.py)：当前 preset 的实际 loader / 标签 / 采样检查。
 - [test_vit_v3.py](../../test/test_vit_v3.py)：直接加载 `7484fdc` 历史源码，在同一后端、固定种子下
   比较实际图像、混合标签、采样数量和初始权重；覆盖四种 ViT、1k/21k-p、PyTorch/DALI。
+- [test_distributed_dali.py](../../test/test_distributed_dali.py)：实际 DALI 1/2/4 分片跨轮复用、RA3 尾部、
+  reader/RNG 状态恢复、旧 checkpoint 兼容和普通训练连续运行/断点恢复后的权重对照。
 
 后续若修改配方、默认尺寸、采样预算或 checkpoint 语义，应同步更新本文和对应测试。

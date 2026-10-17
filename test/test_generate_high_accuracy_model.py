@@ -628,6 +628,15 @@ class TestGenerateHighAccuracyModelCheckpointing(unittest.TestCase):
             )
 
             checkpoint = load_training_checkpoint(checkpoint_path)
+            self.assertEqual(checkpoint["checkpoint_version"], 2)
+            legacy = dict(checkpoint, checkpoint_version=1)
+            legacy.pop("dataloader_state")
+            legacy.pop("dataloader_states_by_rank")
+            torch.save(legacy, checkpoint_path)
+            self.assertEqual(load_training_checkpoint(checkpoint_path)["next_epoch"], 2)
+            torch.save(dict(legacy, checkpoint_version=99), checkpoint_path)
+            with self.assertRaisesRegex(RuntimeError, "checkpoint_version=99"):
+                load_training_checkpoint(checkpoint_path)
 
         self.assertEqual(checkpoint["checkpoint_type"], "generate_high_accuracy_model")
         self.assertEqual(checkpoint["completed_epoch"], 1)

@@ -152,7 +152,8 @@ class TestDaliLoaderGPU(unittest.TestCase):
         shared_builder = imagenet_module.build_dali_imagenet_pipeline
 
         def fixed_seed_builder(**options):
-            options["pipeline_kwargs"] = {"seed": 123, "prefetch_queue_depth": 2}
+            options["pipeline_kwargs"] = {**(options.get("pipeline_kwargs") or {}),
+                                          "seed": 123, "prefetch_queue_depth": 2}
             return shared_builder(**options)
 
         for level in (0, 1, 2):

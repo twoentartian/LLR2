@@ -559,6 +559,84 @@ class TestRunSingleBatch(unittest.TestCase):
         print(f"train loss:{train_result.avg_loss:.4f} train accuracy:{train_result.accuracy:.4f}")
 
 
+class TestGenerateHighAccuracyModelInitialization(unittest.TestCase):
+    def _assert_seeded_vit_initialization(self, *, disable_reinit: bool):
+        from torchvision.models.vision_transformer import VisionTransformer
+        from torch.utils.data import DataLoader, TensorDataset
+
+        from py_src.adapters import StandardAdapter
+        from py_src.ml_setup import ApplicationType
+        from py_src.ml_setup_model import ModelType
+        from tool import generate_high_accuracy_model as generation
+
+        previous_threads = torch.get_num_threads()
+        self.addCleanup(torch.set_num_threads, previous_threads)
+        torch.set_num_threads(1)
+        data = TensorDataset(
+            torch.arange(2 * 3 * 32 * 32, dtype=torch.float32).reshape(2, 3, 32, 32) / 6144,
+            torch.tensor([0, 1]),
+        )
+
+        def factory(*args, **kwargs):
+            model = VisionTransformer(
+                image_size=32, patch_size=16, num_layers=1, num_heads=2,
+                hidden_dim=16, mlp_dim=32, num_classes=2, dropout=0.1,
+            )
+            criterion = nn.CrossEntropyLoss()
+            return MLSetup(
+                model=model, adapter=StandardAdapter(model, criterion),
+                model_type=ModelType.vit_b_32, dataset_type=DatasetType.imagenet21k_p,
+                application_type=ApplicationType.classifier, criterion=criterion,
+                training_data=data, testing_data=data, default_batch_size=2,
+                override_train_loader=DataLoader(data, batch_size=2, shuffle=True),
+            )
+
+        initial_states, final_states = [], []
+        real_train = generation.train
+
+        def capture_train(adapter, *args, **kwargs):
+            initial_states.append({
+                name: value.detach().clone() for name, value in adapter.get_model().state_dict().items()
+            })
+            return real_train(adapter, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            for index, (parent_seed, run_seed) in enumerate(((101, 42), (909, 42), (101, 43))):
+                # Simulate independent processes with unrelated RNG states before main().
+                generation.set_seed(parent_seed)
+                output = os.path.join(directory, str(index))
+                argv = [
+                    "generation", "--cpu", "--no-compile", "--core", "1", "--epoch", "1",
+                    "--model_type", "vit_b_32", "--dataset_type", "imagenet21k_p",
+                    "--preset", "3", "--batch_size", "2", "--random_seed", str(run_seed),
+                    "--output_folder_name", output,
+                ]
+                if disable_reinit:
+                    argv.append("--disable_reinit")
+                with patch.object(sys, "argv", argv), \
+                     patch.object(generation, "get_ml_setup_from_config", side_effect=factory), \
+                     patch.object(generation, "train", side_effect=capture_train):
+                    generation.main()
+                checkpoint = load_training_checkpoint(os.path.join(output, "0", "training_checkpoint.pt"))
+                final_states.append(checkpoint["state_dict"])
+
+        for states in (initial_states, final_states):
+            for name, expected in states[0].items():
+                with self.subTest(disable_reinit=disable_reinit, parameter=name):
+                    torch.testing.assert_close(expected, states[1][name], rtol=0, atol=0)
+            for name in (
+                "encoder.pos_embedding",
+                "encoder.layers.encoder_layer_0.self_attention.in_proj_weight",
+            ):
+                self.assertFalse(torch.equal(states[0][name], states[2][name]), name)
+
+    def test_seed_reproduces_vit_initialization_and_training(self):
+        self._assert_seeded_vit_initialization(disable_reinit=False)
+
+    def test_seed_reproduces_vit_with_reinitialization_disabled(self):
+        self._assert_seeded_vit_initialization(disable_reinit=True)
+
+
 class TestGenerateHighAccuracyModelCheckpointing(unittest.TestCase):
     def test_training_checkpoint_round_trip_preserves_latest_training_state(self):
         model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))

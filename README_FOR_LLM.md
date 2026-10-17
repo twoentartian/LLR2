@@ -20,6 +20,7 @@
 - 支持从头初始化、指定初始模型、迁移学习、从 `training_checkpoint.pt` 恢复，以及用另一个模型构造 opposite-direction 初始化。
 - 每个模型会写出 `.model.pt`、`.optimizer.pt`、`*.log.csv`；启用中间保存时还会写 epoch checkpoint。输出目录还包含 `info.json`、训练配置和可恢复训练状态。
 - `training_model()` 是单个模型的主要训练流程；`save_training_checkpoint()` / `load_training_checkpoint()` 负责可恢复训练。
+- 新训练的 `--random_seed` 必须在 `main()` 调用模型工厂前设置，才能固定 ViT 位置编码和 attention QKV 等仅在构造时初始化的参数；worker 内仍重新设置种子以控制训练随机流。不要只依赖 `re_initialize_model()`，它只调用公开的 `reset_parameters()`。续训仍恢复 checkpoint 的参数与各 rank RNG 状态；固定初始化种子不代表 CUDA 训练全程逐位确定。
 - `torchrun --standalone --nproc-per-node=2/4` 支持单节点、单模型 DDP 分类训练和 DALI；batch size 为全局大小，rank 0 写文件，checkpoint 保存各 rank RNG。公共运行时在 `py_src/distributed.py`，用法与 Snellius 脚本见 `tool/README_multi_gpu.md`。
 
 ### `tool/generate_grokking.py`

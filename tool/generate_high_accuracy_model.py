@@ -912,6 +912,10 @@ def main():
             )
         ]
     else:
+        # Seed constructor-only parameters too (e.g. ViT positional embeddings
+        # and attention QKV weights); worker re-initialisation does not reset them.
+        if args.random_seed is not None:
+            set_seed(args.random_seed)
         current_ml_setup = get_ml_setup_from_config(
             args.model_type,
             args.dataset_type,

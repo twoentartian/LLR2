@@ -8,12 +8,18 @@ runners do not provide CUDA GPUs. Run it manually on a CUDA machine with DALI:
 
 from __future__ import annotations
 
+import ast
+import linecache
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
+from unittest.mock import patch
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -55,6 +61,83 @@ def _write_tiny_imagenet10(root: Path, image_size: int = 256) -> None:
 
 
 class TestDaliImageNetTraining(unittest.TestCase):
+    def test_equalize_uses_regular_operator_in_autoaugment_and_v2(self) -> None:
+        _require_cuda_and_dali()
+        from nvidia.dali import fn
+
+        if not hasattr(fn, "equalize"):
+            self.skipTest("Regular equalize requires a newer DALI release")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            self._write_pattern_images(root)
+            for version, policy in ((1, "imagenet"), (2, None)):
+                with self.subTest(version=version, policy=policy), \
+                     warnings.catch_warnings(record=True) as caught, \
+                     patch.object(fn.experimental, "equalize", create=True,
+                                  side_effect=AssertionError("Deprecated equalize alias was called")):
+                    warnings.simplefilter("always", DeprecationWarning)
+                    pipeline = self._augmentation_pipeline(root, version, policy)
+                    images, _ = pipeline.run()
+                    self.assertEqual(images.as_cpu().as_array().shape, (4, 3, 32, 32))
+                    self.assertFalse(any("equalize" in str(item.message) for item in caught))
+                    del pipeline
+
+    def test_seeded_pixels_match_pipeline_before_equalize_fix(self) -> None:
+        _require_cuda_and_dali()
+        # Load the actual pre-fix builder, including its upstream convenience
+        # wrappers, so a change to policy ordering or RNG consumption is detected.
+        repository = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            ["git", "show", "8ec69b1:py_src/ml_setup_dataset/dataset_imagenet.py"],
+            cwd=repository, capture_output=True, text=True,
+        )
+        if result.returncode:
+            self.skipTest("Pre-fix commit 8ec69b1 is unavailable")
+        filename = "git:8ec69b1:dataset_imagenet.py"
+        linecache.cache[filename] = (len(result.stdout), None, result.stdout.splitlines(True), filename)
+        node = next(item for item in ast.parse(result.stdout).body
+                    if isinstance(item, ast.FunctionDef) and item.name == "build_dali_imagenet_pipeline")
+        namespace = dict(vars(dataset_imagenet_module))
+        exec(compile(ast.Module(body=[node], type_ignores=[]), filename, "exec"), namespace)
+        baseline_builder = namespace["build_dali_imagenet_pipeline"]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            self._write_pattern_images(root)
+            for version, policy in ((1, "imagenet"), (2, None)):
+                with self.subTest(version=version, policy=policy), warnings.catch_warnings():
+                    warnings.simplefilter("ignore", DeprecationWarning)
+                    baseline = self._augmentation_pipeline(root, version, policy, baseline_builder)
+                    current = self._augmentation_pipeline(root, version, policy)
+                    for _ in range(3):
+                        old_images, old_labels = baseline.run()
+                        new_images, new_labels = current.run()
+                        np.testing.assert_array_equal(new_images.as_cpu().as_array(),
+                                                      old_images.as_cpu().as_array())
+                        np.testing.assert_array_equal(new_labels.as_array(), old_labels.as_array())
+                    del baseline, current
+
+    @staticmethod
+    def _write_pattern_images(root):
+        pattern = (np.arange(128 * 140 * 3).reshape(128, 140, 3) % 251).astype(np.uint8)
+        for label in range(2):
+            folder = root / f"class{label}"
+            folder.mkdir()
+            for index in range(4):
+                Image.fromarray(np.roll(pattern, label * 17 + index * 5, axis=1)).save(folder / f"{index}.jpg")
+
+    @staticmethod
+    def _augmentation_pipeline(root, version, policy, builder=None):
+        builder = builder or dataset_imagenet_module.build_dali_imagenet_pipeline
+        pipeline = builder(
+            reader_kwargs=dict(file_root=str(root), random_shuffle=True, seed=71, name="Reader"),
+            training=True, crop_size=32, batch_size=4, num_threads=1, device_id=0,
+            preset_version=version, auto_augment_policy=policy,
+            random_erase_prob=0.1 if version == 2 else 0.0,
+            pipeline_kwargs=dict(seed=2026),
+        )
+        pipeline.build()
+        return pipeline
+
     def test_resnet18_imagenet10_dali_train_and_val_one_batch(self) -> None:
         _require_cuda_and_dali()
 

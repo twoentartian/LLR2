@@ -26,8 +26,10 @@ the cuda130 package name for its CUDA 13 build, including when paired with
 CUDA 13.2 PyTorch. The bundle also installs rapidgzip and the imports used by
 LLR2's setup package. Source changes, including the corrected ViT presets and
 BF16 evaluation, must be transferred via the user's GitHub workflow before
-submitting training. The batch script checks VIT_PRESET_VERSION=2 and VIT_LEGACY_PRESET=3 before
-extraction, so an older source checkout fails early.
+submitting training. Include new files such as `py_src/precision.py` in the
+GitHub commit; updating previously tracked files alone is insufficient. The
+batch script checks VIT_PRESET_VERSION=2, VIT_LEGACY_PRESET=3, and the presence
+of `py_src/precision.py` before extraction, so an incomplete checkout fails early.
 
 ## Dataset configuration
 

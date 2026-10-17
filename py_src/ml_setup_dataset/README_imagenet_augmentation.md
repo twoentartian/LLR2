@@ -114,6 +114,11 @@ PyTorch 和 DALI 使用各自的随机裁剪、插值、增强和 RNG 实现，�
 当前共享 DALI pipeline 是 CPU JPEG 解码，之后在 GPU 做缩放、增强和归一化；
 随机擦除的矩形采样/边界处理也与 torchvision 实现不同。保持配方选项一致不代表像素完全相同。
 
+DALI 2.3 自带的自动增强仍调用废弃别名 `fn.experimental.equalize`。共享 pipeline 通过公开的
+自定义 policy/suite 接口，把 Equalize 替换为正式的 `fn.equalize`（旧 DALI 无此接口时保留兼容路径）；
+不改动安装包或全局屏蔽警告。策略名称、操作顺序、概率和幅度保持原样，固定种子的实际 GPU
+图像/标签已与修复前管线逐项对照一致；此接口修复不构成新的增强配方。
+
 ## 5. misalignment2 使用独立的 augmentation 参数
 
 `tool/misalignment_measurement_2.py` 通过 `--augmentation none/0/1/2` 控制图像增强，

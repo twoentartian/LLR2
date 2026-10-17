@@ -144,6 +144,16 @@ class _DaliImageNetIterator:
         return math.ceil(self._sample_count / self._batch_size)
 
 
+def _dali_equalize(data, _):
+    """Use the promoted operator; older DALI releases only have the alias."""
+    from nvidia.dali import fn
+
+    equalize = getattr(fn, "equalize", None)
+    if equalize is None:
+        equalize = fn.experimental.equalize
+    return equalize(data)
+
+
 def build_dali_imagenet_pipeline(
     *, reader_kwargs: dict[str, Any], training: bool, crop_size: int,
     batch_size: int, num_threads: int, device_id: int, resize_size: int = 256,
@@ -165,6 +175,7 @@ def build_dali_imagenet_pipeline(
     from nvidia.dali.auto_aug import auto_augment as dali_auto_augment
     from nvidia.dali.auto_aug import rand_augment as dali_rand_augment
     from nvidia.dali.auto_aug import trivial_augment as dali_trivial_augment
+    from nvidia.dali.auto_aug.core import Policy, augmentation
 
     dali_rgb = getattr(types, "RGB")
     dali_interp_linear = getattr(types, "INTERP_LINEAR")
@@ -176,6 +187,28 @@ def build_dali_imagenet_pipeline(
     use_preset_v2_augmentations = preset_version == 2 and auto_augment_policy is None
     preset_v2_fill_value = 0
     preset_v2_interp = dali_interp_nearest
+
+    # DALI 2.3's built-in suites still call the deprecated experimental.equalize.
+    # Use its public custom-policy API, preserving names, ordering, probabilities
+    # and magnitudes so that seeded augmentation streams remain unchanged.
+    equalize = augmentation(_dali_equalize, name="equalize")
+
+    def replace_equalize(aug):
+        return equalize if aug.name == "equalize" else aug
+
+    if training and auto_augment_policy is not None:
+        original = dali_auto_augment.get_image_net_policy(use_shape=True)
+        policy = Policy(
+            original.name, original.num_magnitude_bins,
+            [[(replace_equalize(aug), probability, magnitude)
+              for aug, probability, magnitude in sub_policy]
+             for sub_policy in original.sub_policies],
+        )
+    elif training and use_preset_v2_augmentations:
+        trivial_suite = [replace_equalize(aug) for aug in
+                         dali_trivial_augment.get_trivial_augment_wide_suite(use_shape=True)]
+        rand_suite = [replace_equalize(aug) for aug in
+                      dali_rand_augment.get_rand_augment_suite(use_shape=True)]
 
     def apply_random_erasing(images):
         if random_erase_prob <= 0.0:
@@ -226,21 +259,23 @@ def build_dali_imagenet_pipeline(
         mirror = fn.random.coin_flip(probability=0.5)
         images = fn.flip(images, horizontal=mirror)
         if auto_augment_policy is not None:
-            images = dali_auto_augment.auto_augment(
+            images = dali_auto_augment.apply_auto_augment(
+                policy,
                 images,
-                policy_name=auto_augment_policy,
                 shape=(crop_size, crop_size),
                 fill_value=auto_augment_fill_value,
                 interp_type=auto_augment_interp,
             )
         elif use_preset_v2_augmentations:
-            images = dali_trivial_augment.trivial_augment_wide(
+            images = dali_trivial_augment.apply_trivial_augment(
+                trivial_suite,
                 images,
                 shape=(crop_size, crop_size),
                 fill_value=preset_v2_fill_value,
                 interp_type=preset_v2_interp,
             )
-            images = dali_rand_augment.rand_augment(
+            images = dali_rand_augment.apply_rand_augment(
+                rand_suite,
                 images,
                 n=2,
                 m=9,

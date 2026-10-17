@@ -224,14 +224,11 @@ class FastTrainingSetup:
 
         elif mt in (ModelType.vit_b_32, ModelType.vit_b_32_reg4, ModelType.vit_b_32_rope, ModelType.vit_b_32_swiglu):
             if dt in (DatasetType.imagenet1k, DatasetType.imagenet21k_p):
-                # Torchvision's recipe is defined in epochs, while LLR2 steps the
-                # scheduler after every optimizer update.
-                initial_lr, weight_decay = 5e-4, 5e-2 # DeiT style
-                warmup_decay, warmup_epochs, epochs = 0.033, 30, 300
-                if dt == DatasetType.imagenet21k_p:
-                    # Reuse the project's 21k-p pretraining budget; all four
-                    # ViT variants share the same optimizer and schedule.
-                    warmup_epochs, epochs = 5, 90
+                # All four ViT variants use the same 90/5 budget on 1k and 21k-p.
+                # LLR2 steps the scheduler after every optimizer update.
+                initial_lr = 5e-4 if dt == DatasetType.imagenet1k else 3e-4
+                weight_decay = 5e-2
+                warmup_decay, warmup_epochs, epochs = 0.033, 5, 90
                 warmup_steps = warmup_epochs * steps_per_epoch
                 total_steps = epochs * steps_per_epoch
 

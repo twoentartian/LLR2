@@ -122,7 +122,7 @@
 
 - `FastTrainingSetup.get_optimizer_lr_scheduler_epoch()` 根据 model、dataset 和 preset 返回 optimizer、scheduler 和 epoch 数。
 - ViT-B/32 的 register 对照模型名为 `vit_b_32_reg4`，增加 4 个无位置编码的可学习 tokens；同 seed 下共同权重与 `vit_b_32` 初始化一致，通用训练 recipe 复用原版设置。
-- ViT-B/32、register、RoPE、SwiGLU 均支持 `imagenet21k_p`（也接受 `imagenet21k-p` / `imagenet21kp` / `imagenet21k`），分类头与 Mixup/CutMix 按实际类别数配置；21k-p 普通训练为 AdamW lr=5e-4、wd=0.05、90 epochs / 5 warmup。两个训练入口均可接 DALI 和单节点多卡；misalignment 的 21k-p 增强仅支持 none/0、1，level 2 提前报错。
+- ViT-B/32、register、RoPE、SwiGLU 均支持 `imagenet21k_p`（也接受 `imagenet21k-p` / `imagenet21kp` / `imagenet21k`），分类头与 Mixup/CutMix 按实际类别数配置；普通训练采用 AdamW，ImageNet-1k 峰值 lr=5e-4、21k-p 峰值 lr=3e-4，均为 wd=0.05、90 epochs / 5 warmup，之后 85 epochs cosine。该预算替代了历史 1k 的 300/30，不应据此重解释旧实验；恢复旧 checkpoint 仍加载已保存的 scheduler。两个训练入口均可接 DALI 和单节点多卡；misalignment 的 21k-p 增强仅支持 none/0、1，level 2 提前报错。
 - ViT 普通训练的 preset 0/1/2/3 分别为无增强、项目 ImageNet v1、项目 v2、v3（旧 ViT 配方，均保持 224 输入）。0/1 禁用 Mixup/CutMix、重复增强及 label smoothing；2 使用强增强、smoothing 0.1、RA4；3 为 ImageNet AutoAugment + Mixup/CutMix(0.2/1.0) + RA3 + smoothing 0.11。历史 0/1 checkpoint 无语义版本时明确迁移到 3，并保留原编号；新语义仍为 `vit_preset_version=2`。SURF sbatch 默认 3。misalignment2 的 ViT 默认 `--model_preset 3` 恢复历史损失，图片增强仍由 `--augmentation` 独立控制。
 - 覆盖 SGD、Adam/AdamW、OneCycle、Cosine、MultiStep、warmup 等训练 recipe，并根据 dataloader 的 steps-per-epoch 换算 scheduler 步数。
 - `TransferTrainingSetup.get_optimizer_lr_scheduler_epoch()` 定义允许的迁移学习组合和对应的优化器配置。

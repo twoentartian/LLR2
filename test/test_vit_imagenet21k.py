@@ -95,7 +95,7 @@ def test_factory_train_val_and_checkpoint(tmp_path, model_name, dali, preset):
             setup, setup.model, override_steps_per_epoch=len(train_loader),
         )
         assert epochs == 90
-        assert optimizer.param_groups[0]["initial_lr"] == pytest.approx(5e-4)
+        assert optimizer.param_groups[0]["initial_lr"] == pytest.approx(3e-4)
         assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.05)
         assert scheduler._schedulers[0].total_iters == 5 * len(train_loader)
         result = train(setup.adapter, train_loader, optimizer, scheduler, device=device)

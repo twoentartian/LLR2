@@ -167,6 +167,12 @@ optimizer/scheduler、随机种子和精度。普通训练的新运行默认 BF1
 可传 `--eval_precision fp32`，SURF 对应 `LLR2_EVAL_PRECISION=fp32`。
 恢复相同配方不等于跨后端、跨 GPU 数或跨软件版本逐位复现。
 
+**当前普通训练预算：** 四种 ViT 均采用 AdamW，ImageNet-1k 峰值 LR 为 `5e-4`，21k-p 为 `3e-4`，
+weight decay `0.05`、总计 90 epochs（前 5 epochs 线性 warmup，后 85 epochs cosine）。
+这是当前本机的训练预算；历史 ImageNet-1k 的 300 epochs / 30 warmup 和此前 21k-p 的 `5e-4` LR
+应按实际运行源码识别，不能因增强同为 v3 而视为同一训练预算。恢复旧 checkpoint 仍加载保存的
+optimizer/scheduler 状态，不会自动把旧调度压缩成 90/5。misalignment 的调度参数由自己的入口控制。
+
 ## 6. 后续 LLM 如何识别和描述旧实验
 
 1. 先定位入口脚本、实际运行 commit 和 dirty working-tree 记录。对历史代码用

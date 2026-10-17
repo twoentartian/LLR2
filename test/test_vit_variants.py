@@ -164,7 +164,7 @@ class TestViTVariants(unittest.TestCase):
                     optimizer, scheduler, epochs = FastTrainingSetup.get_optimizer_lr_scheduler_epoch(built, built.model)
                     self.assertIsInstance(optimizer, torch.optim.AdamW)
                     self.assertIsInstance(scheduler, torch.optim.lr_scheduler.SequentialLR)
-                    self.assertEqual(epochs, 300)
+                    self.assertEqual(epochs, 90)
                     nn.init.normal_(built.model.heads.head.weight, std=0.1)
                     built.model.eval()
                     with tempfile.TemporaryDirectory() as directory:

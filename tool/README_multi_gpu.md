@@ -114,7 +114,10 @@ Mixup/CutMix、label smoothing 0.1 和重复增强（4 次）。DALI 的 v2 每 
 两种后端的重复增强预算仍需分别计算。
 `3` 为历史兼容 v3：ImageNet AutoAugment、Mixup/CutMix(0.2/1.0)、label smoothing 0.11、
 RA3，无随机擦除，DALI 每 epoch 约三遍数据。SURF 专用 sbatch 默认 3；直接调用普通训练时传 `--preset 3`。
-优化器仍为 AdamW、lr 5e-4、weight decay 0.05；21k-p 为 90 epochs、5 epochs warmup 后 cosine。
+普通训练优化器为 AdamW、weight decay 0.05；ImageNet-1k 峰值 lr 为 5e-4，
+21k-p 峰值 lr 为 3e-4。1k/21k-p 均为 90 epochs，
+前 5 epochs warmup，后 85 epochs cosine。历史 1k 的 300/30 预算不再用于新训练；
+恢复旧 checkpoint 时仍沿用其已保存的 scheduler 状态。
 `-e` 可覆盖普通训练的 epoch 数，已有 scheduler 的总预算仍来自 recipe。
 修复前 ViT 的 preset 0/1 都使用 AutoAugment、Mixup/CutMix、label smoothing 0.11
 及 3 次重复增强，现在完整保留为 preset 3。新 checkpoint 用 `vit_preset_version=2` 记录语义；

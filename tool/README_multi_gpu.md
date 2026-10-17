@@ -93,12 +93,33 @@ torchrun --standalone --nnodes=1 --nproc-per-node=4 \
   --loader_backend dali --augmentation 1 --skip_relative_flatness
 ```
 
-21k-p 普通 ViT 训练复用现有 ViT recipe（224 输入、ImageNet AutoAugment、
-Mixup/CutMix、label smoothing 0.11、AdamW、lr 5e-4、weight decay 0.05），
-训练预算采用项目已有的 21k-p 设置：90 epochs、5 epochs warmup 后 cosine。
+完整参数、旧 ViT 配方和历史结果识别规则见
+[ImageNet 增强配方对照](../py_src/ml_setup_dataset/README_imagenet_augmentation.md)。
+
+ViT 四种变体在 ImageNet-1k/21k-p 上统一使用 224 输入和项目的 preset 定义：
+`0` 为确定性缩放、中心裁剪、归一化，不使用增强、Mixup/CutMix、重复增强或 label smoothing；
+`1` 为基础随机裁剪、翻转，也不使用 Mixup/CutMix、重复增强或 label smoothing；
+`2` 使用项目 ImageNet v2 的 TrivialAugmentWide、RandAugment、随机擦除、
+Mixup/CutMix、label smoothing 0.1 和重复增强（4 次）。DALI 的 v2 每 epoch 读取
+四遍数据；PyTorch 分布式 RASampler 保留其选取规则，每 epoch 总采样量约为原始数据量。
+两种后端的重复增强预算仍需分别计算。
+`3` 为历史兼容 v3：ImageNet AutoAugment、Mixup/CutMix(0.2/1.0)、label smoothing 0.11、
+RA3，无随机擦除，DALI 每 epoch 约三遍数据。SURF 专用 sbatch 默认 3；直接调用普通训练时传 `--preset 3`。
+优化器仍为 AdamW、lr 5e-4、weight decay 0.05；21k-p 为 90 epochs、5 epochs warmup 后 cosine。
 `-e` 可覆盖普通训练的 epoch 数，已有 scheduler 的总预算仍来自 recipe。
-misalignment 不使用普通训练的 batch Mixup/CutMix，21k-p 仅支持 augmentation
-`none/0` 与 `1`；`2` 会在加载数据前报错。其默认 optimizer 为 AdamW，
+修复前 ViT 的 preset 0/1 都使用 AutoAugment、Mixup/CutMix、label smoothing 0.11
+及 3 次重复增强，现在完整保留为 preset 3。新 checkpoint 用 `vit_preset_version=2` 记录语义；
+识别到未带版本的旧 preset 0/1 checkpoint 时明确迁移到 3，并记录原编号，保留原训练配方。
+
+`engine.val()` 和两个训练脚本的评估默认优先原生 CUDA BF16；CPU 或不支持原生
+BF16 的设备回退到 FP32。`--eval_precision fp32` 可显式使用 FP32，且与训练
+`--amp` 独立。普通训练保存/恢复该配置，misalignment 在 summary 的 runtime 中记录实际
+评估 dtype；相对 flatness 继续用 FP32。普通训练 AMP 仍为 FP16；misalignment
+训练 AMP 保留原先的 BF16 优先策略，未启用 fused optimizer。
+misalignment 不使用普通训练的 batch Mixup/CutMix。
+`--model_preset` 默认对 ViT 选择 3、恢复历史 smoothing=0.11，其他 ImageNet 模型仍默认 1。
+21k-p 的 `--augmentation` 仅支持 `none/0` 与 `1`；`2` 会在加载数据前报错。
+其默认 optimizer 为 AdamW，
 lr 5e-4、weight decay 0.05、90 epochs、5 epochs warmup，scheduler 默认仍为
 fixed，可通过现有 CLI 参数覆盖。ImageNet-1k 的原有设置保持不变。
 

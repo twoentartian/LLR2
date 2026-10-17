@@ -16,6 +16,7 @@
 高准确率分类/生成模型 checkpoint 的通用训练入口。
 
 - 根据模型和数据集配置建立 `MLSetup`，然后训练一个或多个模型；支持 CPU/CUDA、AMP、`torch.compile`、DALI、验证集评估和多进程并行。
+- `engine.val()`、普通训练和 misalignment2 的纯评估默认原生 CUDA BF16，不支持时用 FP32；`--eval_precision fp32` 可覆盖，独立于训练 AMP。公共策略在 `py_src/precision.py`，不转换模型/optimizer 的存储 dtype。相对 flatness 保持 FP32。
 - 支持从头初始化、指定初始模型、迁移学习、从 `training_checkpoint.pt` 恢复，以及用另一个模型构造 opposite-direction 初始化。
 - 每个模型会写出 `.model.pt`、`.optimizer.pt`、`*.log.csv`；启用中间保存时还会写 epoch checkpoint。输出目录还包含 `info.json`、训练配置和可恢复训练状态。
 - `training_model()` 是单个模型的主要训练流程；`save_training_checkpoint()` / `load_training_checkpoint()` 负责可恢复训练。
@@ -95,6 +96,14 @@
 
 ## 重要依赖库文件
 
+### ImageNet 增强与历史 ViT 实验
+
+先阅读 [ImageNet 增强配方对照](py_src/ml_setup_dataset/README_imagenet_augmentation.md)。
+文档列出 v3（旧 ViT，历史 preset 0/1 均启用 AutoAugment、Mixup/CutMix、RA3、smoothing 0.11）
+与项目 v1/v2 的区别、ViT 固定 224 输入、PyTorch/DDP/DALI 的每 epoch 训练量差异，
+以及 misalignment 独立增强和 criterion 的影响。历史运行必须结合实际 commit/配置判断，
+不能把旧 preset 0 标成无增强，或把所有旧实验统称为项目 v2。
+
 ### `py_src/ml_setup/factory.py`
 
 模型/数据集配置的总路由。
@@ -113,6 +122,7 @@
 - `FastTrainingSetup.get_optimizer_lr_scheduler_epoch()` 根据 model、dataset 和 preset 返回 optimizer、scheduler 和 epoch 数。
 - ViT-B/32 的 register 对照模型名为 `vit_b_32_reg4`，增加 4 个无位置编码的可学习 tokens；同 seed 下共同权重与 `vit_b_32` 初始化一致，通用训练 recipe 复用原版设置。
 - ViT-B/32、register、RoPE、SwiGLU 均支持 `imagenet21k_p`（也接受 `imagenet21k-p` / `imagenet21kp` / `imagenet21k`），分类头与 Mixup/CutMix 按实际类别数配置；21k-p 普通训练为 AdamW lr=5e-4、wd=0.05、90 epochs / 5 warmup。两个训练入口均可接 DALI 和单节点多卡；misalignment 的 21k-p 增强仅支持 none/0、1，level 2 提前报错。
+- ViT 普通训练的 preset 0/1/2/3 分别为无增强、项目 ImageNet v1、项目 v2、v3（旧 ViT 配方，均保持 224 输入）。0/1 禁用 Mixup/CutMix、重复增强及 label smoothing；2 使用强增强、smoothing 0.1、RA4；3 为 ImageNet AutoAugment + Mixup/CutMix(0.2/1.0) + RA3 + smoothing 0.11。历史 0/1 checkpoint 无语义版本时明确迁移到 3，并保留原编号；新语义仍为 `vit_preset_version=2`。SURF sbatch 默认 3。misalignment2 的 ViT 默认 `--model_preset 3` 恢复历史损失，图片增强仍由 `--augmentation` 独立控制。
 - 覆盖 SGD、Adam/AdamW、OneCycle、Cosine、MultiStep、warmup 等训练 recipe，并根据 dataloader 的 steps-per-epoch 换算 scheduler 步数。
 - `TransferTrainingSetup.get_optimizer_lr_scheduler_epoch()` 定义允许的迁移学习组合和对应的优化器配置。
 - 训练脚本的 `--preset` 默认值会影响学习率、weight decay、scheduler 和总 epoch；显式 CLI 参数通常会覆盖这些默认值。

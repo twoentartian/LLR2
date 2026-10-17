@@ -1,8 +1,12 @@
 # Misalignment ImageNet loading
 
+For exact project v1/v2 recipes, historical ViT augmentation, and the distinction
+between ordinary training presets and misalignment levels, see
+[ImageNet augmentation](../../py_src/ml_setup_dataset/README_imagenet_augmentation.md).
+
 `misalignment_measurement_2.py` and `misalignment_cct_entry.py` accept
 `--loader_backend auto|pytorch|dali`. The default `auto` selects DALI for
-ImageNet-1k and PyTorch for MNIST, CIFAR-10/100 and modular data. Existing
+ImageNet-1k/21k-p and PyTorch for MNIST, CIFAR-10/100 and modular data. Existing
 ImageNet launch scripts need no extra flag. Use `--loader_backend pytorch`
 to compare with the previous loader or run ImageNet on CPU. DALI requires
 CUDA and a working NVIDIA DALI installation in the executing Python
@@ -21,11 +25,13 @@ Both halves use the same augmentation level, regardless of their train/val
 role. This also applies to evaluation and relative flatness, matching the
 experiment's existing augmentation policy:
 
-- `none/0`: mixed JPEG decode, GPU bilinear resize and center crop, normalize.
-- `1`: mixed random-crop decode, GPU resize, horizontal flip, normalize.
+- `none/0`: CPU JPEG decode, GPU bilinear resize and center crop, normalize.
+- `1`: CPU random-crop decode, GPU resize, horizontal flip, normalize.
 - `2`: level 1 plus TrivialAugmentWide, RandAugment (2 operations, magnitude 9)
-  and random erasing (p=0.1) before normalization. Erase rectangles use ten
-  rejection attempts rather than clamping an invalid rectangle to the image.
+  and random erasing (p=0.1). Rectangle parameters and normalized fill values
+  follow the shared pipeline in `dataset_imagenet.py`; rectangle dimensions
+  are clamped to image bounds rather than using torchvision's rejection loop.
+  ImageNet-21k-p rejects level 2 and supports only `none/0` and `1`.
 
 The input size comes from the augmentation factory: CCT's launcher keeps
 224 for every ImageNet level; the generic preset 2 retains 176. DALI uses
@@ -40,9 +46,11 @@ configuration; it does not promise batch-size-independent augmentations.
 `--num_workers` is the DALI CPU thread count per pipeline (minimum 1), not
 a PyTorch multiprocessing worker count. `--prefetch_factor` is DALI's
 pipeline prefetch depth (default 4), rather than batches per worker. JPEG
-decode uses `mixed` CPU/GPU execution, while resize/augmentation/normalize
+decode uses CPU execution, while resize/augmentation/normalize
 run on GPU; only tiny random-erasing rectangle parameters are generated
-on CPU. Training/evaluation use the existing AMP configuration. Flatness
+on CPU. Training uses `--amp`; forward-only evaluation independently uses
+`--eval_precision bf16` by default, falling back to FP32 without native CUDA
+BF16 support. Flatness
 remains full-precision, with the existing microbatch size and sample count.
 Training pipeline pools are released before flatness; an interrupted pass
 is discarded so the next checkpoint measurement restarts at the first image.

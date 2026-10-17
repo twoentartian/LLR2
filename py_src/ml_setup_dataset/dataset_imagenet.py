@@ -4,6 +4,9 @@ Two preprocessing presets (matching DFL_torch):
   preset_version=1 — RandomResizedCrop + RandomHorizontalFlip  (basic)
   preset_version=2 — + TrivialAugmentWide + RandAugment + RandomErasing  (PyTorch Recipe v2)
 
+Recipe comparison, historical ViT preset bug, and epoch budgets are documented
+in README_imagenet_augmentation.md beside this module.
+
 Path resolution is handled by dataset_default.py; override via a
 ``dataset_env.py`` file placed in the same directory.
 """
@@ -786,13 +789,13 @@ def dataset_imagenet21k_p(
 def dataset_imagenet1k_from_pytorch(train_crop_size=224, val_resize_size=256, val_crop_size=224,
                               interpolation=transforms.InterpolationMode.BILINEAR, auto_augment_policy=None,
                               random_erase_prob=0.0, ra_magnitude=9, augmix_severity=3,
-                              backend='pil', use_v2=False):
+                              backend='pil', use_v2=False, transforms_training=None, transforms_testing=None):
     from py_src.torch_vision_train.presets import ClassificationPresetTrain
     dataset_type = DatasetType.imagenet1k
     dataset_path = f'{imagenet1k_path}/train' if imagenet1k_path is None else f"{imagenet1k_path}/train"
     dataset_train = datasets.ImageFolder(
         dataset_path,
-        ClassificationPresetTrain(
+        transforms_training if transforms_training is not None else ClassificationPresetTrain(
             crop_size=train_crop_size,
             interpolation=interpolation,
             auto_augment_policy=auto_augment_policy,
@@ -804,7 +807,7 @@ def dataset_imagenet1k_from_pytorch(train_crop_size=224, val_resize_size=256, va
         ),
     )
     dataset_path = f'{imagenet1k_path}/val' if imagenet1k_path is None else f"{imagenet1k_path}/val"
-    transforms_test = transforms.Compose([
+    transforms_test = transforms_testing if transforms_testing is not None else transforms.Compose([
         transforms.Resize(val_resize_size),
         transforms.CenterCrop(val_crop_size),
         transforms.ToTensor(),
@@ -823,15 +826,17 @@ def dataset_imagenet1k_from_pytorch_dali(
     random_erase_prob: float = 0.0,
     ra_repetitions: int = 3,
     dali_device_id: int = 0,
+    preset_version: int = 1,
+    augmentation: bool = True,
 ) -> DatasetSetup:
     return _make_dali_imagenet_setup(
         DatasetType.imagenet1k,
         imagenet1k_path,
-        preset_version=1,
+        preset_version=preset_version,
         train_crop_size=train_crop_size,
         val_resize_size=val_resize_size,
         val_crop_size=val_crop_size,
-        augmentation=True,
+        augmentation=augmentation,
         dali_device_id=dali_device_id,
         auto_augment_policy=auto_augment_policy,
         auto_augment_interpolation=interpolation,

@@ -193,7 +193,7 @@ class TestMisalignmentPerformance(unittest.TestCase):
         with patch.object(torch.Tensor, "item", side_effect=AssertionError("batch scalar read")):
             result = measurement.evaluate_partition(
                 model, batches, criterion, device=torch.device("cpu"), modular=False, eq_position=None,
-                amp_enabled=True, amp_dtype=torch.bfloat16,
+                precision="bf16",
             )
         self.assertEqual(result.examples, 5)
         self.assertEqual(result.loss, expected_loss / 5)
@@ -233,7 +233,7 @@ class TestMisalignmentPerformance(unittest.TestCase):
                 )
             self.assertEqual(calls, [True] * 3 + [False] * 3 + [True] * 3)
             self.assertEqual(len(evaluate.call_args_list), 6)
-            self.assertTrue(all(call.kwargs["amp_enabled"] for call in evaluate.call_args_list))
+            self.assertTrue(all(call.kwargs["precision"] == "bf16" for call in evaluate.call_args_list))
             self.assertTrue(math.isnan(rows[0]["train_val_gradient_cosine"]))
             self.assertTrue(math.isfinite(rows[1]["train_val_gradient_cosine"]))
             self.assertEqual([row["train_gradient_weight"] for row in rows], [1., .75, .5])
@@ -276,7 +276,7 @@ class TestMisalignmentPerformance(unittest.TestCase):
                         device=device, batch_size=2, epochs=2, args=args, output_folder=Path(directory),
                         model_type_name="toy", dataset_type_name="mnist",
                     )
-                self.assertTrue(all(call.kwargs["amp_enabled"] for call in evaluate.call_args_list))
+                self.assertTrue(all(call.kwargs["precision"] == "bf16" for call in evaluate.call_args_list))
                 dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
                 self.assertIn(dtype, model.output_dtypes)
                 self.assertEqual(model.output_dtypes[-1], torch.float32)
@@ -291,13 +291,13 @@ class TestMisalignmentPerformance(unittest.TestCase):
         criterion = nn.CrossEntropyLoss()
         measurement.evaluate_partition(
             model, loader, criterion, device=torch.device("cuda"), modular=False, eq_position=None,
-            amp_enabled=True, amp_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+            precision="bf16",
         )
         self.assertNotEqual(set(model.output_dtypes), {torch.float32})
         model.output_dtypes.clear()
         measurement.evaluate_partition(
             model, loader, criterion, device=torch.device("cuda"), modular=False, eq_position=None,
-            amp_enabled=False, amp_dtype=torch.bfloat16,
+            precision="fp32",
         )
         self.assertEqual(set(model.output_dtypes), {torch.float32})
 
@@ -313,9 +313,8 @@ class TestMisalignmentPerformance(unittest.TestCase):
         ).cuda()
         images = torch.cat((torch.zeros(1, 3, 32, 32), torch.randn(2, 3, 32, 32)))
         loader = DataLoader(TensorDataset(images, torch.tensor([0, 1, 2])), batch_size=2)
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         kwargs = dict(device=torch.device("cuda"), modular=False, eq_position=None,
-                      amp_enabled=True, amp_dtype=dtype)
+                      precision="bf16")
         criterion = nn.CrossEntropyLoss()
         monitor = TokenizerOutputMonitor(model)
         try:

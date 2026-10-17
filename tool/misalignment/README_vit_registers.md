@@ -38,7 +38,9 @@ for model in vit_b_32 vit_b_32_reg4; do
 done
 ```
 
-The inherited ViT classification loss uses label smoothing 0.11 in both models.
+Both models default to the historical v3 classification loss with label smoothing
+0.11 (`--model_preset 3`). Use `--model_preset 1` explicitly for zero smoothing.
+See the [ImageNet recipe comparison](../../py_src/ml_setup_dataset/README_imagenet_augmentation.md).
 The measurement script applies its own per-image augmentation; the MLSetup's
 Mixup/CutMix collate and repeated-augmentation sampler are not used here.
 Augmentation defaults to `none` in the measurement script. Its existing generic
@@ -96,6 +98,11 @@ in `summary.json`. Other model families retain their existing evaluation path.
 This records final-layer token norms, not per-layer norms or attention maps.
 The existing `misalignment_measure` definition and gradient update rules are
 unchanged.
+
+Forward-only evaluation defaults to native CUDA BF16 independently of training
+AMP. Use `--eval_precision fp32` for FP32; unsupported devices fall back to FP32.
+Evaluation precision does not change training AMP or parameter/optimizer storage.
+Relative-flatness calculations remain in FP32.
 
 ## Shared DALI preprocessing
 

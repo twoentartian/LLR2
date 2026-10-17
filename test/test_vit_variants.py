@@ -158,7 +158,7 @@ class TestViTVariants(unittest.TestCase):
                            side_effect=lambda _constructor=constructor, **kw: tiny_variant(_constructor, **kw)):
                     built = get_ml_setup_from_config(name, "imagenet1k", preset=1, use_dali=dali)
                     self.assertEqual(built.model_type, ModelType[name])
-                    self.assertEqual(built.criterion.label_smoothing, 0.11)
+                    self.assertEqual(built.criterion.label_smoothing, 0.0)
                     self.assertEqual(built.default_batch_size, 512)
                     self.assertEqual(dali_builder.call_count, int(dali))
                     optimizer, scheduler, epochs = FastTrainingSetup.get_optimizer_lr_scheduler_epoch(built, built.model)

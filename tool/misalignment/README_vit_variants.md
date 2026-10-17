@@ -64,10 +64,15 @@ for model in vit_b_32_rope vit_b_32_swiglu; do
 done
 ```
 
-Both models reuse the baseline MLSetup recipe, criterion (label smoothing 0.11),
+Both models reuse the baseline MLSetup recipe and preset-dependent criterion,
 DALI loader, optimizer/scheduler presets, token-norm hooks, checkpoint loading,
 and misalignment update/measurement rules. Explicit measurement CLI parameters
-continue to override the training preset. No extra augmentation is enabled.
+continue to override the training preset. ViT measurement defaults to
+`--model_preset 3`, preserving the historical label smoothing of 0.11;
+`--model_preset 1` explicitly selects zero smoothing. Image augmentation is
+controlled separately by `--augmentation`; batch Mixup/CutMix and the
+repeated-augmentation sampler are not used. See the
+[ImageNet recipe comparison](../../py_src/ml_setup_dataset/README_imagenet_augmentation.md).
 The last matrix remains `heads.head.weight` with shape `[1000, 768]`; token
 norms are still measured at `encoder.ln.input` for `patch` and `cls`.
 

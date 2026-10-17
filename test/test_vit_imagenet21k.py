@@ -57,7 +57,8 @@ def small_thread_pool():
 
 @pytest.mark.parametrize("model_name", VARIANTS)
 @pytest.mark.parametrize("dali", [False, True])
-def test_factory_train_val_and_checkpoint(tmp_path, model_name, dali):
+@pytest.mark.parametrize("preset", [0, 1, 2, 3])
+def test_factory_train_val_and_checkpoint(tmp_path, model_name, dali, preset):
     if dali:
         if not torch.cuda.is_available():
             pytest.skip("CUDA required")
@@ -66,17 +67,28 @@ def test_factory_train_val_and_checkpoint(tmp_path, model_name, dali):
     target, constructor = VARIANTS[model_name]
     with patch("py_src.ml_setup_dataset.dataset_imagenet.imagenet21k_p_path", tmp_path), \
          patch(target, side_effect=tiny_builder(constructor)):
-        setup = get_ml_setup_from_config(model_name, "imagenet21k_p", preset=1, use_dali=dali)
+        setup = get_ml_setup_from_config(model_name, "imagenet21k_p", preset=preset, use_dali=dali)
         assert setup.model.heads.head.out_features == 2
         assert setup.dataset_type == DatasetType.imagenet21k_p
         config = DataloaderConfig(batch_size=2, num_workers=1 if dali else 0, pin_memory=dali)
         train_loader, val_loader = setup.train_dataloader(config), setup.val_dataloader(config)
-        # Dynamic soft-label width must match the classifier, including DALI's
-        # GPU-resident batches and the mixed/cut-mixed targets.
+        assert setup.criterion.label_smoothing == {0: 0.0, 1: 0.0, 2: 0.1, 3: 0.11}[preset]
+        assert (setup.default_sampler_fn is not None) == (preset in (2, 3))
         images, targets = next(iter(train_loader))
         assert images.shape == (2, 3, 224, 224)
-        assert targets.shape == (2, 2)
-        torch.testing.assert_close(targets.sum(dim=1), torch.ones(2, device=targets.device))
+        if preset in (2, 3):
+            # Dynamic soft labels must match the actual classifier, on CPU and DALI/CUDA.
+            assert targets.shape == (2, 2)
+            torch.testing.assert_close(targets.sum(dim=1), torch.ones(2, device=targets.device))
+        else:
+            assert targets.shape == (2,) and targets.dtype == torch.long
+        if preset == 0:
+            assert setup.default_collate_fn is None
+            first = next(iter(train_loader))[0]
+            second = next(iter(train_loader))[0]
+            # Ignore shuffled sample order: preprocessing itself must be deterministic.
+            torch.testing.assert_close(first.flatten(1).sort(dim=0).values,
+                                       second.flatten(1).sort(dim=0).values, rtol=0, atol=0)
         device = Device.cuda() if dali else Device.cpu()
         setup.model.to(device.device)
         optimizer, scheduler, epochs = FastTrainingSetup.get_optimizer_lr_scheduler_epoch(
@@ -88,13 +100,13 @@ def test_factory_train_val_and_checkpoint(tmp_path, model_name, dali):
         assert scheduler._schedulers[0].total_iters == 5 * len(train_loader)
         result = train(setup.adapter, train_loader, optimizer, scheduler, device=device)
         evaluated = val(setup.adapter, val_loader, device=device)
-        assert result.total_count == 6  # three augmentations of each source image
+        assert result.total_count == {0: 2, 1: 2, 2: 8, 3: 6}[preset]
         assert evaluated.total_count == 2
         assert math.isfinite(result.avg_loss) and math.isfinite(evaluated.avg_loss)
         path = str(tmp_path / "model.pt")
         save_model_state(path, setup.model.state_dict(), model_name, setup.dataset_type.name)
         state, saved_model, saved_dataset = load_model_state_file(path, map_location="cpu")
-        restored = get_ml_setup_from_config(saved_model, saved_dataset, preset=1)
+        restored = get_ml_setup_from_config(saved_model, saved_dataset, preset=preset)
         restored.model.load_state_dict(state, strict=True)
         inputs = torch.randn(2, 3, 224, 224)
         restored.model.eval()
@@ -107,7 +119,7 @@ def test_factory_train_val_and_checkpoint(tmp_path, model_name, dali):
 def test_full_class_head_without_class_metadata():
     dataset = TensorDataset(torch.zeros(2, 3, 224, 224), torch.tensor([0, 10449]))
     with patch("torchvision.models.vit_b_32", side_effect=tiny_builder(VisionTransformer)):
-        setup = vit_b_32_imagenet21k_p(override_dataset=DatasetSetup(DatasetType.imagenet21k_p, dataset, dataset))
+        setup = vit_b_32_imagenet21k_p(preset=2, override_dataset=DatasetSetup(DatasetType.imagenet21k_p, dataset, dataset))
     assert setup.model.heads.head.out_features == 10450
     _, targets = next(iter(setup.train_dataloader(DataloaderConfig(batch_size=2))))
     assert targets.shape == (2, 10450)
@@ -132,6 +144,8 @@ def test_misalignment_bundle_and_dali_pipeline(tmp_path, level):
         bundle = measurement.load_dataset_bundle(args)
     assert len(bundle.partition_a) == len(bundle.partition_b) == 2
     assert bundle.ml_setup.model.heads.head.out_features == 2
+    assert bundle.model_preset == 3
+    assert bundle.ml_setup.criterion.label_smoothing == 0.11
     config = describe_augmentation("imagenet21k_p", level)
     assert config["input_size"] == 224
     assert resolve_loader_backend("imagenet21k_p") == "dali"
@@ -175,6 +189,8 @@ def test_misalignment_entry_point_saves_models_with_flatness_deferred(tmp_path):
         measurement.main()
     summary = json.loads((output / "summary.json").read_text())
     for name, run in summary["runs"].items():
+        assert run["model_preset"] == 3
+        assert run["criterion"]["label_smoothing"] == 0.11
         assert run["dataset"] == "imagenet21k_p"
         assert run["model_type"] == "vit_b_32"
         assert run["optimizer"]["optimizer"] == "adamw"

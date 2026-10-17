@@ -245,19 +245,13 @@ def _build(mt: ModelType, dt, preset: int, device, *, use_dali: bool = False, da
             }[mt]
             return builder(preset, use_dali=use_dali, dali_device_id=dali_device_id)
         if _default or dt == DatasetType.imagenet1k:
-            if use_dali:
-                from py_src.ml_setup_dataset import dataset_imagenet1k_from_pytorch_dali
-
-                override = dataset_imagenet1k_from_pytorch_dali(dali_device_id=dali_device_id)
-            else:
-                override = None
             builder = {
                 ModelType.vit_b_32: vit_b_32_imagenet1k,
                 ModelType.vit_b_32_reg4: vit_b_32_reg4_imagenet1k,
                 ModelType.vit_b_32_rope: vit_b_32_rope_imagenet1k,
                 ModelType.vit_b_32_swiglu: vit_b_32_swiglu_imagenet1k,
             }[mt]
-            return builder(preset, override_dataset=override)
+            return builder(preset, use_dali=use_dali, dali_device_id=dali_device_id)
         raise _nie(mt, dt)
 
     elif mt == ModelType.squeezenet1_1:

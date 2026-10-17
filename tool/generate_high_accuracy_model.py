@@ -27,6 +27,8 @@ from py_src.complete_ml_setup import FastTrainingSetup, TransferTrainingSetup
 from py_src.ml_setup_dataset import DatasetType
 from py_src.engine import Device, train, val
 from py_src import distributed
+from py_src.precision import inference_dtype
+from py_src.ml_setup.vit import VIT_PRESET_VERSION, VIT_LEGACY_PRESET
 from py_src.ml_setup.dataloader_util import DataloaderConfig
 import py_src.adapters as _adapters
 
@@ -369,6 +371,10 @@ def training_model(
         child_logger.info("random seed = %d", random_seed)
 
     device = Device.cpu() if arg_use_cpu else Device.auto()
+    eval_precision = run_config.get("eval_precision", "bf16")
+    child_logger.info("evaluation precision: requested=%s effective=%s", eval_precision,
+                      inference_dtype(device.device, eval_precision) or torch.float32)
+    child_logger.info("training preset = %s", arg_preset)
 
     digit_width = len(str(number_of_models))
     model: torch.nn.Module = copy.deepcopy(arg_ml_setup.model)
@@ -619,7 +625,7 @@ def training_model(
             train_acc = train_result.accuracy if train_result.accuracy is not None else math.nan
             log_csv.write(f"{epoch},{train_result.avg_loss:.4e},{train_acc:.4e},{math.nan},{math.nan},{lrs}\n")
         else:
-            val_result = val(adapter, dataloader_test, device=device)
+            val_result = val(adapter, dataloader_test, device=device, precision=eval_precision)
             child_logger.info(
                 "epoch[%d] (train) loss=%.4f acc=%s  (val) loss=%.4f acc=%s  lrs=%s",
                 epoch,
@@ -708,6 +714,9 @@ def main():
                         help="save per-epoch checkpoints (file) or skip (none)")
     parser.add_argument("--save_interval", type=int, default=1, help="checkpoint every N epochs")
     parser.add_argument("--amp", action="store_true", help="enable automatic mixed precision")
+    parser.add_argument("--eval_precision", choices=["bf16", "fp32"], default=None,
+                        help="evaluation precision (default: bf16 on supported CUDA GPUs, otherwise fp32); "
+                             "independent of training --amp; resume uses the saved value unless overridden")
     parser.add_argument(
         "--compile",
         action=argparse.BooleanOptionalAction,
@@ -716,7 +725,9 @@ def main():
     )
     parser.add_argument("-s", "--random_seed", type=int, default=None)
     parser.add_argument("-i", "--start_index", type=int, default=0)
-    parser.add_argument("-P", "--preset", type=int, default=1, help="training hyperparameter preset index")
+    parser.add_argument("-P", "--preset", type=int, default=1,
+                        help="training preset; ViT: 0=no augmentation, 1=ImageNet v1, "
+                             "2=ImageNet v2, 3=legacy ViT augmentation")
     parser.add_argument("-e", "--epoch", type=int, default=None, help="override epoch count")
     parser.add_argument("-tl", "--transfer_learn", type=str, default=None,
                         help="checkpoint path for transfer learning")
@@ -787,6 +798,23 @@ def main():
 
         resume_checkpoint = load_training_checkpoint(args.load_checkpoint)
         run_config = copy.deepcopy(resume_checkpoint["run_config"])
+        if run_config["model_type"].startswith("vit_b_32"):
+            saved_version = run_config.get("vit_preset_version")
+            if saved_version is None and run_config["preset"] in (0, 1):
+                original_preset = run_config["preset"]
+                run_config["vit_legacy_preset"] = original_preset
+                run_config["preset"] = VIT_LEGACY_PRESET
+                run_config["vit_preset_version"] = VIT_PRESET_VERSION
+                # Historical high-accuracy validation was FP32. Preserve it
+                # unless the saved config or an explicit CLI override says otherwise.
+                run_config.setdefault("eval_precision", "fp32")
+                logger.warning("legacy ViT checkpoint: saved preset %s maps to preset 3; "
+                               "AutoAugment, Mixup/CutMix, RA3 and label smoothing 0.11 are preserved",
+                               original_preset)
+            elif saved_version != VIT_PRESET_VERSION:
+                parser.error(f"Unsupported ViT preset semantics version {saved_version!r}; "
+                             "only recognized legacy preset 0/1 checkpoints can migrate to v3")
+        run_config["eval_precision"] = args.eval_precision or run_config.get("eval_precision", "bf16")
         if distributed.enabled() and run_config["dali"]:
             run_config["dali_device_id"] = torch.cuda.current_device()
         if args.batch_size is not None:
@@ -805,7 +833,8 @@ def main():
             current_ml_setup.dataset_type.name,
             args.load_checkpoint,
         )
-        logger.info("resume uses the checkpoint's saved training configuration; only --core and optional --epoch are applied")
+        logger.info("resume uses the checkpoint's saved training configuration; --core, optional --epoch "
+                    "and --eval_precision are applied")
 
         output_folder_path = _resolve_output_folder_from_checkpoint(args.load_checkpoint, resume_checkpoint)
         os.makedirs(output_folder_path, exist_ok=True)
@@ -865,9 +894,14 @@ def main():
             "use_dali": args.dali,
             "dali_device_id": args.dali_device_id,
             "torch_compile": args.compile,
+            "preset": args.preset,
+            "amp": args.amp,
+            "eval_precision": args.eval_precision or "bf16",
             "opposite_init_model": args.opposite_init_model,
         }
         info["world_size"] = distributed.world_size()
+        if current_ml_setup.model_type.name.startswith("vit_b_32"):
+            info["vit_preset_version"] = VIT_PRESET_VERSION
         info["batch_size"] = args.batch_size or current_ml_setup.default_batch_size
         if distributed.is_main():
             with open(os.path.join(output_folder_path, "info.json"), "w", encoding="utf-8") as f:
@@ -886,6 +920,7 @@ def main():
             "save_format": args.save_format,
             "save_interval": args.save_interval,
             "amp": args.amp,
+            "eval_precision": args.eval_precision or "bf16",
             "compile": args.compile,
             "random_seed": args.random_seed,
             "preset": args.preset,
@@ -896,6 +931,9 @@ def main():
             "disable_reinit": args.disable_reinit,
             "enable_eval": args.enable_eval,
         }
+
+        if current_ml_setup.model_type.name.startswith("vit_b_32"):
+            run_config["vit_preset_version"] = VIT_PRESET_VERSION
 
         task_args = [
             (output_folder_path, i, number_of_models,

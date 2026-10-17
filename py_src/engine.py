@@ -31,6 +31,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 
 from py_src.adapters import ModelAdapter
+from py_src.precision import inference_autocast
 from py_src.util import MovingAverage
 from py_src import distributed
 
@@ -333,6 +334,7 @@ def _val_local(
     dataloader: Iterable,
     *,
     device: Device,
+    precision: str = "bf16",
 ) -> ValResult:
     """Run one epoch of validation.
 
@@ -353,7 +355,7 @@ def _val_local(
 
     result = ValResult()
 
-    with torch.inference_mode():
+    with torch.inference_mode(), inference_autocast(device.device, precision):
         for batch_idx, batch in enumerate(dataloader):
             out = adapter.val_step(batch, batch_idx, device.device)
             result.total_loss += out.loss * out.sample_count
@@ -388,18 +390,19 @@ def _reduce_result(result: TrainResult | ValResult, device: Device) -> None:
     result.total_correct = int(correct) if has_correct else None
 
 
-def val(adapter: ModelAdapter, dataloader: Iterable, *, device: Device) -> ValResult:
+def val(adapter: ModelAdapter, dataloader: Iterable, *, device: Device, precision: str = "bf16") -> ValResult:
     """Evaluate exact shards, allowing different numbers of batches per rank.
 
     DDP forwards can broadcast buffers, so validation uses the underlying
     module after one buffer broadcast rather than entering DDP collectives.
+    Native CUDA BF16 is used by default; pass ``precision="fp32"`` for FP32.
     """
     model = adapter.get_model()
     distributed.broadcast_model(model, buffers_only=True)
     if isinstance(model, DDP):
         adapter._model = model.module
     try:
-        result = _val_local(adapter, dataloader, device=device)
+        result = _val_local(adapter, dataloader, device=device, precision=precision)
     finally:
         if isinstance(model, DDP):
             adapter._model = model

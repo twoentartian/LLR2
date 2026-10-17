@@ -1,3 +1,9 @@
+"""Shared ImageNet criterion, batch augmentation and sampler presets.
+
+See ../ml_setup_dataset/README_imagenet_augmentation.md for exact v1/v2
+semantics, the historical ViT recipe, and backend-dependent epoch budgets.
+"""
+
 from typing import Callable, Optional
 
 import torch.nn as nn

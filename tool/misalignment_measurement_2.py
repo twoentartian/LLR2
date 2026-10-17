@@ -100,6 +100,8 @@ from py_src.ml_setup_dataset import ArithmeticDataset, DatasetSetup, DatasetType
 from py_src.model_opti_save_load import load_model_state_file, save_model_state
 from py_src.util import set_seed, setup_logging
 from py_src import distributed
+from py_src.precision import inference_autocast, inference_dtype
+from py_src.ml_setup.vit import VIT_LEGACY_PRESET
 
 logger = logging.getLogger("misalignment_measurement_2")
 
@@ -122,6 +124,7 @@ class DatasetBundle:
     excluded_indices: torch.Tensor
     modular: bool
     eq_position: int | None = None
+    model_preset: int | None = None
 
 
 @dataclass
@@ -278,7 +281,11 @@ def _load_modular_bundle(args, model_type: str) -> DatasetBundle:
 def _load_image_bundle(args, dataset_name: str, model_type: str, augmentation: int) -> DatasetBundle:
     # Bind augmentation below instead of using the high-accuracy loader's
     # batch transforms. Mixup/CutMix is not used in this experiment.
-    factory_preset = 1 if dataset_name in IMAGENET_DATASETS else 0
+    factory_preset = getattr(args, "model_preset", None)
+    if factory_preset is None:
+        factory_preset = (
+            VIT_LEGACY_PRESET if model_type.startswith("vit_b_32") else 1
+        ) if dataset_name in IMAGENET_DATASETS else 0
     ml_setup = get_ml_setup_from_config(model_type, dataset_type=dataset_name, preset=factory_preset)
     common_transform = build_augmentation(ml_setup, dataset_name, augmentation)
     if not hasattr(ml_setup.training_data, "transform") or not hasattr(ml_setup.testing_data, "transform"):
@@ -302,6 +309,7 @@ def _load_image_bundle(args, dataset_name: str, model_type: str, augmentation: i
         permutation=permutation,
         excluded_indices=excluded,
         modular=False,
+        model_preset=factory_preset,
     )
 
 
@@ -367,12 +375,11 @@ def evaluate_partition(
     eq_position: int | None,
     tokenizer_monitor: TokenizerOutputMonitor | None = None,
     token_norm_monitor: TokenNormMonitor | None = None,
-    amp_enabled: bool = False,
-    amp_dtype: torch.dtype | None = None,
+    precision: str = "bf16",
     progress_enabled: bool | None = None,
     progress_label: str | None = None,
 ) -> LossMetrics:
-    """Evaluate a complete partition, optionally using the training AMP dtype.
+    """Evaluate a complete partition with BF16 independent of training AMP.
 
     Loss/accuracy totals stay on the device until the partition is complete.
     Relative-flatness measurements use a separate, full-precision path.
@@ -383,11 +390,7 @@ def evaluate_partition(
     example_count = 0
     capture_context = tokenizer_monitor.capture() if tokenizer_monitor is not None else contextlib.nullcontext()
     norm_capture_context = token_norm_monitor.capture() if token_norm_monitor is not None else contextlib.nullcontext()
-    autocast_context = (
-        torch.autocast(device_type=device.type, dtype=amp_dtype)
-        if amp_enabled and device.type == "cuda" and amp_dtype is not None
-        else contextlib.nullcontext()
-    )
+    autocast_context = inference_autocast(device, precision)
     with capture_context, norm_capture_context, autocast_context:
         batches = loader
         if progress_label is not None:
@@ -604,6 +607,7 @@ def train_symmetric_objective(
     amp_enabled: bool = False,
     amp_dtype: torch.dtype | None = None,
     scaler=None,
+    eval_precision: str = "bf16",
     epoch_callback: Callable[[dict[str, float]], None] | None = None,
     tokenizer_monitor: TokenizerOutputMonitor | None = None,
     token_norm_monitor: TokenNormMonitor | None = None,
@@ -642,12 +646,12 @@ def train_symmetric_objective(
         baseline_start = time.perf_counter()
         baseline_a = evaluate_partition(
             model, eval_loader_a, criterion, device=device, modular=modular, eq_position=eq_position,
-            amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+            precision=eval_precision,
             progress_enabled=progress_enabled, progress_label=f"{epoch_label} baseline eval train",
         )
         baseline_b = evaluate_partition(
             model, eval_loader_b, criterion, device=device, modular=modular, eq_position=eq_position,
-            amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+            precision=eval_precision,
             progress_enabled=progress_enabled, progress_label=f"{epoch_label} baseline eval val",
         )
         baseline_eval_seconds = time.perf_counter() - baseline_start
@@ -721,7 +725,7 @@ def train_symmetric_objective(
             current_a = evaluate_partition(
                 model, eval_loader_a, criterion, device=device, modular=modular, eq_position=eq_position,
                 tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
-                amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+                precision=eval_precision,
                 progress_enabled=progress_enabled, progress_label=f"{epoch_label} eval train",
             )
             eval_train_seconds = time.perf_counter() - eval_start
@@ -729,7 +733,7 @@ def train_symmetric_objective(
             current_b = evaluate_partition(
                 model, eval_loader_b, criterion, device=device, modular=modular, eq_position=eq_position,
                 tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
-                amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+                precision=eval_precision,
                 progress_enabled=progress_enabled, progress_label=f"{epoch_label} eval val",
             )
             eval_val_seconds = time.perf_counter() - eval_start
@@ -1020,6 +1024,7 @@ def train_normalized_two_sided(
     amp_enabled: bool = False,
     amp_dtype: torch.dtype | None = None,
     scaler=None,
+    eval_precision: str = "bf16",
     epoch_callback: Callable[[dict[str, float]], None] | None = None,
     tokenizer_monitor: TokenizerOutputMonitor | None = None,
     token_norm_monitor: TokenNormMonitor | None = None,
@@ -1158,7 +1163,7 @@ def train_normalized_two_sided(
             current_a = evaluate_partition(
                 model, eval_loader_a, criterion, device=device, modular=modular, eq_position=eq_position,
                 tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
-                amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+                precision=eval_precision,
                 progress_enabled=progress_enabled, progress_label=f"{epoch_label} eval train",
             )
             eval_train_seconds = time.perf_counter() - eval_start
@@ -1166,7 +1171,7 @@ def train_normalized_two_sided(
             current_b = evaluate_partition(
                 model, eval_loader_b, criterion, device=device, modular=modular, eq_position=eq_position,
                 tokenizer_monitor=tokenizer_monitor, token_norm_monitor=token_norm_monitor,
-                amp_enabled=amp_enabled, amp_dtype=amp_dtype,
+                precision=eval_precision,
                 progress_enabled=progress_enabled, progress_label=f"{epoch_label} eval val",
             )
             eval_val_seconds = time.perf_counter() - eval_start
@@ -1620,6 +1625,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset_path", default=None, help="modular dataset folder containing train.txt/val.txt")
     parser.add_argument("-m", "--model_type", default=None, help="MLSetup model name; defaults depend on the dataset")
+    parser.add_argument("--model_preset", type=int, default=None,
+                        help="MLSetup/criterion preset (default: ViT ImageNet v3, other ImageNet v1, otherwise 0); "
+                             "image augmentation remains controlled by --augmentation")
     parser.add_argument("--augmentation", "--data_augmentation", default="none", help="none/0 or an integer augmentation level")
     parser.add_argument(
         "--objective",
@@ -1670,6 +1678,9 @@ def parse_args() -> argparse.Namespace:
                         help="loader workers / DALI decoder threads per pipeline (default: 8)")
     parser.add_argument("--eval_batch_size", type=int, default=None,
                         help="batch size for full-partition epoch evaluation; defaults to training batch size")
+    parser.add_argument("--eval_precision", choices=["bf16", "fp32"], default="bf16",
+                        help="forward-only evaluation precision, independent of --amp; "
+                             "bf16 uses native CUDA support and falls back to fp32 elsewhere")
     parser.add_argument("--eval_num_workers", type=int, default=None,
                         help="decoder/loader workers for epoch evaluation; defaults to --num_workers")
     parser.add_argument("--eval_last_10_percent", "--eval-last-10-percent", action="store_true",
@@ -1760,7 +1771,8 @@ def parse_args() -> argparse.Namespace:
         dest="amp",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="CUDA automatic mixed precision during training and evaluation; relative flatness stays full precision (default: enabled; use --no-amp to disable; ignored on CPU)",
+        help="CUDA training automatic mixed precision (default: enabled; use --no-amp to disable; ignored on CPU); "
+             "evaluation uses --eval_precision and relative flatness stays full precision",
     )
     parser.add_argument(
         "--directions",
@@ -1840,13 +1852,17 @@ def _run_direction(
             except (AttributeError, TypeError):
                 scaler = torch.cuda.amp.GradScaler(enabled=True)
         logger.info(
-            "CUDA AMP enabled for training and evaluation, direction=%s: dtype=%s grad_scaler=%s; relative flatness remains full precision",
+            "CUDA AMP enabled for training, direction=%s: dtype=%s grad_scaler=%s; relative flatness remains full precision",
             direction_name,
             amp_dtype,
             scaler is not None,
         )
     else:
         logger.info("CUDA AMP disabled for direction=%s", direction_name)
+    eval_precision = getattr(args, "eval_precision", "bf16")
+    eval_dtype = inference_dtype(device, eval_precision)
+    logger.info("evaluation precision, direction=%s: requested=%s effective=%s",
+                direction_name, eval_precision, eval_dtype or torch.float32)
     logger.info(
         "starting direction=%s: train=partition_%s val=partition_%s",
         direction_name,
@@ -1918,6 +1934,7 @@ def _run_direction(
                 report_interval=args.report_interval,
                 csv_path=str(optimization_path),
                 gradient_geometry_csv_path=str(geometry_path),
+                eval_precision=eval_precision,
                 train_gradient_weight_function=args.train_gradient_weight_function,
                 val_gradient_weight_function=args.val_gradient_weight_function,
                 amp_enabled=amp_enabled,
@@ -1947,6 +1964,7 @@ def _run_direction(
                 report_interval=args.report_interval,
                 csv_path=str(optimization_path),
                 objective_mode=args.objective,
+                eval_precision=eval_precision,
                 amp_enabled=amp_enabled,
                 amp_dtype=amp_dtype,
                 scaler=scaler,
@@ -2020,6 +2038,9 @@ def _run_direction(
         "augmentation_config": describe_augmentation(args.dataset, args.augmentation),
         "excluded_source_indices": bundle.excluded_indices.tolist(),
         "model_type": model_type_name,
+        "model_preset": bundle.model_preset,
+        "criterion": {"type": type(criterion).__name__,
+                      "label_smoothing": getattr(criterion, "label_smoothing", None)},
         "device": str(device),
         "runtime": {
             "world_size": distributed.world_size(),
@@ -2038,7 +2059,9 @@ def _run_direction(
             "torch_compile": compile_enabled,
             "gradient_combination": gradient_combiner.runtime_info() if gradient_combiner is not None else None,
             "amp": amp_enabled,
-            "evaluation_amp": amp_enabled,
+            "evaluation_amp": eval_dtype is not None,
+            "eval_precision": eval_precision,
+            "evaluation_amp_dtype": str(eval_dtype) if eval_dtype is not None else None,
             "relative_flatness_amp": False,
             "amp_dtype": str(amp_dtype) if amp_dtype is not None else None,
             "grad_scaler": scaler is not None,

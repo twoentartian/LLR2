@@ -3,6 +3,9 @@
 Both random halves must receive the same transform distribution.  This
 factory returns one transform that can be assigned to every source dataset
 before they are concatenated and repartitioned.
+
+For the distinction from ordinary ViT training presets and historical runs,
+see ../../py_src/ml_setup_dataset/README_imagenet_augmentation.md.
 """
 
 from __future__ import annotations

@@ -84,7 +84,7 @@ class TestViTRegisters(unittest.TestCase):
              patch("py_src.ml_setup_model.vit_registers.vit_b_32_reg4", side_effect=lambda **kw: tiny_vit(**kw)):
             built = get_ml_setup_from_config("vit_b_32_reg4", "imagenet1k", preset=1)
             self.assertEqual(built.model_type, ModelType.vit_b_32_reg4)
-            self.assertEqual(built.criterion.label_smoothing, 0.11)
+            self.assertEqual(built.criterion.label_smoothing, 0.0)
             with tempfile.TemporaryDirectory() as directory:
                 path = str(Path(directory) / "registered.model.pt")
                 save_model_state(path, built.model.state_dict(), built.model_type.name, "imagenet1k")

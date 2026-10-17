@@ -24,10 +24,10 @@ The requirements match the tested local environment: PyTorch 2.13.0+cu132 /
 torchvision 0.28.0+cu132 (CUDA 13.2) and nvidia-dali-cuda130 2.3.0. DALI uses
 the cuda130 package name for its CUDA 13 build, including when paired with
 CUDA 13.2 PyTorch. The bundle also installs rapidgzip and the imports used by
-LLR2's setup package. Source
-changes for ViT + 21k-p must be transferred via the user's GitHub workflow
-before submitting training; the server was at commit `6b26901` when inspected.
-The batch script fails before extraction if the new ViT setup is absent.
+LLR2's setup package. Source changes, including the corrected ViT presets and
+BF16 evaluation, must be transferred via the user's GitHub workflow before
+submitting training. The batch script checks VIT_PRESET_VERSION=2 and VIT_LEGACY_PRESET=3 before
+extraction, so an older source checkout fails early.
 
 ## Dataset configuration
 
@@ -47,8 +47,13 @@ node-local data after the job, so checkpoints and logs go directly to HOME.
 
 ## Submit after dependencies and source are ready
 
-The default is 4 H100 GPUs, global batch 512 (128 per GPU), AMP, DALI,
-torch.compile, validation each epoch, and 90 epochs. Five days is the maximum
+The default is 4 H100 GPUs, global batch 512 (128 per GPU), FP16 training AMP,
+BF16 validation, DALI, torch.compile, and 90 epochs. The default preset is 3,
+the historical ViT recipe: 224-pixel random resized crop, horizontal flip,
+ImageNet AutoAugment, Mixup/CutMix (alpha 0.2/1.0), three repetitions, label
+smoothing 0.11, no random erasing. DALI therefore processes about three full
+training-set passes per epoch. Presets 0/1/2 retain no augmentation / project
+v1 / project v2, respectively. Five days is the maximum
 walltime requested; the job ends earlier if training finishes. Only the latest
 resumable checkpoint is retained, plus final model/optimizer; per-epoch model
 archives are disabled. A short CUDA/DALI/NCCL import-and-collective check runs
@@ -78,6 +83,7 @@ LLR2_EPOCHS=1 sbatch --time=04:00:00 /gpfs/home6/ytian1/llr2-jobs/vit_b_32_image
 ```
 
 `LLR2_BATCH_SIZE`, `LLR2_SEED`, `LLR2_COMPILE=0/1`, `LLR2_EPOCHS`,
+`LLR2_PRESET=0/1/2/3` (default 3), `LLR2_EVAL_PRECISION=bf16/fp32`,
 `LLR2_OUTPUT_ROOT`, and `LLR2_DECOMPRESS_THREADS` are optional environment
 overrides. Keep the global batch constant when comparing GPU counts.
 
@@ -88,6 +94,15 @@ extracts the archive into its own scratch space again:
 LLR2_RESUME_CHECKPOINT=/gpfs/home6/ytian1/llr2-runs/vit_b_32_imagenet21k_p_JOBID/0/training_checkpoint.pt \
   sbatch /gpfs/home6/ytian1/llr2-jobs/vit_b_32_imagenet21k_p.sbatch
 ```
+
+Resume preserves the checkpoint's evaluation precision unless
+LLR2_EVAL_PRECISION is explicitly provided. Recognized pre-fix ViT checkpoints
+with unversioned preset 0/1 migrate explicitly to the equivalent preset 3;
+the log reports this and the new checkpoint records the original preset.
+When an old checkpoint has no evaluation-precision field, resume preserves
+historical FP32 evaluation. Versioned preset 0/1/2 checkpoints retain their own
+recipes on resume; LLR2_PRESET applies to fresh runs. To compare historical
+FP32 validation metrics in a fresh run, set LLR2_EVAL_PRECISION=fp32.
 
 ## References
 

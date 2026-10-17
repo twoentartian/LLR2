@@ -24,7 +24,7 @@ def get_ml_setup_from_config(
         sys.exit(1)
 
     try:
-        dataset_type_key = "imagenet21k_p" if dataset_type == "imagenet21k-p" else dataset_type
+        dataset_type_key = "imagenet21k_p" if dataset_type in ("imagenet21k-p", "imagenet21k") else dataset_type
         dt = DatasetType[dataset_type_key] if dataset_type != "default" else None
     except KeyError:
         print(f"Unknown dataset type: {dataset_type!r}. Valid options: {[e.name for e in DatasetType]}")
@@ -233,7 +233,17 @@ def _build(mt: ModelType, dt, preset: int, device, *, use_dali: bool = False, da
         from .vit import (
             vit_b_32_imagenet1k, vit_b_32_reg4_imagenet1k,
             vit_b_32_rope_imagenet1k, vit_b_32_swiglu_imagenet1k,
+            vit_b_32_imagenet21k_p, vit_b_32_reg4_imagenet21k_p,
+            vit_b_32_rope_imagenet21k_p, vit_b_32_swiglu_imagenet21k_p,
         )
+        if dt == DatasetType.imagenet21k_p:
+            builder = {
+                ModelType.vit_b_32: vit_b_32_imagenet21k_p,
+                ModelType.vit_b_32_reg4: vit_b_32_reg4_imagenet21k_p,
+                ModelType.vit_b_32_rope: vit_b_32_rope_imagenet21k_p,
+                ModelType.vit_b_32_swiglu: vit_b_32_swiglu_imagenet21k_p,
+            }[mt]
+            return builder(preset, use_dali=use_dali, dali_device_id=dali_device_id)
         if _default or dt == DatasetType.imagenet1k:
             if use_dali:
                 from py_src.ml_setup_dataset import dataset_imagenet1k_from_pytorch_dali

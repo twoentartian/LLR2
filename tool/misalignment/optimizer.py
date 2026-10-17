@@ -78,6 +78,10 @@ class MisalignmentOptimizationSetup:
         elif dataset_name == "imagenet1k":
             default_optimizer, default_lr, default_wd, default_epochs = "sgd", 0.1, 1e-4, 100
             minimum_lr_ratio, default_warmup = 0.01, 0
+        elif dataset_name == "imagenet21k_p":
+            default_optimizer, default_wd, default_epochs = "adamw", 5e-2, 90
+            default_lr = 5e-4 if model_name.startswith("vit_") else 3e-4
+            minimum_lr_ratio, default_warmup = 0.0, 5
         else:
             raise NotImplementedError(f"No misalignment optimizer preset for {dataset_name!r}")
 

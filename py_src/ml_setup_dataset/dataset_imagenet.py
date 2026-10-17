@@ -728,12 +728,16 @@ def dataset_imagenet21k_p(
     augmentation: bool = True,
     use_dali: bool = False,
     dali_device_id: int = 0,
+    auto_augment_policy: Optional[str] = None,
+    repeated_augmentation_repetitions: Optional[int] = None,
 ) -> DatasetSetup:
     """ImageNet-21k-p in the resized ImageFolder layout.
 
     The default root is ``~/dataset/imagenet21k_resized`` and contains
     ``imagenet21k_train/`` and ``imagenet21k_val/``.  The root can be
     overridden in ``py_src/ml_setup_dataset/dataset_env.py``.
+    ``auto_augment_policy`` and ``repeated_augmentation_repetitions`` configure
+    the DALI backend; PyTorch callers can supply explicit transforms.
     """
     if use_dali:
         if transforms_training is not None or transforms_testing is not None:
@@ -750,6 +754,8 @@ def dataset_imagenet21k_p(
             random_erase_prob=_default_dali_random_erase_prob(preset_version, random_erasing),
             train_dirname="imagenet21k_train",
             val_dirname="imagenet21k_val",
+            auto_augment_policy=auto_augment_policy,
+            repeated_augmentation_repetitions=repeated_augmentation_repetitions,
         )
         if ds.train_data.classes != ds.valdation_data.classes:
             raise ValueError(

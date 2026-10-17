@@ -74,8 +74,33 @@ JSON 将 flatness 标记为 `deferred`，相关测量值为 `null`。
 并复用该 run 的 `split_seed`、`random_seed`、augmentation 等设置。
 本轮没有增加多卡二阶测量。
 
-模型和数据集组合仍以现有 factory 为准：当前 ViT-B/32 与 register 变体仅接入
-ImageNet-1k；本次没有增加 ViT + ImageNet-21k 的模型/分类头/训练配置。
+ViT 的 baseline、register、RoPE、SwiGLU 四种变体都支持 ImageNet-21k-p。
+使用数据集名 `imagenet21k_p`，也接受 `imagenet21k-p`、`imagenet21kp`、
+`imagenet21k`；这些名字均指向项目已有的 21k-p 数据布局，分类头与 soft-label
+宽度根据训练目录中的实际类别数构建（现有服务器数据为 10,450 类）。
+默认根目录为 `~/dataset/imagenet21k_resized`，其下为 `imagenet21k_train/`
+与 `imagenet21k_val/`；可通过 `py_src/ml_setup_dataset/dataset_env.py` 中的
+`imagenet21k_p_path` 覆盖。两个 split 必须具有相同的类别目录及标签映射。
+
+```bash
+torchrun --standalone --nnodes=1 --nproc-per-node=4 \
+  tool/generate_high_accuracy_model.py \
+  -m vit_b_32 -d imagenet21k_p --batch_size 512 --dali --amp --enable_eval
+
+torchrun --standalone --nnodes=1 --nproc-per-node=4 \
+  tool/misalignment_measurement_2.py \
+  --dataset imagenet21k_p -m vit_b_32 --batch_size 512 \
+  --loader_backend dali --augmentation 1 --skip_relative_flatness
+```
+
+21k-p 普通 ViT 训练复用现有 ViT recipe（224 输入、ImageNet AutoAugment、
+Mixup/CutMix、label smoothing 0.11、AdamW、lr 5e-4、weight decay 0.05），
+训练预算采用项目已有的 21k-p 设置：90 epochs、5 epochs warmup 后 cosine。
+`-e` 可覆盖普通训练的 epoch 数，已有 scheduler 的总预算仍来自 recipe。
+misalignment 不使用普通训练的 batch Mixup/CutMix，21k-p 仅支持 augmentation
+`none/0` 与 `1`；`2` 会在加载数据前报错。其默认 optimizer 为 AdamW，
+lr 5e-4、weight decay 0.05、90 epochs、5 epochs warmup，scheduler 默认仍为
+fixed，可通过现有 CLI 参数覆盖。ImageNet-1k 的原有设置保持不变。
 
 ## Snellius
 

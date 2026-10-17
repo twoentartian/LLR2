@@ -112,6 +112,7 @@
 
 - `FastTrainingSetup.get_optimizer_lr_scheduler_epoch()` 根据 model、dataset 和 preset 返回 optimizer、scheduler 和 epoch 数。
 - ViT-B/32 的 register 对照模型名为 `vit_b_32_reg4`，增加 4 个无位置编码的可学习 tokens；同 seed 下共同权重与 `vit_b_32` 初始化一致，通用训练 recipe 复用原版设置。
+- ViT-B/32、register、RoPE、SwiGLU 均支持 `imagenet21k_p`（也接受 `imagenet21k-p` / `imagenet21kp` / `imagenet21k`），分类头与 Mixup/CutMix 按实际类别数配置；21k-p 普通训练为 AdamW lr=5e-4、wd=0.05、90 epochs / 5 warmup。两个训练入口均可接 DALI 和单节点多卡；misalignment 的 21k-p 增强仅支持 none/0、1，level 2 提前报错。
 - 覆盖 SGD、Adam/AdamW、OneCycle、Cosine、MultiStep、warmup 等训练 recipe，并根据 dataloader 的 steps-per-epoch 换算 scheduler 步数。
 - `TransferTrainingSetup.get_optimizer_lr_scheduler_epoch()` 定义允许的迁移学习组合和对应的优化器配置。
 - 训练脚本的 `--preset` 默认值会影响学习率、weight decay、scheduler 和总 epoch；显式 CLI 参数通常会覆盖这些默认值。

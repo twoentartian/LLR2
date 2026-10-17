@@ -39,7 +39,7 @@ The normalized two-sided update accepts arithmetic gradient-weight expressions
 in the variable ``f`` (the normalized epoch fraction). The defaults are the
 constant expressions ``0.5`` and ``0.5`` for train and val respectively.
 
-Supported datasets are MNIST, CIFAR-10, CIFAR-100, ImageNet-1k, and a modular
+Supported datasets are MNIST, CIFAR-10, CIFAR-100, ImageNet-1k/21k-p, and a modular
 dataset folder containing train.txt/val.txt (and optionally test.txt).
 ImageNet defaults to the shared high-accuracy ImageNet DALI pipeline: CPU
 decoding and GPU preprocessing for training, evaluation and flatness. Other
@@ -78,6 +78,7 @@ from tqdm.auto import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from misalignment.augmentation import (
+    IMAGENET_DATASETS,
     build_augmentation,
     describe_augmentation,
     parse_augmentation_level,
@@ -136,12 +137,18 @@ def _parse_augmentation(value: str) -> int:
     return parse_augmentation_level(value)
 
 
+def _normalize_dataset_name(value: str) -> str:
+    name = value.lower()
+    return "imagenet21k_p" if name in {"imagenet21k", "imagenet21k-p", "imagenet21kp"} else name
+
+
 def _default_model_type(dataset_name: str) -> str:
     return {
         "mnist": "lenet5",
         "cifar10": "resnet18_bn",
         "cifar100": "resnet18_bn",
         "imagenet1k": "resnet18_bn",
+        "imagenet21k_p": "vit_b_32",
         "modular": "transformer_for_grokking",
     }[dataset_name]
 
@@ -269,10 +276,9 @@ def _load_modular_bundle(args, model_type: str) -> DatasetBundle:
 
 
 def _load_image_bundle(args, dataset_name: str, model_type: str, augmentation: int) -> DatasetBundle:
-    # Use preset 1 to construct a plain cross-entropy MLSetup.  Augmentation
-    # is applied below explicitly, so ImageNet level 2 does not silently add
-    # Mixup/CutMix or label smoothing to this experiment.
-    factory_preset = 1 if dataset_name == "imagenet1k" else 0
+    # Bind augmentation below instead of using the high-accuracy loader's
+    # batch transforms. Mixup/CutMix is not used in this experiment.
+    factory_preset = 1 if dataset_name in IMAGENET_DATASETS else 0
     ml_setup = get_ml_setup_from_config(model_type, dataset_type=dataset_name, preset=factory_preset)
     common_transform = build_augmentation(ml_setup, dataset_name, augmentation)
     if not hasattr(ml_setup.training_data, "transform") or not hasattr(ml_setup.testing_data, "transform"):
@@ -300,14 +306,14 @@ def _load_image_bundle(args, dataset_name: str, model_type: str, augmentation: i
 
 
 def load_dataset_bundle(args) -> DatasetBundle:
-    dataset_name = args.dataset.lower()
+    dataset_name = _normalize_dataset_name(args.dataset)
     model_type = args.model_type or _default_model_type(dataset_name)
     augmentation = _parse_augmentation(args.augmentation)
     if dataset_name == "modular":
         if augmentation != 0:
             raise ValueError("modular datasets support only --augmentation none/0")
         return _load_modular_bundle(args, model_type)
-    if dataset_name not in {"mnist", "cifar10", "cifar100", "imagenet1k"}:
+    if dataset_name not in {"mnist", "cifar10", "cifar100", *IMAGENET_DATASETS}:
         raise ValueError(f"unsupported dataset {dataset_name!r}")
     return _load_image_bundle(args, dataset_name, model_type, augmentation)
 
@@ -1608,7 +1614,8 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         "--dataset_type",
         dest="dataset",
-        choices=["mnist", "cifar10", "cifar100", "imagenet1k", "modular"],
+        type=_normalize_dataset_name,
+        choices=["mnist", "cifar10", "cifar100", "imagenet1k", "imagenet21k_p", "modular"],
         required=True,
     )
     parser.add_argument("--dataset_path", default=None, help="modular dataset folder containing train.txt/val.txt")

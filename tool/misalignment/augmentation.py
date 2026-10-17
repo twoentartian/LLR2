@@ -14,11 +14,14 @@ from torchvision import transforms
 
 from py_src.ml_setup_dataset import get_imagenet_preprocessing
 
+IMAGENET_DATASETS = frozenset({"imagenet1k", "imagenet21k_p"})
+
 _SUPPORTED_LEVELS = {
     "mnist": (0, 1, 2, 3),
     "cifar10": (0, 1, 2, 3),
     "cifar100": (0, 1, 2, 3),
     "imagenet1k": (0, 1, 2),
+    "imagenet21k_p": (0, 1),
     "modular": (0,),
 }
 
@@ -57,7 +60,7 @@ def _validate(dataset_name: str, level: str | int, input_size: int | None) -> tu
         supported = ["none/0", *[str(item) for item in _SUPPORTED_LEVELS[dataset_name] if item > 0]]
         raise ValueError(f"{dataset_name} supports augmentation levels {', '.join(supported)}")
     if input_size is not None:
-        if dataset_name != "imagenet1k":
+        if dataset_name not in IMAGENET_DATASETS:
             raise ValueError("input_size is supported only for ImageNet augmentation")
         if not isinstance(input_size, int) or isinstance(input_size, bool) or input_size <= 0:
             raise ValueError("input_size must be a positive integer")

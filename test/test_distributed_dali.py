@@ -17,7 +17,8 @@ from py_src.ml_setup_dataset.dataset_imagenet import DaliImageNetDataset
 
 
 @pytest.mark.parametrize("size", [2, 4])
-def test_real_dali_shards_have_equal_training_steps_and_exact_evaluation(tmp_path, size):
+@pytest.mark.parametrize("dataset_name", ["imagenet1k", "imagenet21k_p"])
+def test_real_dali_shards_have_equal_training_steps_and_exact_evaluation(tmp_path, size, dataset_name):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     pytest.importorskip("nvidia.dali")
@@ -31,7 +32,7 @@ def test_real_dali_shards_have_equal_training_steps_and_exact_evaluation(tmp_pat
         folder.mkdir()
         Image.new("RGB", (64, 64), (label * 19, 30, 60)).save(folder / "image.jpg")
     dataset = DaliImageNetDataset(
-        file_root=str(tmp_path), dataset_type=DatasetType.imagenet1k, split="train",
+        file_root=str(tmp_path), dataset_type=DatasetType[dataset_name], split="train",
         augmentation=False, val_crop_size=32, val_resize_size=36, device_id=0,
     )
     partition = ImageFolder(tmp_path)
@@ -50,7 +51,7 @@ def test_real_dali_shards_have_equal_training_steps_and_exact_evaluation(tmp_pat
                         loader = DaliImageNetLoader(
                             partition, 8, device=torch.device("cuda", 0), num_workers=1,
                             seed=0, prefetch_factor=1, is_train=is_train,
-                            augmentation_config=describe_augmentation("imagenet1k", 0, input_size=32),
+                            augmentation_config=describe_augmentation(dataset_name, 0, input_size=32),
                         )
                     labels = [batch[1].cpu().tolist() for batch in loader]
                     assert len(labels) == len(loader)

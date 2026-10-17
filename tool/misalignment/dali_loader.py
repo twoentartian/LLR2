@@ -15,14 +15,15 @@ from typing import Any
 import torch
 from torch.utils.data import ConcatDataset, Dataset, Subset
 from py_src import distributed
+from .augmentation import IMAGENET_DATASETS
 
 
 def resolve_loader_backend(dataset_name: str, requested: str = "auto") -> str:
     if requested not in {"auto", "pytorch", "dali"}:
         raise ValueError(f"unsupported loader backend {requested!r}")
-    backend = ("dali" if dataset_name == "imagenet1k" else "pytorch") if requested == "auto" else requested
-    if backend == "dali" and dataset_name != "imagenet1k":
-        raise ValueError("DALI loader backend is supported only for imagenet1k")
+    backend = ("dali" if dataset_name in IMAGENET_DATASETS else "pytorch") if requested == "auto" else requested
+    if backend == "dali" and dataset_name not in IMAGENET_DATASETS:
+        raise ValueError("DALI loader backend is supported only for imagenet1k and imagenet21k_p")
     return backend
 
 
@@ -99,9 +100,11 @@ class DaliImageNetLoader:
             raise ValueError("DALI ImageNet loading requires CUDA; use --loader_backend pytorch on CPU")
         if batch_size <= 0 or num_workers < 0 or prefetch_factor <= 0:
             raise ValueError("invalid DALI batch size, thread count or prefetch depth")
-        if augmentation_config.get("dataset") != "imagenet1k":
+        if augmentation_config.get("dataset") not in IMAGENET_DATASETS:
             raise ValueError("DALI requires an ImageNet augmentation configuration")
         self.level = int(augmentation_config["level"])
+        if augmentation_config["dataset"] == "imagenet21k_p" and self.level not in (0, 1):
+            raise ValueError("ImageNet-21k-p DALI supports augmentation none/0 and 1 only")
         if self.level not in (0, 1, 2):
             raise ValueError("DALI ImageNet augmentation supports none/0, 1 and 2")
         self.crop_size = int(augmentation_config["input_size"])

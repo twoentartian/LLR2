@@ -23,6 +23,8 @@ from .vgg import vgg11_bn_cifar10, vgg11_bn_imagenet1k, vgg11_no_bn_cifar10
 from .vit import (
     vit_b_32_imagenet1k, vit_b_32_reg4_imagenet1k,
     vit_b_32_rope_imagenet1k, vit_b_32_swiglu_imagenet1k,
+    vit_b_32_imagenet21k_p, vit_b_32_reg4_imagenet21k_p,
+    vit_b_32_rope_imagenet21k_p, vit_b_32_swiglu_imagenet21k_p,
 )
 
 from .cct import (
@@ -65,6 +67,8 @@ __all__ = [
     "vit_b_32_reg4_imagenet1k",
     "vit_b_32_rope_imagenet1k",
     "vit_b_32_swiglu_imagenet1k",
+    "vit_b_32_imagenet21k_p", "vit_b_32_reg4_imagenet21k_p",
+    "vit_b_32_rope_imagenet21k_p", "vit_b_32_swiglu_imagenet21k_p",
     "binary_attention_cct_7_3x1_cifar10",
     "cct_7_3x1_cifar10", "cct_7_3x1_cifar100", "cct14_7x2_imagenet1k", "cct14_7x2_imagenet21k_p",
     "ddpm_cifar10", "ddpm_flowers102",

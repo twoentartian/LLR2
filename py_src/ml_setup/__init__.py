@@ -5,7 +5,7 @@ from py_src.ml_setup_dataset import DatasetType
 
 from .alexnet import alexnet_imagenet1k
 from .bnn import bnn_cifar10, bnn_floating_cifar10
-from .convnext import conveNeXt_tiny_imagenet1k, convnext_tiny_imagenet1k
+from .convnext import conveNeXt_tiny_imagenet1k, convnext_tiny_imagenet1k, convnext_tiny_imagenet21k_p
 from .densenet import densenet121_cifar10, densenet121_imagenet1k, densenet_cifar_cifar10
 from .dla import dla_cifar10, dla_cifar100, dla46c_imagenet10
 from .efficientnet import efficientnet_b0_cifar10, efficientnet_b0_cifar100, efficientnet_v2_s_imagenet1k, efficientnet_b1_imagenet1k
@@ -48,7 +48,7 @@ __all__ = [
     "alexnet_imagenet1k",
     "bnn_cifar10",
     "bnn_floating_cifar10",
-    "conveNeXt_tiny_imagenet1k", "convnext_tiny_imagenet1k",
+    "conveNeXt_tiny_imagenet1k", "convnext_tiny_imagenet1k", "convnext_tiny_imagenet21k_p",
     "densenet121_cifar10", "densenet121_imagenet1k", "densenet_cifar_cifar10",
     "dla_cifar10", "dla_cifar100", "dla46c_imagenet10",
     "efficientnet_b0_cifar10", "efficientnet_b0_cifar100", "efficientnet_v2_s_imagenet1k", "efficientnet_b1_imagenet1k",

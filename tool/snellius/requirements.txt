@@ -1,0 +1,19 @@
+# Runtime for the ViT/ImageNet-21k-p job (Python 3.12, CUDA 13.2).
+# Match the tested local torch/torchvision builds; DALI's CUDA 13 package is cuda130.
+--extra-index-url https://download.pytorch.org/whl/cu132
+torch==2.13.0+cu132
+torchvision==0.28.0+cu132
+nvidia-dali-cuda130==2.3.0
+rapidgzip==0.16.0
+lightning
+timm
+numpy
+pillow
+pyyaml
+tqdm
+scipy
+matplotlib
+transformers
+faiss-cpu
+mod
+blobfile

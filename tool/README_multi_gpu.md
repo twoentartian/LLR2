@@ -6,6 +6,22 @@
 
 ## 高准确率模型
 
+ConvNeXt-Tiny / 21k-p 的独立 90 轮配方：
+
+```bash
+torchrun --standalone --nnodes=1 --nproc-per-node=4 \
+  tool/generate_high_accuracy_model.py -m convnext_tiny -d imagenet21k_p \
+  --preset 4 --batch_size 512 --gradient_accumulate_every 8 \
+  --random_seed 42 --dali --amp --enable_eval -o convnext_ddp
+```
+
+有效更新 batch=4096；scheduler 按 optimizer 更新次数前进。这里 preset4 的 smoothing=0.1
+已放入混合标签，CE 不再次平滑；DALI 每轮一遍数据。preset3 可作完整历史增强对照，仍为 RA3。
+初始化、90/5 预算和 bias/LayerNorm/LayerScale 权重衰减规则独立于 ViT recipe。
+CPU/PyTorch 使用 timm 的原配方，DALI 为明确记录的 GPU 适配。
+见 [SURF 说明](snellius/README_convnext.md) 和
+[增强对照第6节](../py_src/ml_setup_dataset/README_imagenet_augmentation.md)。
+
 ```bash
 torchrun --standalone --nnodes=1 --nproc-per-node=4 \
   tool/generate_high_accuracy_model.py \

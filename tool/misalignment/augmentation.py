@@ -5,7 +5,13 @@ factory returns one transform that can be assigned to every source dataset
 before they are concatenated and repartitioned.
 
 For the distinction from ordinary ViT training presets and historical runs,
-see ../../py_src/ml_setup_dataset/README_imagenet_augmentation.md.
+see ../../py_src/ml_setup_dataset/README_imagenet_augmentation.md sections 1.1/1.2
+and 5. ImageNet levels 0/1/2 reuse the project's deterministic/basic/advanced
+image transforms; the advanced TA Wide + RandAugment chain is a local variant
+of https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/.
+The level numbering, A/B symmetry, and MNIST/CIFAR parameter combinations are
+LLR2 experiment choices, not upstream standard numbered recipes. This module
+does not import ordinary training's batch Mixup/CutMix or RA sampler.
 """
 
 from __future__ import annotations

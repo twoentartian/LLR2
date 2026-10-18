@@ -22,6 +22,7 @@
 - `training_model()` 是单个模型的主要训练流程；`save_training_checkpoint()` / `load_training_checkpoint()` 负责可恢复训练。
 - 新训练的 `--random_seed` 必须在 `main()` 调用模型工厂前设置，才能固定 ViT 位置编码和 attention QKV 等仅在构造时初始化的参数；worker 内仍重新设置种子以控制训练随机流。不要只依赖 `re_initialize_model()`，它只调用公开的 `reset_parameters()`。续训仍恢复 checkpoint 的参数与各 rank RNG 状态；固定初始化种子不代表 CUDA 训练全程逐位确定。
 - `torchrun --standalone --nproc-per-node=2/4` 支持单节点、单模型 DDP 分类训练和 DALI；batch size 为全局大小，rank 0 写文件，checkpoint 保存各 rank RNG。公共运行时在 `py_src/distributed.py`，用法与 Snellius 脚本见 `tool/README_multi_gpu.md`。
+- ConvNeXt-Tiny 新增 `imagenet21k_p` 随机初始化入口（不影响原 1k）：显式 `--preset 4` 使用官方 ConvNeXt 配方的 CPU/timm 与 DALI 适配，`--preset 3` 完整保留旧 ViT 增强/RA3。默认 microbatch512、`--gradient_accumulate_every 8`、有效 batch4096，AdamW peak LR0.004、90 epochs/5 warmup/85 cosine；调度按 optimizer 更新数计算，checkpoint 保存累积次数和 `convnext_recipe_version=1`。模型初始化回调保留截断正态、LayerScale、LayerNorm；不加载预训练权重。DALI preset4 每轮一遍数据。详情见 `tool/snellius/README_convnext.md` 和 ImageNet 增强文档第6节。
 
 ### `tool/generate_grokking.py`
 
@@ -104,6 +105,10 @@
 与项目 v1/v2 的区别、ViT 固定 224 输入、PyTorch/DDP/DALI 的每 epoch 训练量差异，
 以及 misalignment 独立增强和 criterion 的影响。历史运行必须结合实际 commit/配置判断，
 不能把旧 preset 0 标成无增强，或把所有旧实验统称为项目 v2。
+第 1.1/1.2 节逐项记录方法论文、上游实现版本 / 链接和 LLR2 改动：项目 v2 额外串联 TA Wide
+与 RandAugment；v3 smoothing=0.11 源自 torchvision ViT-B/32 参考命令；DALI `image_net`
+与 torchvision `IMAGENET` 的 AutoAugment 策略表不同，且 RA 每 epoch 预算不同。
+新增或调整增强时，必须同步更新该来源记录及代码注释；历史来源不明时应明确标记，不能推测为官方配方。
 
 ### `py_src/ml_setup/factory.py`
 

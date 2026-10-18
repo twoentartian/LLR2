@@ -1,5 +1,9 @@
 # Snellius: ytian1 / ViT-B/32 / ImageNet-21k-p
 
+For the separate random-init ConvNeXt-Tiny 90-epoch job (preset 4), see
+[README_convnext.md](README_convnext.md). The ViT job and its preset 3 defaults
+remain unchanged.
+
 This bundle contains configuration and Slurm submission files. It does not
 update the server's training source or automatically submit any jobs.
 

@@ -1,3 +1,13 @@
+"""Batch transforms adapted from torchvision's classification references.
+
+Reference snapshot (helper / legacy RandomMixUp and RandomCutMix):
+https://github.com/pytorch/vision/blob/v0.28.0/references/classification/transforms.py
+Methods: Mixup https://arxiv.org/abs/1710.09412,
+CutMix https://arxiv.org/abs/1905.04899.
+LLR2 preset coefficients/provenance are documented in
+../ml_setup_dataset/README_imagenet_augmentation.md sections 1.1/1.2.
+"""
+
 import math
 from typing import Tuple
 
@@ -9,6 +19,8 @@ from .presets import get_module
 
 
 def get_mixup_cutmix(*, mixup_alpha, cutmix_alpha, num_classes, use_v2):
+    # Follow torchvision's RandomChoice composition, not sequential Mixup then
+    # CutMix. use_v2 selects torchvision's implementation/API only.
     transforms_module = get_module(use_v2)
 
     mixup_cutmix = []

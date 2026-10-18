@@ -283,7 +283,9 @@ def _build(mt: ModelType, dt, preset: int, device, *, use_dali: bool = False, da
         raise _nie(mt, dt)
 
     elif mt == ModelType.convnext_tiny:
-        from .convnext import convnext_tiny_imagenet1k
+        from .convnext import convnext_tiny_imagenet1k, convnext_tiny_imagenet21k_p
+        if dt == DatasetType.imagenet21k_p:
+            return convnext_tiny_imagenet21k_p(preset, use_dali=use_dali, dali_device_id=dali_device_id)
         if _default or dt == DatasetType.imagenet1k:
             override = _imagenet_dataset_override(DatasetType.imagenet1k, preset, use_dali, dali_device_id)
             return convnext_tiny_imagenet1k(preset, override_dataset=override)

@@ -11,6 +11,14 @@ class RASampler(torch.utils.data.Sampler):
     When distributed training is initialized, this matches the torchvision /
     DeiT repeated-augmentation behaviour. Outside distributed runs it behaves
     like the old LLR2 sampler and simply repeats the local indices.
+
+    Reference implementations (repeat, shard, then truncate to ~N globally):
+    https://github.com/pytorch/vision/blob/v0.28.0/references/classification/sampler.py
+    https://github.com/facebookresearch/deit/blob/7e160fe43f0252d17191b71cbb5826254114ea5b/samplers.py
+    Method background: https://arxiv.org/abs/1901.09335 (Augment your batch).
+    The non-distributed R*N fallback and tiny-dataset selection fallback are
+    project adaptations. DALI's R full passes are also local policy, not an
+    implication of the RA paper; see README_imagenet_augmentation.md section 4.
     """
 
     def __init__(self, dataset, num_replicas=None, rank=None, shuffle=True, seed=0, repetitions=3):
@@ -76,6 +84,8 @@ class RASampler(torch.utils.data.Sampler):
         indices = indices[self.rank : self.total_size : self.num_replicas]
         assert len(indices) == self.num_samples
 
+        # torchvision/DeiT selection: repetitions affect the candidate sequence,
+        # not the final global epoch budget (~N, rather than repetitions*N).
         return iter(indices[: self.num_selected_samples])
 
     def __len__(self):

@@ -52,6 +52,7 @@ class MLSetup:
 
     # ---- special functions ------------------------------------------------
     difussion_generate_sample: Optional[Callable[..., None]] = None
+    reinitialize_model_fn: Optional[Callable[[nn.Module], None]] = None
 
     # ------------------------------------------------------------------
     # Public API: get dataloaders

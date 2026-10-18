@@ -1,11 +1,17 @@
 """ImageNet dataset setups for LLR2.
 
-Two preprocessing presets (matching DFL_torch):
+Two project preprocessing presets, imported from DFL_torch in LLR2 98addde:
   preset_version=1 — RandomResizedCrop + RandomHorizontalFlip  (basic)
-  preset_version=2 — + TrivialAugmentWide + RandAugment + RandomErasing  (PyTorch Recipe v2)
+  preset_version=2 — + TrivialAugmentWide + RandAugment + RandomErasing
 
-Recipe comparison, historical ViT preset bug, and epoch budgets are documented
-in README_imagenet_augmentation.md beside this module.
+Basic/eval preprocessing reference:
+https://github.com/pytorch/vision/blob/v0.28.0/references/classification/presets.py
+The v2 inspiration is torchvision's improved training recipe:
+https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/
+LLR2 additionally chains RandAugment after TrivialAugmentWide; this is a project
+variant, not an exact reproduction of that official recipe or transforms v2 API.
+Per-operation papers, pinned implementations, legacy ViT and backend differences
+are documented in README_imagenet_augmentation.md, sections 1.1/1.2 and 4.
 
 Path resolution is handled by dataset_default.py; override via a
 ``dataset_env.py`` file placed in the same directory.
@@ -152,6 +158,10 @@ class _DaliImageNetIterator:
         pending_label = None
 
         try:
+            # LLR2's DALI RA compatibility means R complete reader passes,
+            # unlike torchvision/DeiT's repeat-then-truncate distributed RA.
+            # Pipeline reuse does not change this sample budget; provenance
+            # and per-backend epoch counts: README_imagenet_augmentation.md §4.
             for repetition in range(self._repetitions):
                 reader_consumed = 0
                 for batch in self._dali_iterator:
@@ -248,6 +258,7 @@ def build_dali_imagenet_pipeline(
     auto_augment_interpolation=transforms.InterpolationMode.BILINEAR,
     random_erase_prob: float = 0.0, labels_on_gpu: bool = False,
     pipeline_kwargs: Optional[dict[str, Any]] = None,
+    augmentation_recipe: Optional[str] = None,
 ):
     """Shared CPU decoding/GPU preprocessing for both ImageNet entry points.
 
@@ -266,6 +277,10 @@ def build_dali_imagenet_pipeline(
 
     dali_rgb = getattr(types, "RGB")
     dali_interp_linear = getattr(types, "INTERP_LINEAR")
+    if augmentation_recipe not in (None, "convnext_v1"):
+        raise ValueError(f"Unknown ImageNet augmentation recipe {augmentation_recipe!r}")
+    resize_interpolation = (getattr(types, "INTERP_CUBIC")
+                            if augmentation_recipe == "convnext_v1" else dali_interp_linear)
     dali_interp_nearest = getattr(types, "INTERP_NN")
     dali_float = getattr(types, "FLOAT")
     auto_augment_fill_value = _to_dali_fill_value(auto_augment_policy)
@@ -284,6 +299,10 @@ def build_dali_imagenet_pipeline(
         return equalize if aug.name == "equalize" else aug
 
     if training and auto_augment_policy is not None:
+        # Historical LLR2 DALI choice, retained for v3 compatibility. NVIDIA's
+        # image_net table differs from torchvision AutoAugmentPolicy.IMAGENET;
+        # this is a policy difference, not merely a GPU implementation detail.
+        # https://github.com/NVIDIA/DALI/blob/v2.3.0/dali/python/nvidia/dali/auto_aug/auto_augment.py
         original = dali_auto_augment.get_image_net_policy(use_shape=True)
         policy = Policy(
             original.name, original.num_magnitude_bins,
@@ -292,12 +311,18 @@ def build_dali_imagenet_pipeline(
              for sub_policy in original.sub_policies],
         )
     elif training and use_preset_v2_augmentations:
+        # NVIDIA implementations of TrivialAugmentWide / RandAugment; composing
+        # both is LLR2's v2 choice, not torchvision's exclusive policy selector.
+        # Method/implementation links: README_imagenet_augmentation.md section 1.2.
         trivial_suite = [replace_equalize(aug) for aug in
                          dali_trivial_augment.get_trivial_augment_wide_suite(use_shape=True)]
         rand_suite = [replace_equalize(aug) for aug in
                       dali_rand_augment.get_rand_augment_suite(use_shape=True)]
 
     def apply_random_erasing(images):
+        # Project DALI adaptation of Random Erasing (arxiv:1708.04896): mimic
+        # CPU v2's pre-normalization black fill. Rectangle sampling differs from
+        # torchvision's retry algorithm; ConvNeXt uses timm pixel noise instead.
         if random_erase_prob <= 0.0:
             return images
 
@@ -341,11 +366,15 @@ def build_dali_imagenet_pipeline(
             device="gpu",
             resize_x=crop_size,
             resize_y=crop_size,
-            interp_type=dali_interp_linear,
+            interp_type=resize_interpolation,
         )
         mirror = fn.random.coin_flip(probability=0.5)
         images = fn.flip(images, horizontal=mirror)
-        if auto_augment_policy is not None:
+        if augmentation_recipe == "convnext_v1":
+            from .convnext_augmentation import dali_convnext_randaugment
+
+            images = dali_convnext_randaugment(images, crop_size)
+        elif auto_augment_policy is not None:
             images = dali_auto_augment.apply_auto_augment(
                 policy,
                 images,
@@ -377,7 +406,12 @@ def build_dali_imagenet_pipeline(
             mean=_DALI_MEAN,
             std=_DALI_STD,
         )
-        images = apply_random_erasing(images)
+        if augmentation_recipe == "convnext_v1":
+            from .convnext_augmentation import dali_convnext_erasing
+
+            images = dali_convnext_erasing(images, crop_size, random_erase_prob)
+        else:
+            images = apply_random_erasing(images)
         return images, labels.gpu() if labels_on_gpu else labels
 
     @pipeline_def
@@ -389,7 +423,7 @@ def build_dali_imagenet_pipeline(
             images,
             device="gpu",
             resize_shorter=resize_size,
-            interp_type=dali_interp_linear,
+            interp_type=resize_interpolation,
         )
         images = fn.crop_mirror_normalize(  # type: ignore[call-overload]
             images, # type: ignore
@@ -421,11 +455,15 @@ class DaliImageNetDataset(Dataset):
     auto_augment_interpolation: transforms.InterpolationMode = transforms.InterpolationMode.BILINEAR
     random_erase_prob: float = 0.0
     repeated_augmentation_repetitions: int = 1
+    augmentation_recipe: Optional[str] = None
 
     def __post_init__(self) -> None:
         folder_dataset = datasets.ImageFolder(self.file_root)
         self.base_sample_count = len(folder_dataset)
         if self.split == "train" and self.augmentation:
+            # LLR2 compatibility budget: full reader passes, hence R*N samples
+            # per logical epoch (v3 R=3, v2 R=4). This is not DALI's requirement
+            # or torchvision/DeiT DDP RA's repeat-then-truncate (~N) semantics.
             self.sample_count = self.base_sample_count * max(1, self.repeated_augmentation_repetitions)
         else:
             self.sample_count = self.base_sample_count
@@ -506,6 +544,7 @@ class DaliImageNetDataset(Dataset):
                 preset_version=self.preset_version, auto_augment_policy=self.auto_augment_policy,
                 auto_augment_interpolation=self.auto_augment_interpolation,
                 random_erase_prob=self.random_erase_prob, pipeline_kwargs=pipeline_options,
+                augmentation_recipe=self.augmentation_recipe,
             )
             return DALIGenericIterator(
                 [pipeline], output_map=["data", "label"], reader_name="Reader", auto_reset=False,
@@ -537,6 +576,9 @@ class DaliImageNetDataset(Dataset):
                 "erase": self.random_erase_prob, "repetitions": repetitions, "seed": config.seed,
                 "drop_last": drop_last, "shuffle": shuffle,
                 "prefetch_factor": config.prefetch_factor or 2,
+                # Preserve legacy signatures exactly when no new recipe is selected.
+                **({"augmentation_recipe": self.augmentation_recipe}
+                   if self.augmentation_recipe is not None else {}),
             },
         )
 
@@ -558,7 +600,8 @@ def get_imagenet_preprocessing(
     Parameters
     ----------
     version:
-        1 — basic recipe; 2 — PyTorch Recipe v2 (TrivialAugmentWide + RandAugment).
+        1 — basic recipe; 2 — LLR2 v2 (TrivialAugmentWide + RandAugment),
+        inspired by torchvision's improved recipe; see the module provenance.
     train_crop_size / val_resize_size / val_crop_size:
         Override default crop/resize sizes.
     random_erasing:
@@ -568,6 +611,8 @@ def get_imagenet_preprocessing(
         Set to ``False`` to disable all training augmentation (evaluation mode).
     """
     if not augmentation:
+        # LLR2 no-augmentation baseline: reuse deterministic eval-style image
+        # processing, not an upstream recipe called "preset 0".
         crop = train_crop_size or 224
         vrs = val_resize_size or 256
         vcs = val_crop_size or 224
@@ -586,6 +631,7 @@ def get_imagenet_preprocessing(
         return train_tfm, val_tfm
 
     if version == 1:
+        # torchvision basic classification recipe: RRC + HFlip + normalization.
         crop = train_crop_size or 224
         vrs = val_resize_size or 256
         vcs = val_crop_size or 224
@@ -607,6 +653,10 @@ def get_imagenet_preprocessing(
         return train_tfm, val_tfm
 
     elif version == 2:
+        # Historical LLR2/DFL_torch composition (98addde). The torchvision
+        # reference uses TA Wide alone, whereas LLR2 additionally applies RA(2,9).
+        # Keep the original pre-Normalize black erasing for compatibility.
+        # Papers and upstream code: README_imagenet_augmentation.md section 1.2.
         crop = train_crop_size or 176
         vrs = val_resize_size or 232
         vcs = val_crop_size or 224
@@ -698,6 +748,7 @@ def _make_dali_imagenet_setup(
     repeated_augmentation_repetitions: Optional[int] = None,
     train_dirname: str = "train",
     val_dirname: str = "val",
+    augmentation_recipe: Optional[str] = None,
 ) -> DatasetSetup:
     root = str(dataset_root)
     if repeated_augmentation_repetitions is None:
@@ -716,6 +767,7 @@ def _make_dali_imagenet_setup(
         auto_augment_interpolation=auto_augment_interpolation,
         random_erase_prob=random_erase_prob,
         repeated_augmentation_repetitions=repeated_augmentation_repetitions,
+        augmentation_recipe=augmentation_recipe,
     )
     val_data = DaliImageNetDataset(
         file_root=os.path.join(root, val_dirname),
@@ -731,6 +783,7 @@ def _make_dali_imagenet_setup(
         auto_augment_interpolation=auto_augment_interpolation,
         random_erase_prob=0.0,
         repeated_augmentation_repetitions=1,
+        augmentation_recipe=augmentation_recipe,
     )
     return DatasetSetup(dataset_type, train_data, val_data)
 
@@ -876,6 +929,7 @@ def dataset_imagenet21k_p(
     dali_device_id: int = 0,
     auto_augment_policy: Optional[str] = None,
     repeated_augmentation_repetitions: Optional[int] = None,
+    augmentation_recipe: Optional[str] = None,
 ) -> DatasetSetup:
     """ImageNet-21k-p in the resized ImageFolder layout.
 
@@ -902,6 +956,7 @@ def dataset_imagenet21k_p(
             val_dirname="imagenet21k_val",
             auto_augment_policy=auto_augment_policy,
             repeated_augmentation_repetitions=repeated_augmentation_repetitions,
+            augmentation_recipe=augmentation_recipe,
         )
         if ds.train_data.classes != ds.valdation_data.classes:
             raise ValueError(

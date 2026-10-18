@@ -1,7 +1,11 @@
 """Shared ImageNet criterion, batch augmentation and sampler presets.
 
-See ../ml_setup_dataset/README_imagenet_augmentation.md for exact v1/v2
-semantics, the historical ViT recipe, and backend-dependent epoch budgets.
+v1 uses torchvision's basic classification recipe; v2 takes Mixup/CutMix
+0.2/1.0, label smoothing 0.1 and RA4 from its improved training recipe:
+https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/
+LLR2's v2 image pipeline additionally chains TA Wide and RandAugment; it is not
+an exact copy of that recipe. See ../ml_setup_dataset/README_imagenet_augmentation.md
+sections 1.1/1.2 for per-operation sources, v3/v4, and backend epoch budgets.
 """
 
 from typing import Callable, Optional
@@ -21,6 +25,7 @@ def preset_version(preset: int) -> int:
 
 
 def imagenet_criterion(preset: int) -> nn.Module:
+    # Improved torchvision recipe: smoothing=0.1; basic recipe uses hard CE.
     return nn.CrossEntropyLoss() if preset == 1 else nn.CrossEntropyLoss(label_smoothing=0.1)
 
 
@@ -56,6 +61,8 @@ def imagenet_sampler_fn(preset: int, ) -> Optional[Callable]:
     if preset == 1:
         output_sampler_fn = None
     else:
+        # RA4 is a torchvision improved-recipe parameter. The local sampler's
+        # non-DDP full-repeat fallback is LLR2-specific; DDP truncates to ~N.
         def sampler_fn(dataset):
             return RASampler(dataset, shuffle=True, repetitions=4)
         output_sampler_fn = sampler_fn

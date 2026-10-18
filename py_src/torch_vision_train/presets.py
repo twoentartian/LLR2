@@ -1,3 +1,13 @@
+"""Local adaptation of torchvision classification reference preset builders.
+
+Upstream reference snapshot:
+https://github.com/pytorch/vision/blob/v0.28.0/references/classification/presets.py
+The builder exposes alternative AA/RA/TA/AugMix policies; callers choose the
+recipe. use_v2 selects a transforms API, not LLR2's numbered preset 2.
+For the actually used recipes and per-method papers, see
+../ml_setup_dataset/README_imagenet_augmentation.md sections 1.1/1.2.
+"""
+
 import torch
 from torchvision.transforms.functional import InterpolationMode
 

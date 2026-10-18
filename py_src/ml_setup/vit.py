@@ -1,3 +1,14 @@
+"""ViT ImageNet recipe provenance (LLR2 preset numbers, not transforms API versions).
+
+0 is the project's deterministic baseline; 1/2 are the project basic/advanced
+recipes documented in ../ml_setup_dataset/README_imagenet_augmentation.md.
+3 preserves LLR2 c4de35f / 7484fdc, based on torchvision's ViT-B/32 command:
+https://github.com/pytorch/vision/blob/v0.28.0/references/classification/README.md#vit_b_32
+That reference supplies ImageNet AA, Mixup/CutMix 0.2/1.0, smoothing 0.11 and
+RA3 (train.py default). DALI's policy table and full-repeat epoch budget are
+LLR2 adaptations; they are not equivalent to torchvision's DDP sampling.
+"""
+
 from functools import partial
 from typing import Optional
 
@@ -33,6 +44,8 @@ def _mixup_cutmix_collate(batch, *, mixup_cutmix):
 
 
 def _vit_b_32_torchvision_collate_fn(num_classes: int = 1000):
+    # torchvision ViT-B/32 reference coefficients; the helper selects one batch
+    # operation. Mixup / CutMix papers: arxiv:1710.09412 / arxiv:1905.04899.
     mixup_cutmix = get_mixup_cutmix(
         mixup_alpha=0.2, cutmix_alpha=1.0, num_classes=num_classes, use_v2=True,
     )
@@ -40,6 +53,8 @@ def _vit_b_32_torchvision_collate_fn(num_classes: int = 1000):
 
 
 def _vit_b_32_torchvision_sampler_fn(dataset):
+    # RA3 comes from torchvision's ViT-B/32 --ra-sampler + default --ra-reps 3.
+    # Local and DDP epoch budgets differ; see RASampler's provenance/docstring.
     return RASampler(dataset, shuffle=True, repetitions=3)
 
 
@@ -153,7 +168,12 @@ def _vit_dataset(dataset_type, preset, use_dali, dali_device_id):
 
 
 def _vit_v3_dataset(dataset_type, use_dali, dali_device_id):
-    """The pre-fix ViT transforms, including its original transforms API choices."""
+    """Preserve 7484fdc's torchvision ViT-B/32-inspired transforms/API choices.
+
+    AutoAugment method: https://arxiv.org/abs/1805.09501. CPU uses torchvision's
+    IMAGENET table; DALI keeps NVIDIA's different image_net table and 3N budget.
+    This preserves each historical backend, not CPU/DALI equivalence.
+    """
     sizes = dict(train_crop_size=224, val_resize_size=256, val_crop_size=224)
     if use_dali:
         if dataset_type == DatasetType.imagenet21k_p:
@@ -189,6 +209,8 @@ def _vit_b_32_setup(ds: DatasetSetup, *, preset: int, model_type: ModelType, num
     from torchvision import models
 
     if preset == VIT_LEGACY_PRESET:
+        # 0.11 is explicitly in torchvision's ViT-B/32 reference command linked
+        # above, not an accidental typo for 0.1 or a universal ViT paper setting.
         criterion = nn.CrossEntropyLoss(label_smoothing=0.11)
         collate_fn = _vit_b_32_torchvision_collate_fn(num_classes)
         sampler_fn = _vit_b_32_torchvision_sampler_fn

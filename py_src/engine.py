@@ -259,6 +259,14 @@ def train(
                 if step_optimizer and accumulated_batches < gradient_accumulate_every
                 else gradient_accumulate_every
             )
+            if (step_optimizer and 1 < accumulated_batches < gradient_accumulate_every):
+                # Previous microbatches in this short final group used the
+                # full divisor. Rescale them before adding the final gradient
+                # so every microbatch in the group has the same weight.
+                with torch.no_grad():
+                    for parameter in model.parameters():
+                        if parameter.grad is not None:
+                            parameter.grad.mul_(gradient_accumulate_every / accumulated_batches)
 
             sync_context = (
                 model.no_sync()

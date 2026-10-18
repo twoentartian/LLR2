@@ -222,6 +222,43 @@ class FastTrainingSetup:
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
             return optimizer, scheduler, epochs
 
+        elif mt == ModelType.convnext_tiny and dt == DatasetType.imagenet21k_p:
+            # ConvNeXt CVPR 2022, Table 5: 90/5, effective batch 4096, lr=.004.
+            # override_steps_per_epoch counts optimizer updates, as provided
+            # by the training entry point after accounting for accumulation.
+            accumulation = arg_ml_setup.gradient_accumulate_every
+            if accumulation < 1:
+                raise ValueError("gradient_accumulate_every must be positive")
+            updates_per_epoch = (steps_per_epoch if override_steps_per_epoch is not None
+                                 else math.ceil(steps_per_epoch / accumulation))
+            effective_batch = batch_size * accumulation
+            peak_lr = 4e-3 * effective_batch / 4096
+            minimum_lr = 1e-6 * effective_batch / 4096
+            decay, no_decay = [], []
+            for name, parameter in model.named_parameters():
+                if parameter.requires_grad:
+                    # torchvision stores LayerScale as [C,1,1], whereas the
+                    # official implementation stores the same vector as [C].
+                    exempt = parameter.ndim == 1 or name.endswith((".bias", ".layer_scale"))
+                    (no_decay if exempt else decay).append(parameter)
+            optimizer = torch.optim.AdamW(
+                [{"params": decay, "weight_decay": 0.05},
+                 {"params": no_decay, "weight_decay": 0.0}],
+                lr=peak_lr, betas=(0.9, 0.999), eps=1e-8,
+            )
+            warmup_steps, total_steps = 5 * updates_per_epoch, 90 * updates_per_epoch
+
+            def convnext_lr(step):
+                # Match the official array schedule: first update uses zero LR,
+                # the final warmup update reaches peak, then cosine to 1e-6.
+                if step < warmup_steps:
+                    return step / max(1, warmup_steps - 1)
+                progress = min(1.0, (step - warmup_steps) / (total_steps - warmup_steps))
+                return (minimum_lr + 0.5 * (peak_lr - minimum_lr) * (1 + math.cos(math.pi * progress))) / peak_lr
+
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, convnext_lr)
+            return optimizer, scheduler, 90
+
         elif mt in (ModelType.vit_b_32, ModelType.vit_b_32_reg4, ModelType.vit_b_32_rope, ModelType.vit_b_32_swiglu):
             if dt in (DatasetType.imagenet1k, DatasetType.imagenet21k_p):
                 # All four ViT variants use the same 90/5 budget on 1k and 21k-p.

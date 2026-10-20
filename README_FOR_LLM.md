@@ -63,6 +63,7 @@
 - 每 epoch 的日志和优化 CSV 还包含 `running_train_loss` / `running_val_loss`，复用训练 forward 的原始 loss 按样本数加权，跳过末尾 eval 时仍汇报；val 权重为 0、未执行该侧 forward 时记 `NaN`。完整 eval 的日志字段为 `eval_train_loss` / `eval_val_loss`，CSV 仍为 `loss_a` / `loss_b`。
 - 会保留 accuracy gap 和 loss gap 最大的 checkpoint，并对这些 checkpoint 追加相对平坦度测量。
 - 单节点 2/4 卡通过显式 all-reduce 同步原始 train/val 梯度后再归一化组合，同时支持 PyTorch/DALI 分片。多卡默认延后 flatness，单设备可用 `--skip_relative_flatness` 显式延后；仍保存最终模型、gap checkpoint、split seed 等，summary 记 `deferred`/`null`。多卡 flatness 尚未实现。
+- `--gradient_accumulate_every k`（默认 1）：normalized_two_sided 在同一参数点按样本数平均 k 个配对 microbatch 的原始 train/val 梯度，再归一化组合并更新一次；difference/mean_relative_gap 直接累加 surrogate 梯度。epoch 末不足 k 的组单独更新，scheduler 按更新数计步；CSV 的 `batches` 为 microbatch 数，新增 `optimizer_updates`，summary runtime 记录 `effective_batch_size`。ConvNeXt + 21k-p 默认 `--model_preset 4`（无 Mixup 时为硬标签 CE），optimizer 为 AdamW lr4e-3、wd0.05（范数/偏置/LayerScale 不衰减）、cosine 到 1e-6；Snellius 入口 `tool/snellius/convnext_tiny_imagenet21k_p_misalignment.sbatch` 强制 512×8=4096。
 - `--eval_last_10_percent` 可将 epoch 末全量 A/B 评估限制到最后 `ceil(epochs/10)` 个 epoch（默认每 epoch 评估）。跳过时优化 CSV 标记 `evaluated=0`，loss/accuracy/gap 为 `NaN`；范数和 gap checkpoint 仅记录已评估 epoch，权重方差和梯度几何照常记录。对称目标更新所需的 baseline eval 保留。
 - 主要输出为 `optimization_*.csv`、`gradient_geometry_*.csv`、`weight_variance_*.csv`、`relative_flatness_*.csv`、`selected_relative_flatness_*.csv`、模型 checkpoint 和 `summary.json`。
 - `summary.json` 还记录数据分区、loader、AMP/compile、optimizer、checkpoint 选择和 `git_provenance`。最近一次修改后，Git commit、branch 和 tracked working-tree 状态会在运行时写入结果。

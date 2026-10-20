@@ -1,8 +1,8 @@
 """Optimizer presets for the symmetric misalignment experiment.
 
-The misalignment objectives are optimized after every paired mini-batch.
-Scheduler durations therefore count the number of mini-batch updates in each
-epoch. These presets are local to this experiment and do not change
+The misalignment objectives are optimized after every paired mini-batch (or
+after an explicitly requested accumulation group). Scheduler durations
+therefore count effective optimizer updates in each epoch. These presets are local to this experiment and do not change
 project-wide MLSetup interfaces.
 """
 
@@ -31,6 +31,7 @@ class MisalignmentOptimizerConfig:
     eps: float
     epochs: int
     updates_per_epoch: int
+    gradient_accumulate_every: int
     warmup_epochs: int
     minimum_learning_rate: float
 
@@ -56,6 +57,7 @@ class MisalignmentOptimizationSetup:
         optimizer: str = "auto",
         scheduler: str = "fixed",
         updates_per_epoch: int = 1,
+        gradient_accumulate_every: int = 1,
         warmup_epochs: int | None = None,
     ) -> MisalignmentOptimizerConfig:
         preset = int(preset)
@@ -80,8 +82,16 @@ class MisalignmentOptimizationSetup:
             minimum_lr_ratio, default_warmup = 0.01, 0
         elif dataset_name == "imagenet21k_p":
             default_optimizer, default_wd, default_epochs = "adamw", 5e-2, 90
-            default_lr = 5e-4 if model_name.startswith("vit_") else 3e-4
-            minimum_lr_ratio, default_warmup = 0.0, 5
+            if model_name.startswith("convnext"):
+                # ConvNeXt's ImageNet-22k recipe uses peak LR 4e-3 and
+                # decays to 1e-6. The 21k-p run uses the same optimizer
+                # recipe, with its processed dataset as the only adaptation.
+                default_lr = 4e-3
+                minimum_lr_ratio = 1e-6 / default_lr
+            else:
+                default_lr = 5e-4 if model_name.startswith("vit_") else 3e-4
+                minimum_lr_ratio = 0.0
+            default_warmup = 5
         else:
             raise NotImplementedError(f"No misalignment optimizer preset for {dataset_name!r}")
 
@@ -101,8 +111,11 @@ class MisalignmentOptimizationSetup:
 
         actual_epochs = default_epochs if epochs is None else int(epochs)
         actual_updates_per_epoch = int(updates_per_epoch)
+        gradient_accumulate_every = int(gradient_accumulate_every)
         if actual_updates_per_epoch <= 0:
             raise ValueError("updates_per_epoch must be positive")
+        if gradient_accumulate_every <= 0:
+            raise ValueError("gradient_accumulate_every must be positive")
         actual_lr = default_lr if learning_rate is None else float(learning_rate)
         actual_wd = default_wd if weight_decay is None else float(weight_decay)
         if actual_epochs <= 0:
@@ -136,6 +149,7 @@ class MisalignmentOptimizationSetup:
             eps=1e-8,
             epochs=actual_epochs,
             updates_per_epoch=actual_updates_per_epoch,
+            gradient_accumulate_every=gradient_accumulate_every,
             warmup_epochs=warmup_epochs,
             # For a fixed schedule the effective minimum is the initial LR;
             # the dataset-specific ratio only applies to cosine annealing.
@@ -158,6 +172,7 @@ class MisalignmentOptimizationSetup:
         optimizer: str = "auto",
         scheduler: str = "fixed",
         updates_per_epoch: int = 1,
+        gradient_accumulate_every: int = 1,
         warmup_epochs: int | None = None,
     ):
         config = MisalignmentOptimizationSetup.resolve_config(
@@ -169,6 +184,7 @@ class MisalignmentOptimizationSetup:
             optimizer=optimizer,
             scheduler=scheduler,
             updates_per_epoch=updates_per_epoch,
+            gradient_accumulate_every=gradient_accumulate_every,
             warmup_epochs=warmup_epochs,
         )
         if config.optimizer == "sgd":
@@ -180,13 +196,27 @@ class MisalignmentOptimizationSetup:
             )
         else:
             optimizer_class = torch.optim.AdamW if config.optimizer == "adamw" else torch.optim.Adam
-            optimizer_instance = optimizer_class(
-                model.parameters(),
-                lr=config.learning_rate,
-                weight_decay=config.weight_decay,
-                betas=config.betas,
-                eps=config.eps,
-            )
+            if (config.optimizer == "adamw" and config.dataset == "imagenet21k_p"
+                    and config.model.startswith("convnext")):
+                decay, no_decay = [], []
+                for name, parameter in model.named_parameters():
+                    if not parameter.requires_grad:
+                        continue
+                    exempt = parameter.ndim == 1 or name.endswith((".bias", ".layer_scale"))
+                    (no_decay if exempt else decay).append(parameter)
+                optimizer_instance = optimizer_class(
+                    [{"params": decay, "weight_decay": config.weight_decay},
+                     {"params": no_decay, "weight_decay": 0.0}],
+                    lr=config.learning_rate, betas=config.betas, eps=config.eps,
+                )
+            else:
+                optimizer_instance = optimizer_class(
+                    model.parameters(),
+                    lr=config.learning_rate,
+                    weight_decay=config.weight_decay,
+                    betas=config.betas,
+                    eps=config.eps,
+                )
         scheduler_instance = None
         if config.scheduler == "onecycle":
             scheduler_instance = torch.optim.lr_scheduler.OneCycleLR(
@@ -244,6 +274,7 @@ def build_optimizer_and_scheduler(
     weight_decay: float | None = None,
     optimizer: str = "auto",
     scheduler: str = "fixed",
+    gradient_accumulate_every: int = 1,
     warmup_epochs: int | None = None,
 ):
     """Build a preset while preserving the original wrapper's call shape."""
@@ -251,7 +282,10 @@ def build_optimizer_and_scheduler(
         raise ValueError("batch_size must be positive")
     if len(training_dataset) == 0:
         raise ValueError("training_dataset must contain at least one example")
-    updates_per_epoch = max(1, math.ceil(len(training_dataset) / batch_size))
+    if gradient_accumulate_every <= 0:
+        raise ValueError("gradient_accumulate_every must be positive")
+    microbatches_per_epoch = max(1, math.ceil(len(training_dataset) / batch_size))
+    updates_per_epoch = max(1, math.ceil(microbatches_per_epoch / gradient_accumulate_every))
     return MisalignmentOptimizationSetup.get_optimizer_lr_scheduler_epoch(
         ml_setup,
         model,
@@ -262,5 +296,6 @@ def build_optimizer_and_scheduler(
         optimizer=optimizer,
         scheduler=scheduler,
         updates_per_epoch=updates_per_epoch,
+        gradient_accumulate_every=gradient_accumulate_every,
         warmup_epochs=warmup_epochs,
     )

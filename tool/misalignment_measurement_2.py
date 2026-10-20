@@ -102,6 +102,7 @@ from py_src.util import set_seed, setup_logging
 from py_src import distributed
 from py_src.precision import inference_autocast, inference_dtype
 from py_src.ml_setup.vit import VIT_LEGACY_PRESET
+from py_src.ml_setup.convnext import CONVNEXT_OFFICIAL_PRESET
 
 logger = logging.getLogger("misalignment_measurement_2")
 
@@ -283,9 +284,12 @@ def _load_image_bundle(args, dataset_name: str, model_type: str, augmentation: i
     # batch transforms. Mixup/CutMix is not used in this experiment.
     factory_preset = getattr(args, "model_preset", None)
     if factory_preset is None:
-        factory_preset = (
-            VIT_LEGACY_PRESET if model_type.startswith("vit_b_32") else 1
-        ) if dataset_name in IMAGENET_DATASETS else 0
+        if model_type.startswith("convnext") and dataset_name == "imagenet21k_p":
+            factory_preset = CONVNEXT_OFFICIAL_PRESET
+        elif dataset_name in IMAGENET_DATASETS:
+            factory_preset = VIT_LEGACY_PRESET if model_type.startswith("vit_b_32") else 1
+        else:
+            factory_preset = 0
     ml_setup = get_ml_setup_from_config(model_type, dataset_type=dataset_name, preset=factory_preset)
     common_transform = build_augmentation(ml_setup, dataset_name, augmentation)
     if not hasattr(ml_setup.training_data, "transform") or not hasattr(ml_setup.testing_data, "transform"):
@@ -618,16 +622,20 @@ def train_symmetric_objective(
     eval_loader_b: Iterable | None = None,
     final_metrics_callback: Callable[[LossMetrics, LossMetrics], None] | None = None,
     eval_last_10_percent: bool = False,
+    gradient_accumulate_every: int = 1,
 ) -> list[dict[str, float]]:
     if epochs <= 0:
         raise ValueError("epochs must be positive")
+    if gradient_accumulate_every <= 0:
+        raise ValueError("gradient_accumulate_every must be positive")
     eval_loader_a = loader_a if eval_loader_a is None else eval_loader_a
     eval_loader_b = loader_b if eval_loader_b is None else eval_loader_b
     first_eval_epoch = _epoch_evaluation_start(epochs, eval_last_10_percent)
     rows: list[dict[str, float]] = []
     optimization_fields = [
         "epoch", "evaluated", "loss_a", "loss_b", "train_accuracy", "val_accuracy", "mean_loss",
-        "abs_accuracy_gap", "abs_loss_gap", "relative_gap", "objective", "batches", "learning_rate",
+        "abs_accuracy_gap", "abs_loss_gap", "relative_gap", "objective", "batches", "optimizer_updates",
+        "learning_rate",
     ]
     if tokenizer_monitor is not None and tokenizer_monitor.available:
         optimization_fields.extend(TOKENIZER_RATIO_FIELDS)
@@ -662,6 +670,8 @@ def train_symmetric_objective(
         )
         model.train()
         batches = 0
+        updates = 0
+        microbatches_per_epoch = len(loader_a)
         training_loss_totals = torch.zeros(2, dtype=torch.float64, device=device)
         training_example_counts = [0, 0]
         training_start = time.perf_counter()
@@ -697,8 +707,14 @@ def train_symmetric_objective(
             )
             if scaler is not None:
                 surrogate = scaler.scale(surrogate)
-            optimizer.zero_grad(set_to_none=True)
+            # The surrogate is already weighted by count/partition size, so
+            # summing microbatch gradients gives the group's gradient.
+            if batches % gradient_accumulate_every == 0:
+                optimizer.zero_grad(set_to_none=True)
             surrogate.backward()
+            batches += 1
+            if batches % gradient_accumulate_every and batches != microbatches_per_epoch:
+                continue
             if distributed.enabled():
                 parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
                 for parameter in parameters:
@@ -715,7 +731,7 @@ def train_symmetric_objective(
                 optimizer.step()
             if scheduler is not None and (scaler is None or scaler.get_scale() >= previous_scale):
                 scheduler.step()
-            batches += 1
+            updates += 1
         running_losses = _epoch_training_losses(training_loss_totals, training_example_counts)
         train_seconds = time.perf_counter() - training_start
         evaluated = epoch >= first_eval_epoch
@@ -766,6 +782,7 @@ def train_symmetric_objective(
             "relative_gap": relative_gap_current,
             "objective": mean_objective,
             "batches": float(batches),
+            "optimizer_updates": float(updates),
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
         }
         tokenizer_log = "".join(f" {name}={row[name]:.6g}" for name in TRAINING_LOSS_FIELDS)
@@ -1036,10 +1053,20 @@ def train_normalized_two_sided(
     eval_loader_b: Iterable | None = None,
     final_metrics_callback: Callable[[LossMetrics, LossMetrics], None] | None = None,
     eval_last_10_percent: bool = False,
+    gradient_accumulate_every: int = 1,
 ) -> list[dict[str, float]]:
-    """Run the normalized train-descent/val-ascent update from initialization."""
+    """Run the normalized train-descent/val-ascent update from initialization.
+
+    With ``gradient_accumulate_every=k`` the raw train and val gradients of
+    ``k`` consecutive paired microbatches are averaged (weighted by examples)
+    at one parameter state before the per-tensor normalization, so each
+    update sees the gradient of the full effective batch. A shorter final
+    group in an epoch is applied as its own update.
+    """
     if epochs <= 0:
         raise ValueError("epochs must be positive")
+    if gradient_accumulate_every <= 0:
+        raise ValueError("gradient_accumulate_every must be positive")
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not parameters:
         raise ValueError("model has no trainable parameters")
@@ -1058,8 +1085,8 @@ def train_normalized_two_sided(
     geometry_sample_epochs = _gradient_geometry_sample_epochs(epochs)
     optimization_fields = [
         "epoch", "evaluated", "loss_a", "loss_b", "train_accuracy", "val_accuracy", "mean_loss",
-        "abs_accuracy_gap", "abs_loss_gap", "relative_gap", "objective", "batches", "learning_rate",
-        "train_val_gradient_cosine", "train_gradient_weight", "val_gradient_weight",
+        "abs_accuracy_gap", "abs_loss_gap", "relative_gap", "objective", "batches", "optimizer_updates",
+        "learning_rate", "train_val_gradient_cosine", "train_gradient_weight", "val_gradient_weight",
     ]
     if tokenizer_monitor is not None and tokenizer_monitor.available:
         optimization_fields.extend(TOKENIZER_RATIO_FIELDS)
@@ -1089,8 +1116,13 @@ def train_normalized_two_sided(
         # state; the next pair then sees the updated model and optimizer state.
         # This matches ordinary mini-batch training and is intentionally
         # different from accumulating a full-partition gradient and taking a
-        # single optimizer step per epoch.
+        # single optimizer step per epoch. With accumulation, a group of
+        # microbatches plays the role of one mini-batch.
         batches = 0
+        updates = 0
+        microbatches_per_epoch = len(loader_a)
+        pending_train = pending_val = None
+        pending_counts = [0, 0]
         collect_geometry = epoch in geometry_sample_epochs
         statistic_fields = GRADIENT_GEOMETRY_FIELDS if collect_geometry else ("train_val_gradient_cosine",)
         geometry_accumulator = GradientGeometryAccumulator(parameter_names, statistic_fields, device)
@@ -1110,14 +1142,14 @@ def train_normalized_two_sided(
                 amp_enabled=amp_enabled, amp_dtype=amp_dtype, scaler=scaler,
                 loss_total=train_loss_total,
             )
-            training_example_counts[0] += int(batch_a["text"].shape[0] if modular else batch_a[0].shape[0])
-            # Training shards have equal per-step sample counts on every rank.
-            distributed.reduce_gradients(train_gradients)
+            count_a = int(batch_a["text"].shape[0] if modular else batch_a[0].shape[0])
+            training_example_counts[0] += count_a
             if val_gradient_weight == 0.0:
                 # Avoid an unnecessary validation forward/backward pass.  In
                 # particular, this keeps train-only runs from consuming extra
                 # dropout RNG values and makes them a faithful train baseline.
-                val_gradients = [torch.zeros_like(gradient) for gradient in train_gradients]
+                val_gradients = None
+                count_b = 0
             else:
                 batch_b = _move_batch(raw_b, device)
                 val_gradients = _compute_batch_gradients(
@@ -1126,7 +1158,38 @@ def train_normalized_two_sided(
                     amp_enabled=amp_enabled, amp_dtype=amp_dtype, scaler=scaler,
                     loss_total=val_loss_total,
                 )
-                training_example_counts[1] += int(batch_b["text"].shape[0] if modular else batch_b[0].shape[0])
+                count_b = int(batch_b["text"].shape[0] if modular else batch_b[0].shape[0])
+                training_example_counts[1] += count_b
+            batches += 1
+            if gradient_accumulate_every > 1:
+                # Parameters are unchanged within a group, so the example-
+                # weighted mean of the microbatch-mean gradients equals the
+                # mean-loss gradient of the whole group. GradScaler's scale is
+                # also constant until the update below.
+                if pending_train is None:
+                    pending_train = [gradient.mul_(count_a) for gradient in train_gradients]
+                    pending_val = (None if val_gradients is None
+                                   else [gradient.mul_(count_b) for gradient in val_gradients])
+                    pending_counts = [count_a, count_b]
+                else:
+                    torch._foreach_add_(pending_train, train_gradients, alpha=count_a)
+                    if val_gradients is not None:
+                        torch._foreach_add_(pending_val, val_gradients, alpha=count_b)
+                    pending_counts[0] += count_a
+                    pending_counts[1] += count_b
+                group_end = batches % gradient_accumulate_every == 0 or batches == microbatches_per_epoch
+                if not group_end:
+                    continue
+                torch._foreach_div_(pending_train, float(pending_counts[0]))
+                if pending_val is not None:
+                    torch._foreach_div_(pending_val, float(pending_counts[1]))
+                train_gradients, val_gradients = pending_train, pending_val
+                pending_train = pending_val = None
+            # Training shards have equal per-step sample counts on every rank.
+            distributed.reduce_gradients(train_gradients)
+            if val_gradients is None:
+                val_gradients = [torch.zeros_like(gradient) for gradient in train_gradients]
+            else:
                 distributed.reduce_gradients(val_gradients)
             if gradient_combiner is None:
                 combined_gradients, batch_stats = _combine_normalized_train_val_gradients(
@@ -1143,10 +1206,10 @@ def train_normalized_two_sided(
             _apply_gradient_update(
                 optimizer, scheduler, parameters, combined_gradients, scaler=scaler
             )
-            batches += 1
+            updates += 1
 
             # Keep the geometry CSV schema unchanged while reporting the mean
-            # geometry observed over the mini-batch updates in this epoch.
+            # geometry observed over the optimizer updates in this epoch.
             geometry_accumulator.update(batch_stats)
 
         gradient_stats = geometry_accumulator.averages()
@@ -1205,6 +1268,7 @@ def train_normalized_two_sided(
             "relative_gap": relative_gap,
             "objective": objective,
             "batches": float(batches),
+            "optimizer_updates": float(updates),
             "learning_rate": float(optimizer.param_groups[0]["lr"]),
             "train_val_gradient_cosine": mean_gradient_cosine,
             "train_gradient_weight": train_gradient_weight,
@@ -1626,7 +1690,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_path", default=None, help="modular dataset folder containing train.txt/val.txt")
     parser.add_argument("-m", "--model_type", default=None, help="MLSetup model name; defaults depend on the dataset")
     parser.add_argument("--model_preset", type=int, default=None,
-                        help="MLSetup/criterion preset (default: ViT ImageNet v3, other ImageNet v1, otherwise 0); "
+                        help="MLSetup/criterion preset (default: ViT ImageNet v3, ConvNeXt 21k-p 4, "
+                             "other ImageNet v1, otherwise 0); "
                              "image augmentation remains controlled by --augmentation")
     parser.add_argument("--augmentation", "--data_augmentation", default="none", help="none/0 or an integer augmentation level")
     parser.add_argument(
@@ -1654,6 +1719,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch_size", type=int, default=None,
                         help="global paired mini-batch size per partition across all GPUs")
+    parser.add_argument("--gradient_accumulate_every", type=int, default=1,
+                        help="paired microbatches averaged per optimizer update (default: 1); the effective "
+                             "batch per partition is --batch_size times this value, and LR schedules count updates")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--optimizer_preset", type=int, default=0)
     parser.add_argument("--optimizer", choices=["auto", "sgd", "adam", "adamw"], default="auto")
@@ -1826,6 +1894,7 @@ def _run_direction(
         weight_decay=args.weight_decay,
         optimizer=args.optimizer,
         scheduler=args.scheduler,
+        gradient_accumulate_every=getattr(args, "gradient_accumulate_every", 1),
         warmup_epochs=args.warmup_epochs,
     )
     runtime_model = model
@@ -1948,6 +2017,7 @@ def _run_direction(
                 eval_loader_a=eval_train_loader, eval_loader_b=eval_val_loader,
                 final_metrics_callback=retain_final_metrics,
                 eval_last_10_percent=getattr(args, "eval_last_10_percent", False),
+                gradient_accumulate_every=getattr(args, "gradient_accumulate_every", 1),
             )
         else:
             rows = train_symmetric_objective(
@@ -1975,6 +2045,7 @@ def _run_direction(
                 eval_loader_a=eval_train_loader, eval_loader_b=eval_val_loader,
                 final_metrics_callback=retain_final_metrics,
                 eval_last_10_percent=getattr(args, "eval_last_10_percent", False),
+                gradient_accumulate_every=getattr(args, "gradient_accumulate_every", 1),
             )
         if distributed.is_main():
             save_model_state(str(final_model_path), model.state_dict(), model_type_name, dataset_type_name)
@@ -2046,6 +2117,8 @@ def _run_direction(
             "world_size": distributed.world_size(),
             "local_batch_size": distributed.local_batch_size(batch_size),
             "batch_size_definition": "global_per_partition_before_accumulation",
+            "gradient_accumulate_every": getattr(args, "gradient_accumulate_every", 1),
+            "effective_batch_size": batch_size * getattr(args, "gradient_accumulate_every", 1),
             "training_sampler_padding": (math.ceil(len(bundle.partition_a) / distributed.world_size())
                                          * distributed.world_size() - len(bundle.partition_a)),
             "loader": {
@@ -2237,6 +2310,8 @@ def main() -> None:
         raise ValueError("--dataset_path is required for --dataset modular")
     if args.batch_size is not None and args.batch_size <= 0:
         raise ValueError("--batch_size must be positive")
+    if args.gradient_accumulate_every <= 0:
+        raise ValueError("--gradient_accumulate_every must be positive")
     if args.epochs is not None and args.epochs <= 0:
         raise ValueError("--epochs must be positive")
     if args.num_workers < 0:
@@ -2395,6 +2470,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         optimizer=args.optimizer,
         scheduler=args.scheduler,
+        gradient_accumulate_every=args.gradient_accumulate_every,
         warmup_epochs=args.warmup_epochs,
     )
     epochs = args.epochs if args.epochs is not None else int(default_epochs)
@@ -2412,15 +2488,22 @@ def main() -> None:
     distributed.barrier()
     initial_state = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
     logger.info(
-        "dataset=%s source_examples=%d half_size=%d augmentation=%s batch_size=%d flatness_batch_size=%d epochs=%d",
+        "dataset=%s source_examples=%d half_size=%d augmentation=%s batch_size=%d gradient_accumulate_every=%d "
+        "effective_batch_size=%d flatness_batch_size=%d epochs=%d",
         bundle.dataset_name,
         bundle.source_examples,
         len(bundle.partition_a),
         args.augmentation,
         batch_size,
+        args.gradient_accumulate_every,
+        batch_size * args.gradient_accumulate_every,
         flatness_batch_size,
         epochs,
     )
+    if (model_type_name == "convnext_tiny" and dataset_type_name == "imagenet21k_p"
+            and batch_size * args.gradient_accumulate_every != 4096):
+        logger.warning("ConvNeXt 21k-p recipe assumes effective batch 4096 (LR 4e-3); got %d",
+                       batch_size * args.gradient_accumulate_every)
     logger.info("objective mode = %s; directions = %s", args.objective, args.directions)
     run_specs = tuple(
         spec

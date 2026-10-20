@@ -69,7 +69,8 @@ def build_optimizer_and_scheduler(ml_setup, model, training_dataset, **kwargs):
         ml_setup, model, training_dataset,
         **{**options, "scheduler": "fixed", "warmup_epochs": 0},
     )
-    updates_per_epoch = math.ceil(len(training_dataset) / int(options["batch_size"]))
+    updates_per_epoch = math.ceil(math.ceil(len(training_dataset) / int(options["batch_size"]))
+                                  / int(options.get("gradient_accumulate_every", 1)))
     warmup_epochs = min(warmup_epochs, epochs - 1)
     warmup_steps = warmup_epochs * updates_per_epoch
     cosine_steps = max(1, (epochs - warmup_epochs) * updates_per_epoch)

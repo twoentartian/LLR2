@@ -65,6 +65,24 @@ LLR2_RESUME_CHECKPOINT=/gpfs/home6/ytian1/llr2-runs/convnext_tiny_imagenet21k_p_
 `LLR2_DECOMPRESS_THREADS`, and output/environment overrides match the ViT bundle.
 `sbatch --test-only SCRIPT` checks scheduling without submitting training.
 
+## Misalignment
+
+`convnext_tiny_imagenet21k_p_misalignment.sbatch` runs
+`tool/misalignment_measurement_2.py` with the same optimizer recipe: global
+paired microbatch 512 per partition, `--gradient_accumulate_every 8`
+(effective 4096; the script refuses other products), AdamW peak LR 0.004,
+wd 0.05 with the same no-decay groups, 90 epochs / 5 warmup, cosine to 1e-6.
+Raw A/B gradients of the 8 microbatches are averaged at one parameter state
+before normalized combination, so each update matches a 4096 batch. No
+augmentation, `--model_preset 4` (hard-label CE: Mixup's smoothing is absent),
+BF16 AMP, train/val gradient weights 0.8/0.2, seed 1, split seed 2026,
+evaluation in the last 9 epochs. Both directions run in one job by default
+(`LLR2_DIRECTIONS=a_as_train_b_as_val` selects one); flatness is deferred.
+
+```bash
+sbatch /gpfs/home6/ytian1/llr2-jobs/convnext_tiny_imagenet21k_p_misalignment.sbatch
+```
+
 References: [ConvNeXt paper, Table 5](https://arxiv.org/html/2201.03545v2#A1.SS1),
 [official training](https://github.com/facebookresearch/ConvNeXt/blob/main/TRAINING.md),
 [official augmentation defaults](https://github.com/facebookresearch/ConvNeXt/blob/main/main.py).

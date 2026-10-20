@@ -29,6 +29,7 @@ _SUPPORTED_LEVELS = {
     "mnist": (0, 1, 2, 3),
     "cifar10": (0, 1, 2, 3),
     "cifar100": (0, 1, 2, 3),
+    "noise_cifar10": (0, 1, 2, 3),
     "imagenet1k": (0, 1, 2),
     "imagenet21k_p": (0, 1),
     "modular": (0,),
@@ -43,6 +44,8 @@ _CIFAR_STATS = {
         (0.5071, 0.4867, 0.4408),
         (0.2675, 0.2565, 0.2761),
     ),
+    # Exact ToTensor statistics of uniform uint8 noise (see dataset_random.py).
+    "noise_cifar10": ((0.5,) * 3, (0.28979,) * 3),
 }
 
 

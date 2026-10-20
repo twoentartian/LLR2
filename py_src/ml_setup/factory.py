@@ -95,6 +95,9 @@ def _build(mt: ModelType, dt, preset: int, device, *, use_dali: bool = False, da
             return resnet18_cifar10(use_gn=use_gn)
         elif dt == DatasetType.cifar100:
             return resnet18_cifar100(use_gn=use_gn)
+        elif dt == DatasetType.noise_cifar10:
+            from py_src.ml_setup_dataset.dataset_random import dataset_noise_cifar10
+            return resnet18_cifar10(override_dataset=dataset_noise_cifar10(), use_gn=use_gn)
         elif dt == DatasetType.imagenet10:
             override = _imagenet_dataset_override(DatasetType.imagenet10, preset, use_dali, dali_device_id)
             return resnet18_imagenet10(preset=preset, override_dataset=override, use_gn=use_gn)

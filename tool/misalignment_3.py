@@ -169,6 +169,7 @@ def _default_model_type(dataset_name: str) -> str:
         "mnist": "lenet5",
         "cifar10": "resnet18_bn",
         "cifar100": "resnet18_bn",
+        "noise_cifar10": "resnet18_bn",
         "imagenet1k": "resnet18_bn",
         "imagenet21k_p": "vit_b_32",
         "modular": "transformer_for_grokking",
@@ -340,7 +341,7 @@ def load_dataset_bundle(args) -> DatasetBundle:
         if augmentation != 0:
             raise ValueError("modular datasets support only --augmentation none/0")
         return _load_modular_bundle(args, model_type)
-    if dataset_name not in {"mnist", "cifar10", "cifar100", *IMAGENET_DATASETS}:
+    if dataset_name not in {"mnist", "cifar10", "cifar100", "noise_cifar10", *IMAGENET_DATASETS}:
         raise ValueError(f"unsupported dataset {dataset_name!r}")
     return _load_image_bundle(args, dataset_name, model_type, augmentation)
 
@@ -1879,7 +1880,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset_type",
         dest="dataset",
         type=_normalize_dataset_name,
-        choices=["mnist", "cifar10", "cifar100", "imagenet1k", "imagenet21k_p", "modular"],
+        choices=["mnist", "cifar10", "cifar100", "noise_cifar10", "imagenet1k", "imagenet21k_p", "modular"],
         required=True,
     )
     parser.add_argument("--dataset_path", default=None, help="modular dataset folder containing train.txt/val.txt")

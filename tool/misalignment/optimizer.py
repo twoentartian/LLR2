@@ -72,7 +72,7 @@ class MisalignmentOptimizationSetup:
         elif dataset_name in ("mnist", "mnist_224"):
             default_optimizer, default_lr, default_wd, default_epochs = "sgd", 0.01, 0.0, 20
             minimum_lr_ratio, default_warmup = 0.0, 0
-        elif dataset_name in ("cifar10", "cifar10_224", "cifar100", "cifar100_224"):
+        elif dataset_name in ("cifar10", "cifar10_224", "cifar100", "cifar100_224", "noise_cifar10"):
             default_optimizer, default_lr, default_wd, default_epochs = "sgd", 0.1, 5e-4, 70
             if preset == 1:
                 default_lr, default_wd = 0.2, 1e-4
@@ -102,7 +102,7 @@ class MisalignmentOptimizationSetup:
             raise ValueError("optimizer must be auto, sgd, adam, or adamw")
         scheduler_name = "fixed" if scheduler is None else str(scheduler).lower()
         if scheduler_name == "auto":
-            scheduler_name = "none" if dataset_name.startswith("mnist") else "onecycle" if dataset_name.startswith("cifar") else "cosine"
+            scheduler_name = "none" if dataset_name.startswith("mnist") else "onecycle" if dataset_name.startswith(("cifar", "noise_cifar")) else "cosine"
         # ``fixed`` is the explicit, constant-learning-rate mode used by the
         # misalignment experiment.  Keep the historical ``none`` spelling as
         # a backwards-compatible alias for the same behavior.

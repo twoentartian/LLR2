@@ -5,6 +5,8 @@ from typing import Literal, Optional
 from multiprocessing import Pool
 from pathlib import Path
 
+import torch
+from torch.utils.data import Dataset
 from torchvision import transforms, datasets
 from PIL import Image
 
@@ -216,6 +218,54 @@ def get_random_dataset_setup(dataset_type: DatasetType, override_dataset_path: O
     except KeyError as exc:
         raise NotImplementedError(f"Random dataset loader is not implemented for {dataset_type.name}") from exc
     return dataset_loader(override_dataset_path=override_dataset_path)
+
+""" In-memory noise datasets """
+# Exact statistics of ToTensor(uniform uint8 in [0, 255]).
+NOISE_UINT8_MEAN = 0.5
+NOISE_UINT8_STD = float(np.sqrt((256 ** 2 - 1) / 12) / 255)
+
+
+class NoiseImageDataset(Dataset):
+    """Uniform uint8 noise images with balanced labels, fully determined by ``seed``.
+
+    Images are returned as PIL images so torchvision transforms (and callers
+    that replace ``transform``) behave as with the real image datasets.
+    """
+
+    def __init__(self, count: int, image_size: tuple[int, int], channels: int, num_classes: int, seed: int, transform=None):
+        if count % num_classes:
+            raise ValueError(f"count={count} must be divisible by num_classes={num_classes} for balanced labels")
+        rng = np.random.default_rng(seed)
+        self.data = rng.integers(0, 256, size=(count, *image_size, channels), dtype=np.uint8)
+        labels = np.repeat(np.arange(num_classes, dtype=np.int64), count // num_classes)
+        rng.shuffle(labels)
+        self.targets = labels.tolist()
+        self.classes = [str(i) for i in range(num_classes)]
+        self.seed = int(seed)
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.targets)
+
+    def __getitem__(self, index: int):
+        array = self.data[index]
+        image = Image.fromarray(array[..., 0] if array.shape[-1] == 1 else array)
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, self.targets[index]
+
+
+def dataset_noise_cifar10(seed: int = 0, *args, **kwargs) -> DatasetSetup:
+    """CIFAR-10-shaped pure noise: 50k/10k images, 32x32x3, 10 balanced classes.
+
+    Train and test use disjoint seeds derived from ``seed``.
+    """
+    stats = ((NOISE_UINT8_MEAN,) * 3, (NOISE_UINT8_STD,) * 3)
+    transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize(*stats)])
+    train = NoiseImageDataset(50000, (32, 32), 3, 10, seed=2 * seed, transform=transform)
+    test = NoiseImageDataset(10000, (32, 32), 3, 10, seed=2 * seed + 1, transform=transform)
+    return DatasetSetup(DatasetType.noise_cifar10, train, test)
+
 
 if __name__ == '__main__':
     save_random_images(5, DatasetType.random_mnist, "test_mnist_random_dataset")

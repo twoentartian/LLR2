@@ -34,6 +34,8 @@ class DatasetType(Enum):
     # DatasetType members used by older configs).
     imagenet21k_p = auto()
     imagenet21kp = imagenet21k_p
+    # In-memory uniform noise with CIFAR-10 shape, split sizes and class count.
+    noise_cifar10 = auto()
 
 @dataclass
 class DatasetSetup:

@@ -1694,6 +1694,9 @@ def parse_args() -> argparse.Namespace:
                              "other ImageNet v1, otherwise 0); "
                              "image augmentation remains controlled by --augmentation")
     parser.add_argument("--augmentation", "--data_augmentation", default="none", help="none/0 or an integer augmentation level")
+    parser.add_argument("--label_smoothing", type=float, default=None,
+                        help="override the preset criterion with CrossEntropyLoss(label_smoothing=x) for training, "
+                             "evaluation and flatness (default: keep the --model_preset criterion; image datasets only)")
     parser.add_argument(
         "--objective",
         choices=["normalized_two_sided", "difference", "mean_relative_gap"],
@@ -2297,6 +2300,16 @@ def _measure_flatness_from_checkpoint(
     logger.info("flatness computed from checkpoint=%s; results written to %s", checkpoint_path, output_folder)
 
 
+def _resolve_criterion(preset_criterion: nn.Module | None, label_smoothing: float | None) -> nn.Module:
+    """Return the preset criterion, or plain CE with an explicit smoothing."""
+    criterion = preset_criterion or nn.CrossEntropyLoss()
+    if label_smoothing is None:
+        return criterion
+    if type(criterion) is not nn.CrossEntropyLoss:
+        raise ValueError(f"--label_smoothing requires a CrossEntropyLoss preset criterion, got {type(criterion).__name__}")
+    return nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+
+
 def main() -> None:
     args = parse_args()
     distributed_device = distributed.initialize(use_cpu=args.device == "cpu")
@@ -2312,6 +2325,11 @@ def main() -> None:
         raise ValueError("--batch_size must be positive")
     if args.gradient_accumulate_every <= 0:
         raise ValueError("--gradient_accumulate_every must be positive")
+    if args.label_smoothing is not None:
+        if not 0.0 <= args.label_smoothing < 1.0:
+            raise ValueError("--label_smoothing must be in [0, 1)")
+        if args.dataset == "modular":
+            raise ValueError("--label_smoothing is not supported for modular datasets")
     if args.epochs is not None and args.epochs <= 0:
         raise ValueError("--epochs must be positive")
     if args.num_workers < 0:
@@ -2360,7 +2378,9 @@ def main() -> None:
     bundle = load_dataset_bundle(args)
     model = bundle.ml_setup.model.to(device)
     distributed.broadcast_model(model)
-    criterion = bundle.ml_setup.criterion or nn.CrossEntropyLoss()
+    criterion = _resolve_criterion(bundle.ml_setup.criterion, args.label_smoothing)
+    logger.info("criterion = %s(label_smoothing=%s)", type(criterion).__name__,
+                getattr(criterion, "label_smoothing", None))
     if args.batch_size is not None:
         batch_size = args.batch_size
     elif bundle.modular:

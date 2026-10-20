@@ -76,5 +76,16 @@ class TestMisalignmentGradientAccumulation(unittest.TestCase):
         self.assertEqual([group["weight_decay"] for group in optimizer.param_groups], [0.05, 0.0])
 
 
+class TestMisalignmentLabelSmoothing(unittest.TestCase):
+    def test_explicit_smoothing_overrides_preset_criterion(self):
+        preset = nn.CrossEntropyLoss(label_smoothing=0.11)
+        self.assertIs(measurement._resolve_criterion(preset, None), preset)
+        self.assertEqual(measurement._resolve_criterion(None, None).label_smoothing, 0.0)
+        self.assertEqual(measurement._resolve_criterion(nn.CrossEntropyLoss(), 0.1).label_smoothing, 0.1)
+        self.assertEqual(measurement._resolve_criterion(preset, 0.0).label_smoothing, 0.0)
+        with self.assertRaises(ValueError):
+            measurement._resolve_criterion(nn.NLLLoss(), 0.1)
+
+
 if __name__ == "__main__":
     unittest.main()

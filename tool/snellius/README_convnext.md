@@ -74,7 +74,9 @@ paired microbatch 512 per partition, `--gradient_accumulate_every 8`
 wd 0.05 with the same no-decay groups, 90 epochs / 5 warmup, cosine to 1e-6.
 Raw A/B gradients of the 8 microbatches are averaged at one parameter state
 before normalized combination, so each update matches a 4096 batch. No
-augmentation, `--model_preset 4` (hard-label CE: Mixup's smoothing is absent),
+augmentation, `--model_preset 4` with `--label_smoothing 0.1` (the recipe's
+smoothing normally arrives through Mixup targets, which misalignment does not
+use; `LLR2_LABEL_SMOOTHING=0` gives hard-label CE),
 BF16 AMP, train/val gradient weights 0.8/0.2, seed 1, split seed 2026,
 evaluation in the last 9 epochs. Both directions run in one job by default
 (`LLR2_DIRECTIONS=a_as_train_b_as_val` selects one); flatness is deferred.

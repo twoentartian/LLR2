@@ -10,7 +10,9 @@ val ascent, and rescales the result to the norm of the train gradient.
 The raw ``L_A - L_B`` and previous exchange-symmetric objective remain
 available with ``--objective difference`` and
 ``--objective mean_relative_gap``.  The relative-flatness report is computed
-separately on the two original losses and then averaged.
+separately on the two original losses and then averaged.  Flatness always
+uses the deterministic level-0 transform, so with ``--augmentation`` it is
+measured on the unaugmented halves rather than on random augmented views.
 
 Each invocation evaluates both orientations from the same initial model:
 partition A as train/B as val, then B as train/A as val.
@@ -126,6 +128,10 @@ class DatasetBundle:
     modular: bool
     eq_position: int | None = None
     model_preset: int | None = None
+    # Unaugmented views of partition_a/partition_b for relative flatness;
+    # None means the training partitions are already deterministic.
+    flatness_partition_a: Dataset | None = None
+    flatness_partition_b: Dataset | None = None
 
 
 @dataclass
@@ -171,7 +177,10 @@ class AugmentedDataset(Dataset):
     """Bind augmentation randomness to source index and epoch, not A/B name.
 
     Exchanging the halves therefore keeps each image's augmentation identical.
-    Worker processes are restarted on each iteration to observe ``epoch``.
+    ``epoch`` lives in a shared-memory tensor: persistent DataLoader workers
+    hold a copy of the dataset taken when they start, so a plain attribute
+    set by the main process afterwards would never reach them and every
+    epoch would reuse the first epoch's views.
     """
 
     def __init__(self, dataset: Dataset, transform, seed: int, stochastic: bool) -> None:
@@ -179,7 +188,15 @@ class AugmentedDataset(Dataset):
         self.transform = transform
         self.seed = int(seed)
         self.stochastic = stochastic
-        self.epoch = 0
+        self._epoch = torch.zeros((), dtype=torch.int64).share_memory_()
+
+    @property
+    def epoch(self) -> int:
+        return int(self._epoch.item())
+
+    @epoch.setter
+    def epoch(self, value: int) -> None:
+        self._epoch.fill_(int(value))
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -222,6 +239,22 @@ def _split_dataset(dataset: Dataset, *, seed: int, odd_size_policy: str) -> tupl
     first = permutation[:midpoint].tolist()
     second = permutation[midpoint:2 * midpoint].tolist()
     return Subset(dataset, first), Subset(dataset, second), permutation, excluded
+
+
+def _flatness_partitions(
+    ml_setup, dataset_name: str, augmentation: int, source: Dataset,
+    partition_a: Subset, partition_b: Subset, seed: int,
+) -> tuple[Dataset, Dataset]:
+    """Same A/B examples as training, but with the deterministic level-0 transform.
+
+    Relative flatness is a property of the loss on the data themselves; with
+    stochastic augmentation it would otherwise depend on whichever random
+    views the flatness pass happens to draw.
+    """
+    if augmentation == 0:
+        return partition_a, partition_b
+    clean = AugmentedDataset(source, build_augmentation(ml_setup, dataset_name, 0), seed=seed, stochastic=False)
+    return Subset(clean, partition_a.indices), Subset(clean, partition_b.indices)
 
 
 def _load_modular_bundle(args, model_type: str) -> DatasetBundle:
@@ -297,12 +330,13 @@ def _load_image_bundle(args, dataset_name: str, model_type: str, augmentation: i
         raise TypeError(f"{dataset_name} datasets do not expose torchvision transforms")
     ml_setup.training_data.transform = None
     ml_setup.testing_data.transform = None
-    combined = AugmentedDataset(
-        ConcatDataset([ml_setup.training_data, ml_setup.testing_data]),
-        common_transform, seed=args.random_seed, stochastic=augmentation > 0,
-    )
+    source = ConcatDataset([ml_setup.training_data, ml_setup.testing_data])
+    combined = AugmentedDataset(source, common_transform, seed=args.random_seed, stochastic=augmentation > 0)
     partition_a, partition_b, permutation, excluded = _split_dataset(
         combined, seed=args.split_seed, odd_size_policy=args.odd_size_policy,
+    )
+    flatness_partition_a, flatness_partition_b = _flatness_partitions(
+        ml_setup, dataset_name, augmentation, source, partition_a, partition_b, args.random_seed,
     )
     return DatasetBundle(
         partition_a=partition_a,
@@ -315,6 +349,8 @@ def _load_image_bundle(args, dataset_name: str, model_type: str, augmentation: i
         excluded_indices=excluded,
         modular=False,
         model_preset=factory_preset,
+        flatness_partition_a=flatness_partition_a,
+        flatness_partition_b=flatness_partition_b,
     )
 
 
@@ -2111,6 +2147,7 @@ def _run_direction(
         "random_seed": args.random_seed,
         "augmentation": _parse_augmentation(args.augmentation),
         "augmentation_config": describe_augmentation(args.dataset, args.augmentation),
+        "relative_flatness_augmentation_config": describe_augmentation(args.dataset, 0),
         "excluded_source_indices": bundle.excluded_indices.tolist(),
         "model_type": model_type_name,
         "model_preset": bundle.model_preset,
@@ -2425,24 +2462,27 @@ def main() -> None:
     # retain all forward activations and trigger a CUDA OOM.  Flatness is an
     # average over deterministic microbatches instead.
     flatness_batch_size = min(batch_size, args.relative_flatness_batch_size)
+    # Flatness always sees the deterministic level-0 transform, never the
+    # stochastic training augmentation.
+    flatness_augmentation_config = describe_augmentation(args.dataset, 0)
     flatness_loader_a = _build_loader(
-        bundle.partition_a,
+        bundle.partition_a if bundle.flatness_partition_a is None else bundle.flatness_partition_a,
         flatness_batch_size,
         device=device,
         num_workers=args.num_workers,
         seed=args.random_seed + 303,
         prefetch_factor=args.prefetch_factor,
-        loader_backend=loader_backend, augmentation_config=augmentation_config,
+        loader_backend=loader_backend, augmentation_config=flatness_augmentation_config,
         is_train=False, distributed_loader=False,
     ) if args.relative_flatness or args.flatness_from_checkpoint else None
     flatness_loader_b = _build_loader(
-        bundle.partition_b,
+        bundle.partition_b if bundle.flatness_partition_b is None else bundle.flatness_partition_b,
         flatness_batch_size,
         device=device,
         num_workers=args.num_workers,
         seed=args.random_seed + 404,
         prefetch_factor=args.prefetch_factor,
-        loader_backend=loader_backend, augmentation_config=augmentation_config,
+        loader_backend=loader_backend, augmentation_config=flatness_augmentation_config,
         is_train=False, distributed_loader=False,
     ) if args.relative_flatness or args.flatness_from_checkpoint else None
     model_type_name = bundle.ml_setup.model_type.name

@@ -105,8 +105,8 @@ class DaliImageNetLoader:
         self.level = int(augmentation_config["level"])
         if augmentation_config["dataset"] == "imagenet21k_p" and self.level not in (0, 1):
             raise ValueError("ImageNet-21k-p DALI supports augmentation none/0 and 1 only")
-        if self.level not in (0, 1, 2):
-            raise ValueError("DALI ImageNet augmentation supports none/0, 1 and 2")
+        if self.level not in (0, 1, 2, 3):
+            raise ValueError("DALI ImageNet augmentation supports none/0, 1, 2 and 3")
         self.crop_size = int(augmentation_config["input_size"])
         self.dataset = dataset
         self.world_size = distributed.world_size() if distributed_loader else 1
@@ -169,6 +169,7 @@ class DaliImageNetLoader:
             training=self.level > 0, crop_size=self.crop_size,
             resize_size=math.ceil(256 * self.crop_size / 224),
             preset_version=2 if self.level == 2 else 1,
+            auto_augment_policy="imagenet" if self.level == 3 else None,
             random_erase_prob=0.1 if self.level == 2 else 0.0,
             batch_size=self.batch_size, num_threads=self.num_threads, device_id=self.device_id,
             labels_on_gpu=True,

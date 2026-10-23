@@ -156,13 +156,14 @@ class TestDaliLoaderGPU(unittest.TestCase):
                                           "seed": 123, "prefetch_queue_depth": 2}
             return shared_builder(**options)
 
-        for level in (0, 1, 2):
+        for level in (0, 1, 2, 3):
             with self.subTest(level=level):
                 high_accuracy_dataset = DaliImageNetDataset(
                     file_root=str(self.root / "train"), dataset_type=DatasetType.imagenet1k,
                     split="train", preset_version=2 if level == 2 else 1,
                     train_crop_size=224, val_resize_size=256, val_crop_size=224,
                     augmentation=level > 0, random_erase_prob=0.1 if level == 2 else 0.0,
+                    auto_augment_policy="imagenet" if level == 3 else None,
                     repeated_augmentation_repetitions=1,
                 )
                 loader = self.make_loader(folder, level, seed=123, input_size=224)
@@ -184,7 +185,7 @@ class TestDaliLoaderGPU(unittest.TestCase):
                     loader.close()
 
     def test_all_augmentation_levels_gpu_shape_labels_and_repeated_passes(self):
-        for level in (0, 1, 2):
+        for level in (0, 1, 2, 3):
             with self.subTest(level=level):
                 partition_a, _, _, _ = self.make_partitions(level)
                 loader = self.make_loader(partition_a, level)

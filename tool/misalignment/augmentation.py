@@ -9,6 +9,8 @@ see ../../py_src/ml_setup_dataset/README_imagenet_augmentation.md sections 1.1/1
 and 5. ImageNet levels 0/1/2 reuse the project's deterministic/basic/advanced
 image transforms; the advanced TA Wide + RandAugment chain is a local variant
 of https://pytorch.org/blog/how-to-train-state-of-the-art-models-using-torchvision-latest-primitives/.
+ImageNet-1K level 3 is level 1 plus AutoAugment's ImageNet policy at 224, the
+augmentation of torchvision's ViT-B/32 reference recipe (without Mixup/CutMix).
 The level numbering, A/B symmetry, and MNIST/CIFAR parameter combinations are
 LLR2 experiment choices, not upstream standard numbered recipes. This module
 does not import ordinary training's batch Mixup/CutMix or RA sampler.
@@ -30,7 +32,7 @@ _SUPPORTED_LEVELS = {
     "cifar10": (0, 1, 2, 3),
     "cifar100": (0, 1, 2, 3),
     "noise_cifar10": (0, 1, 2, 3),
-    "imagenet1k": (0, 1, 2),
+    "imagenet1k": (0, 1, 2, 3),
     "imagenet21k_p": (0, 1),
     "modular": (0,),
 }
@@ -117,6 +119,10 @@ def describe_augmentation(
             operations.extend([f"RandomResizedCrop(size={image_size})", "RandomHorizontalFlip(p=0.5)"])
             if level == 2:
                 operations.extend(["TrivialAugmentWide", "RandAugment(num_ops=2, magnitude=9)"])
+            elif level == 3:
+                # The DALI backend uses NVIDIA's ImageNet table, which differs
+                # from torchvision's AutoAugmentPolicy.IMAGENET.
+                operations.append("AutoAugment(policy=imagenet)")
         operations.append("ToTensor")
         if level == 2:
             operations.append("RandomErasing(p=0.1)")
@@ -192,6 +198,12 @@ def build_augmentation(
             val_resize_size=resize_size,
             val_crop_size=input_size,
         )
+    elif level == 3:
+        transform, _ = get_imagenet_preprocessing(version=1, augmentation=True, train_crop_size=input_size)
+        # After RandomResizedCrop and RandomHorizontalFlip, before ToTensor.
+        transform.transforms.insert(2, transforms.AutoAugment(
+            transforms.AutoAugmentPolicy.IMAGENET, interpolation=transforms.InterpolationMode.BILINEAR,
+        ))
     else:
         transform, _ = get_imagenet_preprocessing(
             version=level,

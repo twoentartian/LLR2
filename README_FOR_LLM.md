@@ -71,6 +71,12 @@
 
 ## 工具性文件
 
+### 归档：`tool/archive/remeasure_misalignment_flatness.py`
+
+- 用于修正历史实验在随机增强图片上测得的 flatness；加载已有最终模型和 gap checkpoints，在无增强数据上重新测量，不重新训练。
+- 原路径 `tool/remeasure_misalignment_flatness.py` 已迁入 `tool/archive/`。原 `summary.json` 必须包含非空的 `relative_flatness` 采样配置。
+- 新实验已使用独立的无增强 flatness loader。延后测量单个 checkpoint 使用 `tool/misalignment_measurement_2.py --flatness_from_checkpoint`，并保持原损失与分区配置。
+
 ### `tool/linear_interpolate_models.py`
 
 评估两个 checkpoint 之间的参数线性插值路径，不进行训练。

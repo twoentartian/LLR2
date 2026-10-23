@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Re-measure relative flatness of saved misalignment models on unaugmented data.
+"""Archived repair tool: re-measure old flatness on unaugmented data.
 
 Runs of misalignment_measurement_2.py made before the flatness loaders were
 switched to the deterministic level-0 transform measured flatness on random
@@ -24,7 +24,7 @@ from unittest.mock import patch
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import misalignment_measurement_2 as measurement
 from py_src.model_opti_save_load import load_model_state_file
 

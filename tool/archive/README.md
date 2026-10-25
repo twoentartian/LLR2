@@ -21,3 +21,8 @@ this script reuses that measurement budget. New experiments already use
 unaugmented flatness loaders. For a deferred measurement of a single checkpoint,
 use `tool/misalignment_measurement_2.py --flatness_from_checkpoint ...` with the
 original loss and split settings.
+
+Superseded by `tool/remeasure_misalignment_flatness.py`, which also measures
+accuracy, chooses the image transform and draws random subsets.
+`--sample_order first` with the original flatness budget reproduces this
+script's measurement.

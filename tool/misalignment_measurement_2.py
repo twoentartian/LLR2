@@ -14,6 +14,12 @@ separately on the two original losses and then averaged.  Flatness always
 uses the deterministic level-0 transform, so with ``--augmentation`` it is
 measured on the unaugmented halves rather than on random augmented views.
 
+Training loaders reshuffle each half every epoch by default (``--shuffle``):
+with a fixed order, ViT-B/32 on ImageNet fit only the batches next to its
+current position in the epoch. Each half's order depends on its own seed and
+the epoch, not on its train/val role. Evaluation and flatness keep the fixed
+partition order. ``--no-shuffle`` restores the fixed training order.
+
 Each invocation evaluates both orientations from the same initial model:
 partition A as train/B as val, then B as train/A as val.
 
@@ -74,11 +80,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
-from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from misalignment.epoch_order import ORDER_RNG, EpochOrderSampler, epoch_order
 from misalignment.augmentation import (
     IMAGENET_DATASETS,
     build_augmentation,
@@ -219,6 +225,19 @@ def _set_augmentation_epoch(dataset: Dataset, epoch: int) -> None:
         _set_augmentation_epoch(dataset.dataset, epoch)
     elif isinstance(dataset, AugmentedDataset):
         dataset.epoch = epoch
+
+
+def _set_loader_epoch(loader, epoch: int) -> None:
+    """Advance augmentation views and, for shuffled training loaders, the order.
+
+    DALI loaders read the epoch from their dataset and reorder themselves.
+    """
+    _set_augmentation_epoch(loader.dataset, epoch)
+    sampler = getattr(loader, "sampler", None)
+    if isinstance(sampler, EpochOrderSampler):
+        sampler.set_epoch(epoch)
+    if isinstance(loader, _DeviceCachedLoader):
+        loader.set_epoch(epoch)
 
 
 def _split_indices(count: int, *, seed: int, odd_size_policy: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -683,8 +702,8 @@ def train_symmetric_objective(
         epoch_start = time.perf_counter()
         epoch_label = f"{progress_label} epoch {epoch + 1}/{epochs}".strip()
         model.train()
-        _set_augmentation_epoch(loader_a.dataset, epoch)
-        _set_augmentation_epoch(loader_b.dataset, epoch)
+        _set_loader_epoch(loader_a, epoch)
+        _set_loader_epoch(loader_b, epoch)
         # First evaluate the two complete halves to obtain the objective
         # coefficients.  Each paired mini-batch is then differentiated and
         # applied immediately, matching ordinary mini-batch optimization.
@@ -1143,8 +1162,8 @@ def train_normalized_two_sided(
         # Keep dropout and other train-time layers enabled during optimization.
         # evaluate_partition switches back to eval mode for epoch metrics.
         model.train()
-        _set_augmentation_epoch(loader_a.dataset, epoch)
-        _set_augmentation_epoch(loader_b.dataset, epoch)
+        _set_loader_epoch(loader_a, epoch)
+        _set_loader_epoch(loader_b, epoch)
         progress = epoch / max(1, epochs - 1)
         train_gradient_weight = train_weight_function(progress)
         val_gradient_weight = val_weight_function(progress)
@@ -1610,6 +1629,7 @@ def _build_loader(
     augmentation_config: dict[str, Any] | None = None,
     is_train: bool = True,
     distributed_loader: bool = True,
+    shuffle: bool = False,
 ) -> DataLoader | DaliImageNetLoader:
     if prefetch_factor <= 0:
         raise ValueError("prefetch_factor must be positive")
@@ -1619,7 +1639,7 @@ def _build_loader(
         return DaliImageNetLoader(
             dataset, batch_size, device=device, num_workers=num_workers, seed=seed,
             prefetch_factor=prefetch_factor, augmentation_config=augmentation_config,
-            is_train=is_train, distributed_loader=distributed_loader,
+            is_train=is_train, distributed_loader=distributed_loader, shuffle=shuffle,
         )
     if loader_backend != "pytorch":
         raise ValueError(f"unsupported loader backend {loader_backend!r}")
@@ -1628,14 +1648,18 @@ def _build_loader(
     sampler = None
     if distributed_loader and distributed.enabled():
         batch_size = distributed.local_batch_size(batch_size)
-        sampler = (DistributedSampler(dataset, shuffle=False, seed=seed)
+        sampler = (EpochOrderSampler(len(dataset), seed=seed, shuffle=shuffle,
+                                     world_size=distributed.world_size(), rank=distributed.rank())
                    if is_train else distributed.EvaluationSampler(dataset))
+    elif shuffle:
+        sampler = EpochOrderSampler(len(dataset), seed=seed, shuffle=True)
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        # The split itself is randomized.  Keeping the order fixed makes the
-        # A/B exchange test deterministic; augmentation randomness is seeded
-        # by source index and epoch in AugmentedDataset.
+        # The order comes from the sampler: the per-epoch order of
+        # misalignment/epoch_order.py, or the fixed partition order. Both are
+        # independent of the train/val role, keeping the A/B exchange exact;
+        # augmentation randomness is seeded by source index and epoch.
         shuffle=False,
         sampler=sampler,
         generator=generator,
@@ -1650,20 +1674,34 @@ def _build_loader(
 
 
 class _DeviceCachedLoader:
-    """Fixed-order batches materialized once on the training device.
+    """Batches materialized once on the training device.
 
-    Modular partitions are small integer tensors and the loaders never
-    shuffle, so caching yields exactly the same batches as the DataLoader
-    while avoiding per-epoch worker start-up and per-example collation.
+    Modular partitions are small integer tensors, so caching the fixed-order
+    batches avoids per-epoch worker start-up and per-example collation. With
+    ``shuffle`` the cached examples are regrouped in ``epoch_order`` instead.
     """
 
-    def __init__(self, loader: DataLoader, device: torch.device) -> None:
+    def __init__(self, loader: DataLoader, device: torch.device, *, shuffle: bool = False, seed: int = 0) -> None:
         self.dataset = loader.dataset
         self.batch_size = loader.batch_size
         self.batches = [_move_batch(batch, device) for batch in loader]
+        self.shuffle = shuffle
+        self.seed = int(seed)
+        self.epoch = 0
+        self._examples = ({key: torch.cat([batch[key] for batch in self.batches]) for key in self.batches[0]}
+                          if shuffle and self.batches else None)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
 
     def __iter__(self):
-        return iter(self.batches)
+        if self._examples is None:
+            return iter(self.batches)
+        size = next(iter(self._examples.values())).shape[0]
+        order = torch.tensor(epoch_order(size, seed=self.seed, epoch=self.epoch, shuffle=True),
+                             device=next(iter(self._examples.values())).device)
+        return iter([{key: value[order[start:start + self.batch_size]] for key, value in self._examples.items()}
+                     for start in range(0, size, self.batch_size)])
 
     def __len__(self) -> int:
         return len(self.batches)
@@ -1744,6 +1782,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--split_seed", type=int, default=None,
         help="seed for shuffling the combined dataset; defaults to the resolved --random_seed",
+    )
+    parser.add_argument(
+        "--shuffle", action=argparse.BooleanOptionalAction, default=True,
+        help="reshuffle each half's training order every epoch (default); --no-shuffle keeps the fixed "
+             "partition order. Evaluation and flatness always use the fixed order",
     )
     parser.add_argument(
         "--odd_size_policy",
@@ -2148,6 +2191,12 @@ def _run_direction(
         "augmentation": _parse_augmentation(args.augmentation),
         "augmentation_config": describe_augmentation(args.dataset, args.augmentation),
         "relative_flatness_augmentation_config": describe_augmentation(args.dataset, 0),
+        "data_order": {
+            # Callers that build their own loaders may pass args without it.
+            "training_shuffle": getattr(args, "shuffle", False),
+            "training_order": ORDER_RNG if getattr(args, "shuffle", False) else "fixed partition order",
+            "evaluation_and_flatness_order": "fixed partition order",
+        },
         "excluded_source_indices": bundle.excluded_indices.tolist(),
         "model_type": model_type_name,
         "model_preset": bundle.model_preset,
@@ -2427,19 +2476,21 @@ def main() -> None:
         batch_size = min(len(bundle.partition_a), 65536)
     else:
         batch_size = int(getattr(bundle.ml_setup, "default_batch_size", 64) or 64)
+    # Modular batches are cached on the device and reordered there.
+    sampler_shuffle = args.shuffle and not bundle.modular
     loader_a = _build_loader(
         bundle.partition_a, batch_size, device=device, num_workers=args.num_workers,
         seed=args.random_seed + 101, prefetch_factor=args.prefetch_factor,
-        loader_backend=loader_backend, augmentation_config=augmentation_config,
+        loader_backend=loader_backend, augmentation_config=augmentation_config, shuffle=sampler_shuffle,
     )
     loader_b = _build_loader(
         bundle.partition_b, batch_size, device=device, num_workers=args.num_workers,
         seed=args.random_seed + 202, prefetch_factor=args.prefetch_factor,
-        loader_backend=loader_backend, augmentation_config=augmentation_config,
+        loader_backend=loader_backend, augmentation_config=augmentation_config, shuffle=sampler_shuffle,
     )
     if bundle.modular:
-        loader_a = _DeviceCachedLoader(loader_a, device)
-        loader_b = _DeviceCachedLoader(loader_b, device)
+        loader_a = _DeviceCachedLoader(loader_a, device, shuffle=args.shuffle, seed=args.random_seed + 101)
+        loader_b = _DeviceCachedLoader(loader_b, device, shuffle=args.shuffle, seed=args.random_seed + 202)
     eval_batch_size = args.eval_batch_size or batch_size
     eval_num_workers = args.num_workers if args.eval_num_workers is None else args.eval_num_workers
     eval_loader_a, eval_loader_b = loader_a, loader_b

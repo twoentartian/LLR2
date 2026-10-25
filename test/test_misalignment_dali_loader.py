@@ -25,6 +25,7 @@ import py_src.ml_setup_dataset.dataset_imagenet as imagenet_module
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tool"))
 import misalignment_measurement_2 as measurement
 from misalignment.augmentation import describe_augmentation
+from misalignment.epoch_order import epoch_order
 from misalignment.dali_loader import (
     DaliImageNetLoader, image_file_manifest, resolve_loader_backend,
 )
@@ -134,12 +135,38 @@ class TestDaliLoaderGPU(unittest.TestCase):
         augmented = measurement.AugmentedDataset(self.original, None, 123, level > 0)
         return measurement._split_dataset(augmented, seed=11, odd_size_policy="drop")
 
-    def make_loader(self, partition, level, seed=123, input_size=None):
+    def make_loader(self, partition, level, seed=123, input_size=None, shuffle=False):
         return measurement._build_loader(
             partition, 2, device=torch.device("cuda"), num_workers=2, seed=seed,
             prefetch_factor=2, loader_backend="dali",
             augmentation_config=describe_augmentation("imagenet1k", level, input_size=input_size),
+            shuffle=shuffle,
         )
+
+    def test_shuffled_order_follows_epoch_and_matches_pytorch_order(self):
+        for level in (0, 1):
+            with self.subTest(level=level):
+                partition_a, _, _, _ = self.make_partitions(level)
+                manifest_labels = image_file_manifest(partition_a)[1]
+                loader = self.make_loader(partition_a, level, seed=77, shuffle=True)
+                fixed = self.make_loader(partition_a, 0, seed=77)
+                try:
+                    orders = []
+                    for epoch in (0, 1, 2, 1):
+                        measurement._set_loader_epoch(loader, epoch)
+                        _, labels, _ = self.read(loader)
+                        order = epoch_order(len(partition_a), seed=77, epoch=epoch, shuffle=True)
+                        self.assertEqual(labels.tolist(), [manifest_labels[index] for index in order])
+                        orders.append(order)
+                    self.assertNotEqual(orders[0], orders[1])
+                    self.assertEqual(loader.runtime_info()["shuffle"], True)
+                    _, fixed_labels, _ = self.read(fixed)
+                    self.assertEqual(fixed_labels.tolist(), manifest_labels)
+                    self.assertEqual(fixed.runtime_info()["shuffle"], False)
+                finally:
+                    loader.close()
+                    fixed.close()
+                    measurement._set_augmentation_epoch(partition_a, 0)
 
     def read(self, loader):
         batches = list(loader)
@@ -305,6 +332,10 @@ class TestDaliLoaderGPU(unittest.TestCase):
                 self.assertEqual(run["final"]["val"]["examples"], 5)
                 self.assertTrue(math.isfinite(run["misalignment_measure"]["overall_mean"]))
                 self.assertEqual(run["runtime"]["loader"]["train"]["backend"], "dali")
+                # Training loaders shuffle by default; evaluation and flatness do not.
+                self.assertTrue(run["data_order"]["training_shuffle"])
+                self.assertTrue(run["runtime"]["loader"]["train"]["shuffle"])
+                self.assertFalse(run["runtime"]["loader"]["flatness_train"]["shuffle"])
                 self.assertTrue(run["runtime"]["evaluation_amp"])
                 self.assertFalse(run["runtime"]["relative_flatness_amp"])
                 for point in run["gap_checkpoints"]["union"]:

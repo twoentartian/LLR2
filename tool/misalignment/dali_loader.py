@@ -16,6 +16,7 @@ import torch
 from torch.utils.data import ConcatDataset, Dataset, Subset
 from py_src import distributed
 from .augmentation import IMAGENET_DATASETS
+from .epoch_order import ORDER_RNG, epoch_order, shard_order
 
 
 def resolve_loader_backend(dataset_name: str, requested: str = "auto") -> str:
@@ -78,8 +79,11 @@ def _import_dali():
 
 
 class DaliImageNetLoader:
-    """DataLoader-shaped GPU iterator over one canonical, fixed-order half.
+    """DataLoader-shaped GPU iterator over one half, in fixed or per-epoch order.
 
+    With ``shuffle`` each pass reads the half in ``epoch_order`` for the
+    current augmentation epoch (see misalignment/epoch_order.py); otherwise
+    in the canonical partition order.
     Stochastic pipelines are rebuilt with partition+epoch seeds at each pass.
     Thus evaluation, checkpoint flatness and a second swapped orientation do
     not inherit advanced reader/RNG state from a previous traversal. Level
@@ -95,6 +99,7 @@ class DaliImageNetLoader:
         augmentation_config: dict[str, Any],
         is_train: bool = True,
         distributed_loader: bool = True,
+        shuffle: bool = False,
     ) -> None:
         if device.type != "cuda" or not torch.cuda.is_available():
             raise ValueError("DALI ImageNet loading requires CUDA; use --loader_backend pytorch on CPU")
@@ -115,28 +120,31 @@ class DaliImageNetLoader:
         self.device_id = device.index if device.index is not None else torch.cuda.current_device()
         self.num_threads = max(1, int(num_workers))
         self.seed = int(seed) + self.rank
+        # The order is global, so its seed excludes the rank.
+        self.order_seed = int(seed)
+        self.shuffle = bool(shuffle)
         self.prefetch_factor = int(prefetch_factor)
         self._dali_api = _import_dali()
+        self._pad = is_train
         self.padded_examples = 0
-        if self.world_size > 1:
-            # Shard the canonical fixed-order sequence, so each paired global
-            # batch contains the same source examples as the PyTorch backend.
-            indices = list(range(self.rank, len(dataset), self.world_size))
-            if is_train:
-                total = math.ceil(len(dataset) / self.world_size) * self.world_size
-                self.padded_examples = total - len(dataset)
-                indices.extend(index % len(dataset) for index in range(len(dataset), total)
-                               if index % self.world_size == self.rank)
-            local_dataset = Subset(dataset, indices)
-            if indices:
-                self.files, self.labels = image_file_manifest(local_dataset)
-            else:
-                self.files, self.labels = [], []
-        else:
-            self.files, self.labels = image_file_manifest(dataset)
+        if self.world_size > 1 and is_train:
+            total = math.ceil(len(dataset) / self.world_size) * self.world_size
+            self.padded_examples = total - len(dataset)
+        # Shard the global order, so each paired global batch contains the
+        # same source examples as the PyTorch backend.
+        self._all_files, self._all_labels = image_file_manifest(dataset) if len(dataset) else ([], [])
+        self._order_epoch = None
+        self._set_order(0)
         self._pipeline = None
         self._iterator = None
         self._active = False
+
+    def _set_order(self, epoch: int) -> None:
+        order = epoch_order(len(self._all_files), seed=self.order_seed, epoch=epoch, shuffle=self.shuffle)
+        local = shard_order(order, world_size=self.world_size, rank=self.rank, pad=self._pad)
+        self.files = [self._all_files[index] for index in local]
+        self.labels = [self._all_labels[index] for index in local]
+        self._order_epoch = epoch
 
     def __len__(self) -> int:
         return math.ceil(len(self.files) / self.batch_size)
@@ -149,7 +157,8 @@ class DaliImageNetLoader:
             "local_examples": len(self.files), "padded_training_examples_global": self.padded_examples,
             "prefetch_queue_depth": self.prefetch_factor, "decoder_device": "cpu",
             "resize_normalize_device": "gpu", "input_size": self.crop_size,
-            "last_batch_policy": "partial", "shuffle": False,
+            "last_batch_policy": "partial", "shuffle": self.shuffle,
+            "order_rng": ORDER_RNG if self.shuffle else "fixed partition order",
             "repeated_augmentation": False, "mixup_cutmix": False,
             "augmentation_seed": self.seed,
             "augmentation_rng": "partition_seed + 1000003 * epoch; reset for each pass",
@@ -190,6 +199,10 @@ class DaliImageNetLoader:
         self._active = True
         completed = False
         try:
+            epoch = _augmentation_epoch(self.dataset)
+            if self.shuffle and epoch != self._order_epoch:
+                self.close()
+                self._set_order(epoch)
             if self.level > 0:
                 self.close()
             if self._iterator is None:

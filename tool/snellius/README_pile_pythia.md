@@ -139,7 +139,36 @@ Dependencies in the existing cu13 environment: numpy, huggingface_hub, transform
 safetensors, and the already installed PyTorch. No DALI or additional attention
 extension is required for the Pile entry point.
 
+## 3. Misalignment on the A/B halves
+
+`tool/misalignment_pythia.py` is the language-model counterpart of
+`misalignment_measurement_2.py --objective normalized_two_sided`. Both orientations
+(A as train/B as val, then B as train/A as val) start from the seed-42 random
+initialization, identical to the ordinary run's `initial_model.pt`. Each step computes
+the full effective-batch train and val gradients at the same parameters, normalizes
+them per tensor, combines train descent with val ascent (weights 0.8/0.2 by default)
+and rescales to the train-gradient norm; the ordinary recipe above (AdamW, 1% warmup,
+cosine to 1e-4, clip 1, BF16, 1024 x 2048 tokens per partition per step) is then
+applied. One epoch is one pass over the train half (~49.4k steps).
+
+```bash
+LLR2_NODE_LOCAL=1 sbatch --constraint=scratch-node /gpfs/home6/ytian1/llr2-jobs/pile/pythia_14m_pile_misalignment.sbatch
+```
+
+A half cannot be evaluated in full repeatedly, so fixed random subsets (8192 sequences
+of each half, same for both orientations, indices in `eval_indices_{A,B}.npy`) are
+evaluated every 500 steps. These points replace epochs in `optimization_<dir>.csv`
+(`loss_a`/`train_accuracy` = train half, `loss_b`/`val_accuracy` = val half),
+`gradient_geometry_<dir>.csv`, `weight_variance_<dir>.csv` and the top-5 accuracy/loss
+gap checkpoints in `gap_checkpoints_<dir>/`. Relative flatness is not measured there.
+A checkpoint follows every evaluation point; Slurm's warning signal also checkpoints, and
+`LLR2_RESUME_RUN=<run dir>` resumes exactly. `LLR2_DIRECTIONS` runs one orientation.
+
 ## Validation
+
+`python -m pytest -q test/test_pile_preparation.py test/test_pythia_pile.py test/test_misalignment_pythia.py`
+also checks the first misalignment update against a manual normalized combination,
+exact resume from inside an evaluation interval and 2-rank Gloo equivalence.
 
 `python -m pytest -q test/test_pile_preparation.py test/test_pythia_pile.py`
 checks random document isolation, all-token conservation, interrupted preparation,

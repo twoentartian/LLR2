@@ -77,6 +77,12 @@ class MisalignmentOptimizationSetup:
             if preset == 1:
                 default_lr, default_wd = 0.2, 1e-4
             minimum_lr_ratio, default_warmup = 0.0, 0
+        elif dataset_name == "imagenet1k" and model_name.startswith("convnext"):
+            # ConvNeXt CVPR 2022, Table 5 (ImageNet-1K): AdamW, peak LR 4e-3
+            # at batch 4096, wd 0.05, 300 epochs, 20 warmup epochs; the
+            # official main.py decays to min_lr 1e-6. EMA is not implemented.
+            default_optimizer, default_lr, default_wd, default_epochs = "adamw", 4e-3, 5e-2, 300
+            minimum_lr_ratio, default_warmup = 1e-6 / default_lr, 20
         elif dataset_name == "imagenet1k":
             default_optimizer, default_lr, default_wd, default_epochs = "sgd", 0.1, 1e-4, 100
             minimum_lr_ratio, default_warmup = 0.01, 0
@@ -196,7 +202,7 @@ class MisalignmentOptimizationSetup:
             )
         else:
             optimizer_class = torch.optim.AdamW if config.optimizer == "adamw" else torch.optim.Adam
-            if (config.optimizer == "adamw" and config.dataset == "imagenet21k_p"
+            if (config.optimizer == "adamw" and config.dataset in ("imagenet1k", "imagenet21k_p")
                     and config.model.startswith("convnext")):
                 decay, no_decay = [], []
                 for name, parameter in model.named_parameters():

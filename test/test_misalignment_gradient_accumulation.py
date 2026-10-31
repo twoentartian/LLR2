@@ -75,6 +75,25 @@ class TestMisalignmentGradientAccumulation(unittest.TestCase):
         self.assertAlmostEqual(config["minimum_learning_rate"], 1e-6)
         self.assertEqual([group["weight_decay"] for group in optimizer.param_groups], [0.05, 0.0])
 
+    def test_convnext_imagenet1k_uses_paper_recipe(self):
+        from misalignment.optimizer import build_optimizer_and_scheduler
+        from types import SimpleNamespace
+
+        setup = SimpleNamespace(model_type="convnext_tiny", dataset_type="imagenet1k")
+        optimizer, _, epochs = build_optimizer_and_scheduler(
+            setup, nn.Linear(2, 2), list(range(100)), batch_size=4, gradient_accumulate_every=8,
+            scheduler="cosine",
+        )
+        config = optimizer.misalignment_config
+        self.assertEqual((config["optimizer"], epochs, config["warmup_epochs"]), ("adamw", 300, 20))
+        self.assertEqual((config["learning_rate"], config["weight_decay"]), (4e-3, 0.05))
+        self.assertAlmostEqual(config["minimum_learning_rate"], 1e-6)
+        self.assertEqual([group["weight_decay"] for group in optimizer.param_groups], [0.05, 0.0])
+
+        resnet = SimpleNamespace(model_type="resnet18_bn", dataset_type="imagenet1k")
+        optimizer, _, _ = build_optimizer_and_scheduler(resnet, nn.Linear(2, 2), list(range(100)), batch_size=4)
+        self.assertEqual(optimizer.misalignment_config["optimizer"], "sgd")
+
 
 class TestMisalignmentLabelSmoothing(unittest.TestCase):
     def test_explicit_smoothing_overrides_preset_criterion(self):

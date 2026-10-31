@@ -332,6 +332,32 @@ def _load_modular_bundle(args, model_type: str) -> DatasetBundle:
     )
 
 
+def set_convnext_stochastic_depth(model: nn.Module, probability: float) -> None:
+    """Reset torchvision ConvNeXt's linearly increasing per-block drop rates.
+
+    Block i of n gets probability * i / (n - 1), the rule torchvision applies
+    to stochastic_depth_prob at construction. Stochastic depth has no
+    parameters, so changing it does not alter the initialization.
+    """
+    from torchvision.models.convnext import CNBlock
+
+    blocks = [module for module in model.modules() if isinstance(module, CNBlock)]
+    if not blocks:
+        raise ValueError("--stochastic_depth_prob is only supported for ConvNeXt models")
+    for index, block in enumerate(blocks):
+        block.stochastic_depth.p = probability * index / max(1, len(blocks) - 1)
+
+
+def _stochastic_depth_prob(model: nn.Module | None) -> float | None:
+    """Return the final-block drop rate, i.e. stochastic_depth_prob, if any."""
+    from torchvision.ops import StochasticDepth
+
+    if model is None:
+        return None
+    rates = [module.p for module in model.modules() if isinstance(module, StochasticDepth)]
+    return max(rates) if rates else None
+
+
 def _load_image_bundle(args, dataset_name: str, model_type: str, augmentation: int) -> DatasetBundle:
     # Bind augmentation below instead of using the high-accuracy loader's
     # batch transforms. Mixup/CutMix is not used in this experiment.
@@ -344,6 +370,8 @@ def _load_image_bundle(args, dataset_name: str, model_type: str, augmentation: i
         else:
             factory_preset = 0
     ml_setup = get_ml_setup_from_config(model_type, dataset_type=dataset_name, preset=factory_preset)
+    if getattr(args, "stochastic_depth_prob", None) is not None:
+        set_convnext_stochastic_depth(ml_setup.model, args.stochastic_depth_prob)
     common_transform = build_augmentation(ml_setup, dataset_name, augmentation)
     if not hasattr(ml_setup.training_data, "transform") or not hasattr(ml_setup.testing_data, "transform"):
         raise TypeError(f"{dataset_name} datasets do not expose torchvision transforms")
@@ -1772,6 +1800,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label_smoothing", type=float, default=None,
                         help="override the preset criterion with CrossEntropyLoss(label_smoothing=x) for training, "
                              "evaluation and flatness (default: keep the --model_preset criterion; image datasets only)")
+    parser.add_argument("--stochastic_depth_prob", type=float, default=None,
+                        help="ConvNeXt only: final-block stochastic depth rate, scaled linearly over blocks as in "
+                             "torchvision (default: keep the MLSetup value, 0.1 for ImageNet-1k, 0.0 for 21k-p)")
     parser.add_argument(
         "--objective",
         choices=["normalized_two_sided", "difference", "mean_relative_gap"],
@@ -2200,6 +2231,7 @@ def _run_direction(
         "excluded_source_indices": bundle.excluded_indices.tolist(),
         "model_type": model_type_name,
         "model_preset": bundle.model_preset,
+        "stochastic_depth_prob": _stochastic_depth_prob(getattr(bundle.ml_setup, "model", None)),
         "criterion": {"type": type(criterion).__name__,
                       "label_smoothing": getattr(criterion, "label_smoothing", None)},
         "device": str(device),
@@ -2417,6 +2449,8 @@ def main() -> None:
             raise ValueError("--label_smoothing must be in [0, 1)")
         if args.dataset == "modular":
             raise ValueError("--label_smoothing is not supported for modular datasets")
+    if args.stochastic_depth_prob is not None and not 0.0 <= args.stochastic_depth_prob < 1.0:
+        raise ValueError("--stochastic_depth_prob must be in [0, 1)")
     if args.epochs is not None and args.epochs <= 0:
         raise ValueError("--epochs must be positive")
     if args.num_workers < 0:

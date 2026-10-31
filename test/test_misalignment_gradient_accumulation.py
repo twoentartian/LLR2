@@ -106,5 +106,26 @@ class TestMisalignmentLabelSmoothing(unittest.TestCase):
             measurement._resolve_criterion(nn.NLLLoss(), 0.1)
 
 
+class TestConvNeXtStochasticDepth(unittest.TestCase):
+    def test_override_matches_torchvision_construction(self):
+        from torchvision.models import convnext_tiny
+
+        for probability in (0.0, 0.3):
+            model = convnext_tiny(num_classes=10, stochastic_depth_prob=0.1)
+            measurement.set_convnext_stochastic_depth(model, probability)
+            reference = convnext_tiny(num_classes=10, stochastic_depth_prob=probability)
+            rates = [module.p for module in model.modules() if hasattr(module, "p")]
+            reference_rates = [module.p for module in reference.modules() if hasattr(module, "p")]
+            self.assertEqual(len(rates), 18)
+            for rate, reference_rate in zip(rates, reference_rates, strict=True):
+                self.assertAlmostEqual(rate, reference_rate)
+            self.assertAlmostEqual(measurement._stochastic_depth_prob(model), probability)
+
+    def test_rejects_models_without_convnext_blocks(self):
+        with self.assertRaises(ValueError):
+            measurement.set_convnext_stochastic_depth(nn.Linear(2, 2), 0.0)
+        self.assertIsNone(measurement._stochastic_depth_prob(nn.Linear(2, 2)))
+
+
 if __name__ == "__main__":
     unittest.main()

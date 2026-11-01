@@ -94,6 +94,31 @@ class TestMisalignmentGradientAccumulation(unittest.TestCase):
         optimizer, _, _ = build_optimizer_and_scheduler(resnet, nn.Linear(2, 2), list(range(100)), batch_size=4)
         self.assertEqual(optimizer.misalignment_config["optimizer"], "sgd")
 
+    def test_deeper_resnets_imagenet1k_match_complete_ml_setup(self):
+        from misalignment.optimizer import build_optimizer_and_scheduler
+        from types import SimpleNamespace
+        from py_src.complete_ml_setup import FastTrainingSetup
+        from py_src.ml_setup_dataset import DatasetType
+        from py_src.ml_setup_model import ModelType
+
+        for model_type in (ModelType.resnet34, ModelType.resnet50):
+            with self.subTest(model_type=model_type.name):
+                model = nn.Linear(2, 2)
+                reference_setup = SimpleNamespace(model_type=model_type, dataset_type=DatasetType.imagenet1k,
+                                                  training_data=list(range(100)), default_batch_size=4)
+                reference, reference_scheduler, reference_epochs = (
+                    FastTrainingSetup.get_optimizer_lr_scheduler_epoch(reference_setup, model))
+                setup = SimpleNamespace(model_type=model_type.name, dataset_type="imagenet1k")
+                optimizer, scheduler, epochs = build_optimizer_and_scheduler(
+                    setup, model, list(range(100)), batch_size=4, scheduler="cosine",
+                )
+                self.assertIsInstance(optimizer, type(reference))
+                self.assertEqual(epochs, reference_epochs)
+                for key in ("lr", "momentum", "weight_decay"):
+                    self.assertEqual([group[key] for group in optimizer.param_groups],
+                                     [group[key] for group in reference.param_groups])
+                self.assertAlmostEqual(scheduler.eta_min, reference_scheduler.eta_min)
+
 
 class TestMisalignmentLabelSmoothing(unittest.TestCase):
     def test_explicit_smoothing_overrides_preset_criterion(self):

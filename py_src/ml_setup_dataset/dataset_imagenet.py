@@ -251,6 +251,16 @@ def _dali_equalize(data, _):
     return equalize(data)
 
 
+def _dali_sharpness(data, kernel):
+    """Use the promoted operator; older DALI releases only have the alias."""
+    from nvidia.dali import fn
+
+    filter_op = getattr(fn, "filter", None)
+    if filter_op is None:
+        filter_op = fn.experimental.filter
+    return filter_op(data, kernel)
+
+
 def build_dali_imagenet_pipeline(
     *, reader_kwargs: dict[str, Any], training: bool, crop_size: int,
     batch_size: int, num_threads: int, device_id: int, resize_size: int = 256,
@@ -290,13 +300,23 @@ def build_dali_imagenet_pipeline(
     preset_v2_fill_value = 0
     preset_v2_interp = dali_interp_nearest
 
-    # DALI 2.3's built-in suites still call the deprecated experimental.equalize.
-    # Use its public custom-policy API, preserving names, ordering, probabilities
-    # and magnitudes so that seeded augmentation streams remain unchanged.
-    equalize = augmentation(_dali_equalize, name="equalize")
+    # DALI 2.3's built-in suites still call the deprecated experimental.equalize
+    # and experimental.filter (sharpness). Use its public custom-policy API,
+    # preserving names, ordering, probabilities, magnitudes and magnitude-to-
+    # parameter mappings so that seeded augmentation streams remain unchanged.
+    # One replacement per original instance: Policy renames (and so reorders)
+    # distinct augmentations that share a name.
+    promoted_ops = {"equalize": _dali_equalize, "sharpness": _dali_sharpness}
+    replacements = {}
 
-    def replace_equalize(aug):
-        return equalize if aug.name == "equalize" else aug
+    def replace_deprecated(aug):
+        if aug.name not in promoted_ops:
+            return aug
+        if id(aug) not in replacements:  # keep aug alive so its id is not reused
+            replacements[id(aug)] = (aug, augmentation(
+                promoted_ops[aug.name], mag_range=aug.mag_range, randomly_negate=aug.randomly_negate,
+                mag_to_param=aug.mag_to_param, param_device=aug.param_device, name=aug.name))
+        return replacements[id(aug)][1]
 
     if training and auto_augment_policy is not None:
         # Historical LLR2 DALI choice, retained for v3 compatibility. NVIDIA's
@@ -306,7 +326,7 @@ def build_dali_imagenet_pipeline(
         original = dali_auto_augment.get_image_net_policy(use_shape=True)
         policy = Policy(
             original.name, original.num_magnitude_bins,
-            [[(replace_equalize(aug), probability, magnitude)
+            [[(replace_deprecated(aug), probability, magnitude)
               for aug, probability, magnitude in sub_policy]
              for sub_policy in original.sub_policies],
         )
@@ -314,9 +334,9 @@ def build_dali_imagenet_pipeline(
         # NVIDIA implementations of TrivialAugmentWide / RandAugment; composing
         # both is LLR2's v2 choice, not torchvision's exclusive policy selector.
         # Method/implementation links: README_imagenet_augmentation.md section 1.2.
-        trivial_suite = [replace_equalize(aug) for aug in
+        trivial_suite = [replace_deprecated(aug) for aug in
                          dali_trivial_augment.get_trivial_augment_wide_suite(use_shape=True)]
-        rand_suite = [replace_equalize(aug) for aug in
+        rand_suite = [replace_deprecated(aug) for aug in
                       dali_rand_augment.get_rand_augment_suite(use_shape=True)]
 
     def apply_random_erasing(images):

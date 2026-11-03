@@ -61,12 +61,12 @@ def _write_tiny_imagenet10(root: Path, image_size: int = 256) -> None:
 
 
 class TestDaliImageNetTraining(unittest.TestCase):
-    def test_equalize_uses_regular_operator_in_autoaugment_and_v2(self) -> None:
+    def test_equalize_and_sharpness_use_regular_operators_in_autoaugment_and_v2(self) -> None:
         _require_cuda_and_dali()
         from nvidia.dali import fn
 
-        if not hasattr(fn, "equalize"):
-            self.skipTest("Regular equalize requires a newer DALI release")
+        if not (hasattr(fn, "equalize") and hasattr(fn, "filter")):
+            self.skipTest("Regular equalize/filter require a newer DALI release")
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             self._write_pattern_images(root)
@@ -74,12 +74,14 @@ class TestDaliImageNetTraining(unittest.TestCase):
                 with self.subTest(version=version, policy=policy), \
                      warnings.catch_warnings(record=True) as caught, \
                      patch.object(fn.experimental, "equalize", create=True,
-                                  side_effect=AssertionError("Deprecated equalize alias was called")):
+                                  side_effect=AssertionError("Deprecated equalize alias was called")), \
+                     patch.object(fn.experimental, "filter", create=True,
+                                  side_effect=AssertionError("Deprecated filter alias was called")):
                     warnings.simplefilter("always", DeprecationWarning)
                     pipeline = self._augmentation_pipeline(root, version, policy)
                     images, _ = pipeline.run()
                     self.assertEqual(images.as_cpu().as_array().shape, (4, 3, 32, 32))
-                    self.assertFalse(any("equalize" in str(item.message) for item in caught))
+                    self.assertFalse(any("deprecated" in str(item.message).lower() for item in caught))
                     del pipeline
 
     def test_seeded_pixels_match_pipeline_before_equalize_fix(self) -> None:

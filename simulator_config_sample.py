@@ -42,6 +42,12 @@ preset_variance_correction = None  # None or "VC"
 #   - or a ".csv" variance record (e.g. <run>/variance/<node>.csv); its last row
 #     is used, and layers without a column (e.g. biases) stay unbounded.
 # None disables the bound.
+#
+# preset_reference_variance_mode (per node, per layer):
+#   "always"           - clamp whenever the variance exceeds the reference.
+#   "wait_until_below" - leave a layer alone until its variance first drops to
+#                        or below the reference, then clamp it from then on.
+preset_reference_variance_mode = "always"
 preset_reference_model_path: str | None = None
 preset_network_size = 50
 preset_network_degree = 8  # Only valid for GL.

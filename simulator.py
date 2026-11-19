@@ -166,13 +166,23 @@ def _apply_reference_variance_bound(runtime_parameters: RuntimeParameters, node_
     bound: Optional[ReferenceVarianceBound] = getattr(runtime_parameters, "reference_variance_bound", None)
     if bound is None:
         return
-    scaled_layer_count = bound.apply(node_target.model)
-    if scaled_layer_count > 0:
+    result = bound.apply(node_target.model, key=node_target.name)
+    if result.newly_enabled > 0:
+        SIMULATOR_LOGGER.info(
+            "tick: %s, %s: enabled the reference variance bound on %s more layers of %s (%s/%s enabled)",
+            runtime_parameters.current_tick,
+            stage,
+            result.newly_enabled,
+            node_target.name,
+            result.enabled,
+            len(bound.layer_names),
+        )
+    if result.scaled > 0:
         SIMULATOR_LOGGER.info(
             "tick: %s, %s: scaled %s/%s layers of %s down to the reference variance",
             runtime_parameters.current_tick,
             stage,
-            scaled_layer_count,
+            result.scaled,
             len(bound.layer_names),
             node_target.name,
         )
@@ -600,13 +610,15 @@ def main(
             str(reference_model_path),
             template_node.model,
             template_node.device,
+            mode=getattr(config_file, "preset_reference_variance_mode", "always"),
             expected_model_name=getattr(getattr(config_ml_setup, "model_type", None), "name", None),
             logger=SIMULATOR_LOGGER,
         )
         runtime_parameters.reference_variance_bound = bound
         SIMULATOR_LOGGER.info(
-            "reference variance bound from %s: %s bounded layers, %s normalization parameters ignored",
+            "reference variance bound from %s (mode: %s): %s bounded layers, %s normalization parameters ignored",
             reference_model_path,
+            bound.mode,
             len(bound.layer_names),
             len(bound.excluded_normalization_names),
         )

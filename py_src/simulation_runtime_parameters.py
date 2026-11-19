@@ -32,6 +32,7 @@ class RuntimeParameters:
     performance_disable_training: bool
     performance_disable_communication: bool
     shared_training_loader: Any
+    reference_variance_bound: Any
 
     def __init__(self):
         self.max_tick = 0
@@ -49,4 +50,5 @@ class RuntimeParameters:
 
         self.performance_disable_training = False
         self.performance_disable_communication = False
+        self.reference_variance_bound = None
         self.shared_training_loader = None

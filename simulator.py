@@ -22,6 +22,7 @@ from py_src.ml_setup_dataset.dataset_intermediate_layer import (
     DatasetWithFastLabelSelection,
 )
 from py_src.node import Node, ensure_ml_setup_compatibility
+from py_src.reference_variance import ReferenceVarianceBound
 from py_src.shared_dataloader import BatchRequest, SharedDataLoader
 from py_src.simulation_runtime_parameters import RuntimeParameters, SimulationPhase
 
@@ -161,6 +162,22 @@ def _refresh_label_distributions(runtime_parameters: RuntimeParameters, config_f
             )
 
 
+def _apply_reference_variance_bound(runtime_parameters: RuntimeParameters, node_target: Node, stage: str) -> None:
+    bound: Optional[ReferenceVarianceBound] = getattr(runtime_parameters, "reference_variance_bound", None)
+    if bound is None:
+        return
+    scaled_layer_count = bound.apply(node_target.model)
+    if scaled_layer_count > 0:
+        SIMULATOR_LOGGER.info(
+            "tick: %s, %s: scaled %s/%s layers of %s down to the reference variance",
+            runtime_parameters.current_tick,
+            stage,
+            scaled_layer_count,
+            len(bound.layer_names),
+            node_target.name,
+        )
+
+
 def _trigger_services(runtime_parameters: RuntimeParameters) -> None:
     for service_inst in runtime_parameters.service_container.values():
         service_inst.trigger(runtime_parameters)
@@ -251,6 +268,9 @@ def simulation_phase_training(runtime_parameters: RuntimeParameters, config_file
         for handler in getattr(node_target.ml_setup, "func_handler_post_training", []):
             handler(node_target.model)
 
+        if training_batch_count > 0:
+            _apply_reference_variance_bound(runtime_parameters, node_target, "after training")
+
     for node_name in training_node_names:
         node_target = runtime_parameters.node_container[node_name]
         node_target.next_training_tick = config_file.get_next_training_time(node_target, runtime_parameters)
@@ -295,6 +315,11 @@ def simulation_phase_averaging(runtime_parameters: RuntimeParameters) -> None:
     for node_name in runtime_parameters.node_container:
         if runtime_parameters.node_container[node_name].check_averaging():
             nodes_averaged.add(node_name)
+            _apply_reference_variance_bound(
+                runtime_parameters,
+                runtime_parameters.node_container[node_name],
+                "after averaging",
+            )
 
     if nodes_averaged:
         SIMULATOR_LOGGER.info(
@@ -566,6 +591,33 @@ def main(
         runtime_parameters.node_container[single_node] = temp_node
 
     config_file.node_behavior_control(runtime_parameters)
+
+    runtime_parameters.reference_variance_bound = None
+    reference_model_path = getattr(config_file, "preset_reference_model_path", None)
+    if reference_model_path is not None:
+        template_node = runtime_parameters.node_container[min(runtime_parameters.node_container)]
+        bound = ReferenceVarianceBound.from_file(
+            str(reference_model_path),
+            template_node.model,
+            template_node.device,
+            expected_model_name=getattr(getattr(config_ml_setup, "model_type", None), "name", None),
+            logger=SIMULATOR_LOGGER,
+        )
+        runtime_parameters.reference_variance_bound = bound
+        SIMULATOR_LOGGER.info(
+            "reference variance bound from %s: %s bounded layers, %s normalization parameters ignored",
+            reference_model_path,
+            len(bound.layer_names),
+            len(bound.excluded_normalization_names),
+        )
+        if bound.unbounded_layer_names:
+            SIMULATOR_LOGGER.info(
+                "reference variance bound: %s layers have no reference variance and stay unbounded: %s",
+                len(bound.unbounded_layer_names),
+                list(bound.unbounded_layer_names),
+            )
+        for node_target in runtime_parameters.node_container.values():
+            _apply_reference_variance_bound(runtime_parameters, node_target, "initialization")
 
     service_list = config_file.get_service_list()
     for service_inst in service_list:

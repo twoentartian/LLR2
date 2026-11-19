@@ -33,6 +33,16 @@ override_allocate_all_models = None
 # Network presets: "GL", "FL", or "single".
 preset_network = "GL"
 preset_variance_correction = None  # None or "VC"
+
+# Reference-model variance upper bound. After local training and after
+# averaging, every non-normalization parameter tensor whose variance exceeds the
+# reference variance for that tensor is rescaled (around its mean) to the
+# reference variance. The path is either
+#   - a ".model.pt" file holding a model of the same type as the simulated one,
+#   - or a ".csv" variance record (e.g. <run>/variance/<node>.csv); its last row
+#     is used, and layers without a column (e.g. biases) stay unbounded.
+# None disables the bound.
+preset_reference_model_path: str | None = None
 preset_network_size = 50
 preset_network_degree = 8  # Only valid for GL.
 

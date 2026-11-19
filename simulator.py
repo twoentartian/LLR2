@@ -167,25 +167,33 @@ def _apply_reference_variance_bound(runtime_parameters: RuntimeParameters, node_
     if bound is None:
         return
     result = bound.apply(node_target.model, key=node_target.name)
-    if result.newly_enabled > 0:
-        SIMULATOR_LOGGER.info(
-            "tick: %s, %s: enabled the reference variance bound on %s more layers of %s (%s/%s enabled)",
-            runtime_parameters.current_tick,
-            stage,
-            result.newly_enabled,
-            node_target.name,
-            result.enabled,
-            len(bound.layer_names),
-        )
-    if result.scaled > 0:
-        SIMULATOR_LOGGER.info(
-            "tick: %s, %s: scaled %s/%s layers of %s down to the reference variance",
-            runtime_parameters.current_tick,
-            stage,
-            result.scaled,
-            len(bound.layer_names),
-            node_target.name,
-        )
+    # Counts stay on the device; they are read in one sync per tick.
+    runtime_parameters.reference_variance_pending_logs.append(
+        (runtime_parameters.current_tick, stage, node_target.name, result)
+    )
+
+
+def _flush_reference_variance_logs(runtime_parameters: RuntimeParameters) -> None:
+    pending = runtime_parameters.reference_variance_pending_logs
+    if not pending:
+        return
+    bound: ReferenceVarianceBound = runtime_parameters.reference_variance_bound
+    counts = torch.stack(
+        [torch.stack([result.scaled, result.newly_enabled, result.enabled]) for *_, result in pending]
+    ).tolist()
+    layer_count = len(bound.layer_names)
+    for (tick, stage, node_name, _), (scaled, newly_enabled, enabled) in zip(pending, counts):
+        if newly_enabled > 0:
+            SIMULATOR_LOGGER.info(
+                "tick: %s, %s: enabled the reference variance bound on %s more layers of %s (%s/%s enabled)",
+                tick, stage, newly_enabled, node_name, enabled, layer_count,
+            )
+        if scaled > 0:
+            SIMULATOR_LOGGER.info(
+                "tick: %s, %s: scaled %s/%s layers of %s down to the reference variance",
+                tick, stage, scaled, layer_count, node_name,
+            )
+    pending.clear()
 
 
 def _trigger_services(runtime_parameters: RuntimeParameters) -> None:
@@ -399,6 +407,7 @@ def begin_simulation(runtime_parameters: RuntimeParameters, config_file) -> None
         config_file.node_behavior_control(runtime_parameters)
 
         simulation_phase_end_of_tick(runtime_parameters)
+        _flush_reference_variance_logs(runtime_parameters)
         config_file.node_behavior_control(runtime_parameters)
 
         runtime_parameters.current_tick += 1
@@ -630,6 +639,7 @@ def main(
             )
         for node_target in runtime_parameters.node_container.values():
             _apply_reference_variance_bound(runtime_parameters, node_target, "initialization")
+        _flush_reference_variance_logs(runtime_parameters)
 
     service_list = config_file.get_service_list()
     for service_inst in service_list:

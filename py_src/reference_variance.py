@@ -102,11 +102,17 @@ MODES = (MODE_ALWAYS, MODE_WAIT_UNTIL_BELOW)
 
 
 class BoundResult(NamedTuple):
-    scaled: int
+    """Per-call layer counts as 0-d tensors on the model's device.
+
+    They are tensors so ``apply`` never forces a GPU->CPU sync; read them in
+    bulk (``stack(...).tolist()``) when logging.
+    """
+
+    scaled: torch.Tensor
     """Layers scaled down by this call."""
-    newly_enabled: int
+    newly_enabled: torch.Tensor
     """Layers whose bound was enabled by this call (``wait_until_below`` only)."""
-    enabled: int
+    enabled: torch.Tensor
     """Layers whose bound is enabled after this call."""
 
 
@@ -238,7 +244,7 @@ class ReferenceVarianceBound:
         return tuple(self.reference_variance)
 
     def apply(self, model: nn.Module, key: Hashable = None) -> BoundResult:
-        """Rescale over-variance layers of ``model`` in place.
+        """Rescale over-variance layers of ``model`` in place (no host sync).
 
         ``key`` identifies the model (e.g. the node name) for the per-layer
         enable state of ``wait_until_below``; it is ignored in ``always``.
@@ -247,12 +253,12 @@ class ReferenceVarianceBound:
         wait = self.mode == MODE_WAIT_UNTIL_BELOW
         enabled_state = self._enabled.setdefault(key, {}) if wait else None
         scaled, newly_enabled, enabled = [], [], []
+        tiny = torch.finfo(torch.float32).tiny
         with torch.no_grad():
             for name, reference_variance in self.reference_variance.items():
                 param = parameters[name]
-                value = param.detach().to(torch.float32)
-                mean = value.mean()
-                variance = value.var()
+                value = param if param.dtype == torch.float32 else param.float()
+                variance, mean = torch.var_mean(value)
                 over = variance > reference_variance * (1.0 + self.relative_tolerance)
                 if wait:
                     was_enabled = enabled_state.get(name)
@@ -263,15 +269,21 @@ class ReferenceVarianceBound:
                     newly_enabled.append(now_enabled & ~was_enabled)
                     enabled.append(now_enabled)
                     over = over & now_enabled
-                scale = torch.sqrt(reference_variance / variance.clamp_min(torch.finfo(torch.float32).tiny))
-                # Only shrink; layers within the bound keep their exact values.
-                # torch.where avoids a per-layer GPU->CPU sync on ``over``.
-                param.copy_(torch.where(over, (value - mean) * scale + mean, value).to(param.dtype))
+                # new = mean + (p - mean) * scale  ==  p + (p - mean) * (scale - 1).
+                # The factor is exactly 0 for layers within the bound, so those
+                # keep their exact values without a data-dependent branch.
+                factor = torch.where(
+                    over,
+                    torch.sqrt(reference_variance / variance.clamp_min(tiny)) - 1.0,
+                    torch.zeros_like(variance),
+                )
+                if value is param:
+                    param.addcmul_(param - mean, factor)
+                else:
+                    param.copy_(value.addcmul_(value - mean, factor))
                 scaled.append(over)
+        scaled_count = torch.stack(scaled).sum()
         if not wait:
-            count = int(torch.stack(scaled).sum().item())
-            return BoundResult(count, 0, len(self.reference_variance))
-        counts = torch.stack(
-            [torch.stack(scaled).sum(), torch.stack(newly_enabled).sum(), torch.stack(enabled).sum()]
-        ).tolist()
-        return BoundResult(*(int(c) for c in counts))
+            zero = torch.zeros_like(scaled_count)
+            return BoundResult(scaled_count, zero, zero + len(self.reference_variance))
+        return BoundResult(scaled_count, torch.stack(newly_enabled).sum(), torch.stack(enabled).sum())

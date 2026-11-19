@@ -14,6 +14,19 @@ import torch
 from py_src.special_torch_layers import is_ignored_layer_variance_correction
 
 
+# Single-entry cache of the per-layer variances of the most recent model_stat.
+# In the simulator one sender's model_stat dict is added to every neighbor's
+# averager in a row, so its variances would otherwise be recomputed once per
+# neighbor. The key holds the dict identity plus each tensor's identity and
+# in-place version counter; the entry keeps the dict and tensors alive so ids
+# cannot be reused while cached.
+_model_stat_variance_cache: Optional[tuple] = None
+
+
+def _model_stat_cache_key(model_stat: dict) -> tuple:
+    return tuple((name, id(t), t._version) for name, t in model_stat.items())
+
+
 class VarianceCorrectionType(enum.Enum):
     FollowSelfVariance = 0
     FollowConservative = 1
@@ -36,6 +49,22 @@ class VarianceCorrector:
                 return tensor.new_zeros(())
             return torch.var(tensor)
 
+    @classmethod
+    def model_stat_variances(cls, model_stat: dict) -> Dict[str, torch.Tensor]:
+        """Per-layer variance of every non-ignored layer, cached per model_stat."""
+        global _model_stat_variance_cache
+        key = _model_stat_cache_key(model_stat)
+        cached = _model_stat_variance_cache
+        if cached is not None and cached[1] is model_stat and cached[0] == key:
+            return cached[3]
+        variances = {
+            name: cls.calculate_variance_for_tensor(param)
+            for name, param in model_stat.items()
+            if not is_ignored_layer_variance_correction(name)
+        }
+        _model_stat_variance_cache = (key, model_stat, tuple(model_stat.values()), variances)
+        return variances
+
     def add_variance(self, model_stat: dict) -> None:
         if self.variance_correction_type in (
             VarianceCorrectionType.FollowConservative,
@@ -45,10 +74,12 @@ class VarianceCorrector:
                 self.variance_record = {
                     name: param.new_zeros(()) for name, param in model_stat.items()
                 }
-            for name, param in model_stat.items():
-                if is_ignored_layer_variance_correction(name):
-                    continue
-                self.variance_record[name].add_(self.calculate_variance_for_tensor(param))
+            variances = self.model_stat_variances(model_stat)
+            with torch.no_grad():
+                torch._foreach_add_(
+                    [self.variance_record[name] for name in variances],
+                    list(variances.values()),
+                )
             self.model_counter += 1
 
     def get_variance(

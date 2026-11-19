@@ -165,6 +165,13 @@ class ModelAverager:
     ) -> dict:
         with torch.no_grad():
             assert (not check_same_keys) or (set(src.keys()) == set(addition.keys()))
+            if weight_src == 1.0 and weight_addition == 1.0:
+                src_tensors = list(src.values())
+                addition_tensors = [addition[layer_name] for layer_name in src]
+                if all(a.device == b.device for a, b in zip(src_tensors, addition_tensors)):
+                    # One fused call instead of one Python-level op per layer.
+                    torch._foreach_add_(src_tensors, addition_tensors)
+                    return src
             for layer_name in src.keys():
                 addition_tensor = addition[layer_name]
                 if src[layer_name].device != addition_tensor.device:
@@ -176,6 +183,15 @@ class ModelAverager:
                         src[layer_name] * weight_src + addition_tensor * weight_addition
                     )
         return src
+
+    @staticmethod
+    def _clone_for_buffer(model_stat: dict) -> dict:
+        """Clone the averaged layers of ``model_stat`` (skipping ignored ones)."""
+        return {
+            layer_name: tensor.clone()
+            for layer_name, tensor in model_stat.items()
+            if not is_ignored_layer_averaging(layer_name)
+        }
 
     @staticmethod
     def _move_state_dict(state_dict: dict, device: torch.device) -> None:
@@ -199,10 +215,7 @@ class StandardModelAverager(ModelAverager):
     def add_model(self, model_stat: dict) -> None:
         with torch.no_grad():
             if self.model_buffer is None:
-                self.model_buffer = copy.deepcopy(model_stat)
-                for layer_name in list(self.model_buffer.keys()):
-                    if is_ignored_layer_averaging(layer_name):
-                        del self.model_buffer[layer_name]
+                self.model_buffer = ModelAverager._clone_for_buffer(model_stat)
             else:
                 self.model_buffer = ModelAverager._iadd_two_model(
                     self.model_buffer,
@@ -255,10 +268,7 @@ class ConservativeModelAverager(ModelAverager):
     def add_model(self, model_stat: dict) -> None:
         with torch.no_grad():
             if self.model_buffer is None:
-                self.model_buffer = copy.deepcopy(model_stat)
-                for layer_name in list(self.model_buffer.keys()):
-                    if is_ignored_layer_averaging(layer_name):
-                        del self.model_buffer[layer_name]
+                self.model_buffer = ModelAverager._clone_for_buffer(model_stat)
             else:
                 self.model_buffer = ModelAverager._iadd_two_model(
                     self.model_buffer,
@@ -270,27 +280,43 @@ class ConservativeModelAverager(ModelAverager):
                 self.variance_corrector.add_variance(model_stat)
 
     def get_model(self, self_model: dict, *args, **kwargs) -> dict:
+        """Return ``conservative * self + (1 - conservative) * mean(received)``.
+
+        Layers not in the buffer (ignored for averaging) are mixed with
+        themselves. The arithmetic matches the per-layer formula
+        ``self * c + (buffer / n) * (1 - c)``; it is only batched with
+        ``torch._foreach_*`` and avoids deep copies. The caller's tensors are
+        never modified in place.
+        """
         assert self.model_buffer is not None
         with torch.no_grad():
             device = ModelAverager._get_device_from_model_stat(self.model_buffer)
-            self_model = copy.deepcopy(self_model)
-            ModelAverager._move_state_dict(self_model, device)
+            self_model = {name: tensor.to(device) for name, tensor in self_model.items()}
+            weight_self = self.conservative
+            weight_others = 1 - self.conservative
 
-            averaged = copy.deepcopy(self_model)
-            for layer_name in averaged:
-                if layer_name not in self.model_buffer:
-                    continue
-                averaged[layer_name] = self.model_buffer[layer_name] / self.model_counter
-
-            output = ModelAverager._iadd_two_model(
-                self_model,
-                averaged,
-                weight_src=self.conservative,
-                weight_addition=1 - self.conservative,
+            averaged_names = [name for name in self_model if name in self.model_buffer]
+            averaged = torch._foreach_div(
+                [self.model_buffer[name] for name in averaged_names],
+                self.model_counter,
             )
+            mixed = torch._foreach_add(
+                torch._foreach_mul([self_model[name] for name in averaged_names], weight_self),
+                torch._foreach_mul(averaged, weight_others),
+            )
+            mixed_by_name = dict(zip(averaged_names, mixed))
+
+            output = {}
+            for name, tensor in self_model.items():
+                if name in mixed_by_name:
+                    output[name] = mixed_by_name[name]
+                else:
+                    output[name] = tensor * weight_self + tensor * weight_others
+
             if self.variance_corrector is not None:
+                # As before, the corrector sees the mixed model as "self".
                 target_variance = self.variance_corrector.get_variance(
-                    self_model,
+                    output,
                     self.conservative,
                 )
                 for layer_name, single_layer_variance in target_variance.items():

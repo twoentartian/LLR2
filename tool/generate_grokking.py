@@ -592,6 +592,11 @@ def train_grokking(parameters: GrokkingParameters):
             and train_accuracy >= parameters.early_stop_train_accuracy
             and val_accuracy >= parameters.early_stop_val_accuracy
         ):
+            if parameters.logger is not None:
+                parameters.logger.info(
+                    "early_stop triggered at epoch %d: train acc %.4f, val acc %.4f",
+                    epoch, train_accuracy, val_accuracy,
+                )
             break
 
         train_loss_history.append(float(train_loss))
@@ -709,6 +714,11 @@ def parse_args():
     parser.add_argument("-epoch", "--epoch", type=int, default=None)
     parser.add_argument("-wd", "--weight_decay", type=float, default=None)
     parser.add_argument("-bs", "--batchsize", type=int, default=None)
+    parser.add_argument("--early_stop_val_accuracy", type=float, default=None,
+                        help="stop once validation accuracy reaches this value (and train accuracy reaches "
+                             "--early_stop_train_accuracy); omitted = run all epochs")
+    parser.add_argument("--early_stop_train_accuracy", type=float, default=0.95,
+                        help="train-accuracy condition for --early_stop_val_accuracy (default: 0.95)")
     parser.add_argument("--save_format", type=str, default="none", choices=["none", "file", "lmdb"])
     parser.add_argument("--save_interval", type=int, default=1)
     parser.add_argument("--distance_to_origin_interval", dest="distance_to_origin_interval",type=int,default=None,help="record distance-to-origin every N epochs; omitted/None disables the service")
@@ -825,7 +835,13 @@ def main():
         total_epoch = 150000 if args.epoch is None else args.epoch
 
         params = GrokkingParameters()
-        params.set_env(output_folder_path_current, False, logger=logger)
+        early_stop = args.early_stop_val_accuracy is not None
+        params.set_env(output_folder_path_current, early_stop, logger=logger)
+        if early_stop:
+            params.set_early_stop_thresholds(train_accuracy=args.early_stop_train_accuracy,
+                                             val_accuracy=args.early_stop_val_accuracy)
+            logger.info("early stop enabled: train acc >= %g and val acc >= %g",
+                        args.early_stop_train_accuracy, args.early_stop_val_accuracy)
         params.set_ml_env(model, args.model_type, SAVED_MODEL_DATASET_NAME, train_ds.tokenizer)
         params.set_ml_hyperparameter(
             learning_rate=1e-3 if args.learning_rate is None else args.learning_rate,

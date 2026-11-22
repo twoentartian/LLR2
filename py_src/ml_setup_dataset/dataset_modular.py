@@ -607,6 +607,77 @@ class ArithmeticDataset:
                 "chessboard_transpose_ratio can only be changed for the chessboard_random split"
             )
 
+    @staticmethod
+    def _mix_symmetric_mask(
+        M: np.ndarray,
+        rng: np.random.Generator,
+        swaps_per_cell: int = 50,
+        attempts_per_swap: int = 20,
+    ) -> int:
+        """Randomize a symmetric 0/1 mask in place with mirrored 2x2 swaps.
+
+        A swap picks four distinct indices r0, r1, c0, c1; if the block
+        (r0,c0)=1, (r1,c1)=1, (r0,c1)=0, (r1,c0)=0 it flips those four cells and
+        the mirrored block (c0,r0), (c1,r1), (c1,r0), (c0,r1). Row/column sums,
+        the diagonal and the symmetry are preserved. Because the indices are
+        distinct, a block and its mirror never share a cell.
+
+        Proposals are drawn in batches. Each batch is checked against the current
+        mask; valid proposals that share a cell with another valid proposal in the
+        same batch are rejected, so the remaining swaps touch disjoint cells and
+        can be applied together. Stops after n*n*swaps_per_cell swaps or
+        n*n*swaps_per_cell*attempts_per_swap proposals.
+
+        Replaces a one-proposal-per-iteration Python loop (2026-11-22; about
+        20 min at n=597). The same seed now gives a different, equally mixed
+        split than before that change.
+
+        Returns the number of swaps applied.
+        """
+        n = M.shape[0]
+        num_swaps = n * n * swaps_per_cell
+        max_attempts = num_swaps * attempts_per_swap
+        # ~1/8-1/16 of proposals are valid; n*n/16 proposals per batch keeps
+        # overlaps between valid proposals (and so rejections) rare.
+        batch = max(256, n * n // 16)
+
+        swaps_done = 0
+        attempts = 0
+        while swaps_done < num_swaps and attempts < max_attempts:
+            size = min(batch, max_attempts - attempts)
+            attempts += size
+            r0, r1, c0, c1 = rng.integers(0, n, size=(4, size))
+            ok = (
+                (r0 != r1) & (r0 != c0) & (r0 != c1)
+                & (r1 != c0) & (r1 != c1) & (c0 != c1)
+            )
+            ok &= (M[r0, c0] == 1) & (M[r1, c1] == 1) & (M[r0, c1] == 0) & (M[r1, c0] == 0)
+            if not ok.any():
+                continue
+            r0, r1, c0, c1 = r0[ok], r1[ok], c0[ok], c1[ok]
+
+            cells = np.stack(
+                (r0 * n + c0, r0 * n + c1, r1 * n + c0, r1 * n + c1,
+                 c0 * n + r0, c1 * n + r0, c0 * n + r1, c1 * n + r1),
+                axis=1,
+            )
+            _, inverse, counts = np.unique(cells.ravel(), return_inverse=True, return_counts=True)
+            disjoint = (counts[inverse].reshape(cells.shape) == 1).all(axis=1)
+            take = min(int(disjoint.sum()), num_swaps - swaps_done)
+            keep = np.flatnonzero(disjoint)[:take]
+            r0, r1, c0, c1 = r0[keep], r1[keep], c0[keep], c1[keep]
+
+            M[r0, c0] = 0
+            M[r0, c1] = 1
+            M[r1, c0] = 1
+            M[r1, c1] = 0
+            M[c0, r0] = 0
+            M[c1, r0] = 1
+            M[c0, r1] = 1
+            M[c1, r1] = 0
+            swaps_done += take
+        return swaps_done
+
     @classmethod
     def _apply_chessboard_transpose_ratio(
         cls,
@@ -743,29 +814,7 @@ class ArithmeticDataset:
 
             if rng is None:
                 rng = np.random.default_rng()
-            num_swaps = n * n * 50  # enough passes for thorough mixing
-            max_attempts = num_swaps * 20
-
-            swaps_done = 0
-            for _ in range(max_attempts):
-                if swaps_done >= num_swaps:
-                    break
-                # Sample 4 distinct indices to form a rectangle
-                idx = rng.choice(n, size=4, replace=False)
-                r0, r1, c0, c1 = int(idx[0]), int(idx[1]), int(idx[2]), int(idx[3])
-                # Check anti-diagonal pattern in the 2x2 block
-                if M[r0, c0] == 1 and M[r1, c1] == 1 and M[r0, c1] == 0 and M[r1, c0] == 0:
-                    # Swap the 2x2 block
-                    M[r0, c0] = 0
-                    M[r0, c1] = 1
-                    M[r1, c0] = 1
-                    M[r1, c1] = 0
-                    # Mirror the same swap across the diagonal (transpose indices)
-                    M[c0, r0] = 0
-                    M[c1, r0] = 1
-                    M[c0, r1] = 1
-                    M[c1, r1] = 0
-                    swaps_done += 1
+            cls._mix_symmetric_mask(M, rng)
 
             train_mask = M.astype(bool)
 
